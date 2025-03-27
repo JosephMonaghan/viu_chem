@@ -190,6 +190,66 @@ def get_mzs(imzfile):
     return num_pxs, mz
 
 
+def main(imzML_dir:str,result_dir:str='',mz_res:float=0.005,px_perc:float=1,num_px_per:int=100,dask:int=0,debug:bool=False):
+
+    px_perc = px_perc / 100
+
+
+    if result_dir == '':
+        result_dir = os.path.join((imzML_dir), "alignment")
+    if not os.path.exists(result_dir):
+        os.mkdir(result_dir)
+
+    imzML_files = [f for f in os.listdir(imzML_dir) if os.path.isfile(os.path.join(imzML_dir, f))
+                   and f.endswith('.imzML') and not f.startswith('.')]
+    imzML_paths = [os.path.join(imzML_dir, f) for f in imzML_files]
+
+    if dask == 1:
+        res = []
+        with multiprocessing.Pool() as pool:
+            for result in pool.map(get_mzs, imzML_paths):
+                res.append(result)
+        pool.close()
+        num_pxs, mz_list = zip(*res)
+        num_pxs = np.sum(num_pxs)
+        all_mzs = mz_list[0]
+        print("merging all mz values into one array")
+        for i in tqdm(range(1, len(mz_list))):
+            all_mzs = da.concatenate([all_mzs, mz_list[i]], axis=0)
+    else:
+        all_mzs = []
+        num_pxs = 0
+        print("reading all m/z values")
+        for fl in tqdm(imzML_files):
+            p = ImzMLParser(os.path.join(imzML_dir, fl))
+            # only take specific percentage of pixels randomly
+            num_px = int((len(p.coordinates) / 100) * num_px_per)
+            num_pxs += num_px
+            idx_list = random.sample(range(0, len(p.coordinates)), num_px)
+            # num_px = int((len(p.coordinates[:10]) / 100) * args.num_px_perc)
+            # num_pxs += len(p.coordinates[:10])
+            # idx_list = range(0, len(p.coordinates[:10]))
+            for id in idx_list:
+                mzs, _ = p.getspectrum(id)
+                all_mzs.extend(mzs)
+        all_mzs = np.asarray(all_mzs).astype(np.float32)
+    #print(all_mzs.shape)
+    #print(num_pxs)
+
+    # get common m/z vector
+    cmz = get_cmz_histo(mz=all_mzs, no_px=num_pxs, mz_res=mz_res, px_perc=px_perc, plot=debug, dask=dask)
+
+    if dask == 1:
+        cmz = np.array(cmz)
+
+    #print(cmz)
+
+    #print('reduced m/z vector from {} to {} bins'.format(np.unique(all_mzs).shape, cmz.shape))
+    print('reduced m/z vector to {} bins'.format(cmz.shape[0]))
+    np.save(os.path.join(result_dir, 'cmz.npy'), cmz)
+
+
+
 if __name__ == '__main__':
     # refmz = np.array([0.50, 0.70, 1.50, 1.75, 2.50])
     # mz = np.array([0.40, 0.60, 0.80])
@@ -226,57 +286,4 @@ if __name__ == '__main__':
     parser.add_argument('-debug', type=bool, default=False, help='set to True for debugging')
     args = parser.parse_args()
 
-    args.px_perc = args.px_perc / 100
-
-    if args.result_dir == '':
-        args.result_dir = os.path.join((args.imzML_dir), "alignment")
-    if not os.path.exists(args.result_dir):
-        os.mkdir(args.result_dir)
-
-    imzML_files = [f for f in os.listdir(args.imzML_dir) if os.path.isfile(os.path.join(args.imzML_dir, f))
-                   and f.endswith('.imzML') and not f.startswith('.')]
-    imzML_paths = [os.path.join(args.imzML_dir, f) for f in imzML_files]
-
-    if args.dask == 1:
-        res = []
-        with multiprocessing.Pool() as pool:
-            for result in pool.map(get_mzs, imzML_paths):
-                res.append(result)
-        pool.close()
-        num_pxs, mz_list = zip(*res)
-        num_pxs = np.sum(num_pxs)
-        all_mzs = mz_list[0]
-        print("merging all mz values into one array")
-        for i in tqdm(range(1, len(mz_list))):
-            all_mzs = da.concatenate([all_mzs, mz_list[i]], axis=0)
-    else:
-        all_mzs = []
-        num_pxs = 0
-        print("reading all m/z values")
-        for fl in tqdm(imzML_files):
-            p = ImzMLParser(os.path.join(args.imzML_dir, fl))
-            # only take specific percentage of pixels randomly
-            num_px = int((len(p.coordinates) / 100) * args.num_px_perc)
-            num_pxs += num_px
-            idx_list = random.sample(range(0, len(p.coordinates)), num_px)
-            # num_px = int((len(p.coordinates[:10]) / 100) * args.num_px_perc)
-            # num_pxs += len(p.coordinates[:10])
-            # idx_list = range(0, len(p.coordinates[:10]))
-            for id in idx_list:
-                mzs, _ = p.getspectrum(id)
-                all_mzs.extend(mzs)
-        all_mzs = np.asarray(all_mzs).astype(np.float32)
-    #print(all_mzs.shape)
-    #print(num_pxs)
-
-    # get common m/z vector
-    cmz = get_cmz_histo(mz=all_mzs, no_px=num_pxs, mz_res=args.mz_res, px_perc=args.px_perc, plot=args.debug, dask=args.dask)
-
-    if args.dask == 1:
-        cmz = np.array(cmz)
-
-    #print(cmz)
-
-    #print('reduced m/z vector from {} to {} bins'.format(np.unique(all_mzs).shape, cmz.shape))
-    print('reduced m/z vector to {} bins'.format(cmz.shape[0]))
-    np.save(os.path.join(args.result_dir, 'cmz.npy'), cmz)
+    main(args)

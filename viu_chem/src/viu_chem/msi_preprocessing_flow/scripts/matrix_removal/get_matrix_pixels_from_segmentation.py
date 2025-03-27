@@ -14,8 +14,8 @@ from skimage.morphology import remove_small_objects
 from scipy.stats import pearsonr, spearmanr
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-from pkg import utils
-from pkg.plot import get_mz_img
+from viu_chem.msi_pkg import utils
+from viu_chem.msi_pkg.plot import get_mz_img
 
 
 def get_spectrum_from_bin_img(img, msi_df):
@@ -26,6 +26,86 @@ def get_spectrum_from_bin_img(img, msi_df):
     df = pd.merge(left=msi_df, right=pixels_df, on=['x', 'y'])
     spec = df.iloc[:, 2:].median(axis=0).to_numpy()
     return spec
+
+
+def extract_matrix(imzML_fl:str,img_dir:str,result_dir:str='',matrix_corr_thr:float=0.7,pixel_perc_thr:float=30,qc:int=1,plot:int=0):
+    if result_dir == '':
+        result_dir = os.path.join(os.path.dirname(imzML_fl), "matrix_removal")
+    if not os.path.exists(result_dir):
+        os.mkdir(result_dir)
+
+    if qc == 1:
+        qc_path = os.path.join(result_dir, 'quality_control')
+        if not os.path.exists(qc_path):
+            os.mkdir(qc_path)
+
+    # read in data
+    p = ImzMLParser(imzML_fl)
+    df = utils.get_dataframe_from_imzML(imzML_fl, multi_index=False)
+    sample_name = os.path.basename(imzML_fl).split('.')[0]
+    # print(sample_name)
+    
+    matrix_cluster_file = [f for f in os.listdir(img_dir) if f.startswith(sample_name) and '_matrix_cluster' in f]
+    sample_cluster_files = [f for f in os.listdir(img_dir) if f.startswith(sample_name) and 'cluster' in f and not 'cluster_0' in f]
+    clusters = [f.split('_')[-1] for f in sample_cluster_files]
+    # print(matrix_cluster_file)
+    # print(sample_cluster_files)
+    # print(clusters)
+
+    # combine all cluster images to one --> tissue image
+    tissue_img = np.zeros((p.imzmldict["max count of pixels y"]+1, p.imzmldict["max count of pixels x"]+1), dtype=int)
+    for fl in sample_cluster_files:
+        img = tifffile.imread(os.path.join(img_dir, fl))
+        tissue_img[img == 255] = 255
+    tifffile.imwrite(os.path.join(qc_path, sample_name + '_tissue_clusters.tif'), tissue_img.astype('uint8'))
+
+    matrix_img = tifffile.imread(os.path.join(img_dir, matrix_cluster_file[0]))
+    tifffile.imwrite(os.path.join(qc_path, sample_name + '_matrix_cluster.tif'), matrix_img.astype('uint8'))
+    matrix_spec = get_spectrum_from_bin_img(matrix_img, df)
+    tissue_spec = get_spectrum_from_bin_img(tissue_img, df)
+
+    # get correlation of each cluster to matrix and tissue
+    corr_df = pd.DataFrame(index=clusters, columns=['matrix_pears', 'matrix_spear', 'tissue_pears', 'tissue_spear', 'pixel_perc'])
+    for fl, cl in zip(sample_cluster_files, clusters):
+        img = tifffile.imread(os.path.join(img_dir, fl))
+        cl_spec = get_spectrum_from_bin_img(img, df)
+        matrix_pears, _ = pearsonr(cl_spec, matrix_spec)
+        tissue_pears, _ = pearsonr(cl_spec, tissue_spec)
+        matrix_spear, _ = spearmanr(cl_spec, matrix_spec)
+        tissue_spear, _ = spearmanr(cl_spec, tissue_spec)
+        corr_df.at[cl, 'matrix_pears'] = matrix_pears
+        corr_df.at[cl, 'tissue_pears'] = tissue_pears
+        corr_df.at[cl, 'matrix_spear'] = matrix_spear
+        corr_df.at[cl, 'tissue_spear'] = tissue_spear
+        corr_df.at[cl, 'pixel_perc'] = (np.count_nonzero(img) / np.count_nonzero(tissue_img)) * 100
+    # print(corr_df)
+    corr_df.to_csv(os.path.join(qc_path, sample_name + '_corr.csv'), index=True)
+
+    # visualize spearman correlation to matrix cluster
+    fig, ax = plt.subplots()
+    ax = corr_df.plot.bar(y='matrix_spear', rot=0)
+    ax.axhline(y=matrix_corr_thr, color= 'red', linewidth=5,)
+    plt.savefig(os.path.join(qc_path, sample_name + '_matrix_cluster_corr.svg'))
+    plt.close()
+    fig, ax = plt.subplots()
+    ax = corr_df.plot.bar(y='pixel_perc', rot=0)
+    ax.axhline(y=pixel_perc_thr, color= 'red', linewidth=5,)
+    plt.savefig(os.path.join(qc_path, sample_name + '_cluster_pixel_perc.svg'))
+    plt.close()
+
+    # get classes with matrix corr > correlation threshold
+    corr_df_filt = corr_df[(corr_df['matrix_spear'] > matrix_corr_thr) & (corr_df['pixel_perc'] < pixel_perc_thr)]
+    matrix_corr_clusters = corr_df_filt.index
+    # print(corr_df_filt)
+    # print(matrix_corr_clusters)
+
+    # combine matrix image with cluster images with matrix corr > correlation threshold
+    extended_matrix_img = np.zeros((p.imzmldict["max count of pixels y"]+1, p.imzmldict["max count of pixels x"]+1), dtype=int)
+    for cl in matrix_corr_clusters:
+        cl_img = tifffile.imread(os.path.join(img_dir, sample_cluster_files[clusters.index(cl)]))
+        extended_matrix_img[cl_img == 255] = 255
+    extended_matrix_img[matrix_img == 255] = 255
+    tifffile.imwrite(os.path.join(result_dir, sample_name + '_extended_matrix_image.tif'), extended_matrix_img.astype('uint8'))
 
 
 if __name__ == '__main__':

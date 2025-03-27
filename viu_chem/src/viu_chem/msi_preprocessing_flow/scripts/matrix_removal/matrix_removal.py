@@ -11,10 +11,137 @@ from pyimzml.ImzMLWriter import ImzMLWriter
 from tqdm import tqdm
 from scipy.ndimage import binary_dilation, binary_erosion, binary_closing, binary_opening, binary_fill_holes
 from skimage.morphology import remove_small_objects, octagon
+from viu_chem.msi_pkg import utils
+from viu_chem.msi_pkg.plot import get_mz_img
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-from pkg import utils
-from pkg.plot import get_mz_img
+def matrix_removal(imzML_fl:str,matrix_img:str,proc_matrix_img:int=1,pixel_removal:int=1,matrix_subtraction:int=0,matrix_peaks_removal:int=0,num_matrix_peaks:int=20,result_dir:str='',qc:int=1,plot:int=0):
+    if result_dir == '':
+        result_dir = os.path.join(os.path.dirname(imzML_fl), "matrix_removal")
+    if not os.path.exists(result_dir):
+        os.mkdir(result_dir)
+
+    if qc == 1:
+        qc_path = os.path.join(result_dir, 'quality_control')
+        if not os.path.exists(qc_path):
+            os.mkdir(qc_path)
+
+    if proc_matrix_img == 1:
+        img = tifffile.imread(matrix_img)
+        img = img - img.min()
+        img = (img / img.max()).astype(int)
+        img = img > 0
+
+        cleaned = remove_small_objects(img, min_size=5)
+        #matrix_img = binary_dilation(cleaned, structure=np.ones((2, 2)))
+        #cleaned=img
+        #struct_elem = octagon(3, 1)
+        struct_elem = np.ones((2, 2))
+        matrix_img = binary_dilation(cleaned, structure=np.ones((5, 5)))
+        matrix_img = binary_erosion(matrix_img, structure=struct_elem)
+        #matrix_img = binary_fill_holes(matrix_img)
+        #matrix_img = binary_opening(img)
+        #matrix_img = binary_closing(matrix_img)
+
+        # struct_elem = np.ones((3, 3))
+        # struct_elem = np.ones((3, 3))
+        # binary opening: 1. dilation 2. erosion
+        # matrix_img = binary_dilation(binary_erosion(img, structure=struct_elem), structure=struct_elem)
+        # binary closing: 1. erosion 2. dilation
+        # matrix_img = binary_erosion(binary_dilation(open_img, structure=struct_elem), structure=struct_elem)
+
+        if qc == 1 and proc_matrix_img == 1:
+            tifffile.imwrite(os.path.join(result_dir, os.path.basename(imzML_fl).split('.')[0] + '_postproc_matrix_image.tif'),
+                             (matrix_img * 255).astype(np.uint8))
+    else:
+        matrix_img = utils.NormalizeData(tifffile.imread(matrix_img))
+
+    if plot:
+        plt.imshow(matrix_img)
+        plt.show()
+
+    p = ImzMLParser(imzML_fl)
+    #pyx = (p.imzmldict["max count of pixels y"], p.imzmldict["max count of pixels x"])
+    df = utils.get_dataframe_from_imzML(imzML_fl, multi_index=False)
+    mzs = df.columns[2:].to_numpy()
+
+    # get matrix pixels
+    # matrix_pixels_df = pd.read_csv(args.matrix_pixels, index_col=0)
+    # matrix_pixels = matrix_pixels_df.to_numpy()
+    # matrix_img = np.invert(matrix_img)
+    bin_img_px_idx_np = np.nonzero(matrix_img)
+    # np.savetxt("test.csv",bin_img_px_idx_np,delimiter=",")
+    
+    
+    # print(bin_img_px_idx_np)
+    # print('no. of matrix pixels:', np.count_nonzero(matrix_img))
+    bin_img_px_idx = tuple(zip(bin_img_px_idx_np[1], bin_img_px_idx_np[0]))
+    matrix_pixels_df = pd.DataFrame.from_dict({'x': bin_img_px_idx_np[1], 'y': bin_img_px_idx_np[0]})
+
+
+    # get matrix spectrum
+    matrix_df = pd.merge(left=df, right=matrix_pixels_df, on=['x', 'y'])
+    matrix_spec = matrix_df.iloc[:, 2:].mean(axis=0)
+    matrix_spec_arr = matrix_spec.to_numpy()
+
+    # remove rows with matrix pixels from df
+    if pixel_removal == 1:
+        print('no. pixels before matrix removal: ', df.shape[0])
+        matching_pairs = pd.merge(df, matrix_df, on=['x', 'y'], how='inner')
+
+        df = df[~df.set_index(['x', 'y']).index.isin(matching_pairs.set_index(['x', 'y']).index)]
+
+        # df_merge = pd.merge(df, matrix_pixels_df, how='outer', on=['x', 'y'], indicator=True)
+        # df = df.loc[df_merge['_merge'] == 'left_only']
+        print('no. pixels after matrix removal: ', df.shape[0])
+
+    if matrix_subtraction == 1 or matrix_peaks_removal == 1:
+        if matrix_subtraction == 1:
+            # subtract matrix spectrum
+            df_sub = df.iloc[:, 2:].sub(matrix_spec_arr, axis=1)
+            df_sub[df_sub < 0] = 0  # set negative values to 0
+        else:
+            # get top n peaks
+            n = num_matrix_peaks
+            matrix_mzs_arr = matrix_df.iloc[:, 2:].columns.to_numpy()
+            matrix_mz_peak_idx = np.argpartition(matrix_spec_arr, -n)[-n:]
+            matrix_mz_peaks = matrix_mzs_arr[matrix_mz_peak_idx]
+            df_sub = df.iloc[:, 2:]
+            df_sub.loc[:, matrix_mz_peaks] = 0
+            #df_sub = df.drop(columns=matrix_mz_peaks.tolist())
+        # print(df_sub)
+
+        if plot == 1 or qc == 1:
+            sum_spec_df = utils.get_summarized_spectrum(df, method='mean')
+            sum_sub = np.mean(df_sub.to_numpy(), axis=0)
+            fig, (ax1, ax2) = plt.subplots(nrows=2, sharex=True, sharey=True)  # frameon=False removes frames
+            plt.subplots_adjust(hspace=.0)
+            ax1.stem(mzs, sum_spec_df.iloc[0, :].to_numpy(), linefmt='#5E4FA2', label='tissue', markerfmt=' ', basefmt=" ",)
+            ax1.stem(mzs, matrix_spec.to_numpy().flatten(), markerfmt=' ', basefmt=" ", linefmt='#9F0142', label='matrix')
+            ax2.stem(mzs, sum_sub, linefmt='#5E4FA2', label='matrix subtracted',  markerfmt=' ', basefmt=" ")
+            ax1.legend()
+            ax2.legend()
+            plt.xlabel('m/z')
+            plt.ylabel('intensities [a.u.]')
+
+            if qc == 1:
+                plt.savefig(os.path.join(qc_path, os.path.basename(imzML_fl).split('.')[0] + '_matrix_sub_spectrum.svg'))
+
+            if plot == 1:
+                plt.show()
+            plt.close()
+    else:
+        df_sub = df.iloc[:, 2:]
+
+
+
+
+    # write matrix subtracted data
+    with ImzMLWriter(os.path.join(result_dir, os.path.basename(imzML_fl))) as writer:
+        for i in tqdm(range(df_sub.shape[0])):
+            writer.addSpectrum(df_sub.columns.to_numpy(), df_sub.iloc[i, :].to_numpy(),
+                               (df.iloc[i, 0], df.iloc[i, 1]))
+
+
 
 
 if __name__ == '__main__':

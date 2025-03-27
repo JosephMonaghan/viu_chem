@@ -65,30 +65,32 @@ def pmatch_nn(refmz, mz, maxshift):
     return refmzidcs, mzindcs
 
 
-if __name__ == '__main__':
-    # refmz = np.array([0.50, 1.00, 1.50, 2.00, 2.50, 3.00])
-    # mz = np.array([0.6, 2.2])
-    # mz_ints = np.array([1, 2])
-    # maxshift = 0.5
-    # cmz_idx, matchmz_idx = pmatch_nn(refmz, mz, maxshift)
-    # print(cmz_idx)
-    # print(matchmz_idx)
-    #
-    # cmz_ints = np.zeros(refmz.shape)
-    # cmz_ints[cmz_idx] = mz_ints[matchmz_idx]
-    # print(refmz)
-    # print(cmz_ints)
+def align(imzML_fl:str,refmz:str,result_dir:str='',max_shift:float=0.05,debug:bool=False):
+    if result_dir == '':
+        result_dir = os.path.join(os.path.dirname(imzML_fl), "alignment")
+        if not os.path.exists(result_dir):
+            os.mkdir(result_dir)
 
-    # mz = np.array([0.4, 0.45, 0.5, 0.6,
-    #                1.0, 1.1, 1.15, 1.15, 1.15,
-    #                1.5, 1.55, 1.55,
-    #                1.9, 1.95, 2.0, 2.0, 2.0])
-    # mzres = 0.1
-    # mzmaxshift = 0.5
-    # mzunits = 'Da'
-    # #refmz = get_reference(mz, mzres, mzmaxshift, mzunits)
-    # refmz = get_cmz_histo(mz, 5, mzres, plot=True)
-    # print(refmz)
+    all_mzs = []
+    all_ints = []
+
+    # get common m/z vector
+    cmz = np.load(refmz).astype(np.float32)
+
+    # align all data to common m/z vector
+    p = ImzMLParser(imzML_fl)
+    with ImzMLWriter(os.path.join(result_dir, os.path.basename(imzML_fl))) as writer:
+        for idx, (x, y, z) in enumerate(tqdm(p.coordinates)):
+            mzs, intensities = p.getspectrum(idx)
+            mzs = mzs.astype(np.float32)
+            #cmz_intensities = get_ints_for_cmz(cmz, mzs, intensities)
+            cmz_idx, matchmz_idx = pmatch_nn(cmz, mzs, max_shift)
+            cmz_intensities = np.zeros(cmz.shape)
+            cmz_intensities[cmz_idx] = intensities[matchmz_idx]
+            writer.addSpectrum(cmz, cmz_intensities, (x, y, z))
+
+
+if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Performs alignment to reference based on a nearest neighbor approach')
     parser.add_argument('imzML_fl', type=str, help='imzMl file')

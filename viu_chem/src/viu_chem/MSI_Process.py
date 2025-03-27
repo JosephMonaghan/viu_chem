@@ -102,7 +102,7 @@ def get_aspect_ratio(src:str):
         return y_pix / x_pix
 
 
-def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str = None, cut_offs:tuple=(5, 95),quality:int=100, asp:float=1,scale:float=1):
+def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str = None, cut_offs:tuple=(5, 95),quality:int=100, asp:float=1,scale:float=1,NL_override=None):
     mpl.rcParams['savefig.pad_inches'] = 0
     up_cut = np.percentile(data,max(cut_offs))
     down_cut = np.percentile(data,min(cut_offs))
@@ -113,7 +113,10 @@ def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str
     fig = plt.figure()
     _plt = plt.subplot()
     _plt.axis('off')
-    _plt.imshow(img_cutoff,aspect=asp,interpolation="none",cmap=cmap,vmax=up_cut,vmin=0)
+    if NL_override == None:
+        _plt.imshow(img_cutoff,aspect=asp,interpolation="none",cmap=cmap,vmax=up_cut,vmin=0)
+    else:
+        _plt.imshow(img_cutoff,aspect=asp,interpolation="none",cmap=cmap,vmax=NL_override,vmin=0)
     size = fig.get_size_inches()
     scaled_size = size * scale
     fig.set_size_inches(scaled_size)
@@ -123,8 +126,8 @@ def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str
         if path is None:
             raise Exception("No file name specified")
         else:
-            
             fig.savefig(path, dpi=quality,pad_inches=0,bbox_inches='tight')
+            plt.close(fig)
     
 
 
