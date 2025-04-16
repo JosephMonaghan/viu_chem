@@ -59,6 +59,40 @@ def extract_peak(data:np.array, index:int, ret_window:tuple):
     within_window = data[(data[:,0] > ret_window[0]) & (data[:,0] < ret_window[1]), index]
     baseline_subtract = within_window - np.min(within_window)
     sum_method = np.sum(baseline_subtract)
+
     return sum_method
+
+
+def calcurve(x, y, xlabel:str="Your x label here!", ylabel:str="Your y label here!", color:str="#8C4FA4"):
+    if isinstance(x, list):
+        x = np.array(x)
+    if isinstance(y, list):
+        y = np.array(y)
+
+    #Generate linear fit
+    coeffs = np.polyfit(x, y, 1)
+    poly_eq = np.poly1d(coeffs)
+    x_fit = np.unique(x)
+    y_fit = poly_eq(x_fit)
+
+    y_pred = poly_eq(x)
+    ss_res = np.sum((y - y_pred) ** 2)  # Residual sum of squares
+    ss_tot = np.sum((y - np.mean(y)) ** 2)  # Total sum of squares
+    r2 = 1 - (ss_res / ss_tot)
+    
+    plt.plot(x_fit, y_fit, color=color,linestyle='--')
+    plt.scatter(x, y, marker='s',edgecolors='k', color=color)
+
+    # Prepare the equation string
+    slope, intercept = coeffs
+    equation = f"y = {slope:.2f}x + {intercept:.2f}\nR² = {r2:.3f}"
+
+    # Add text annotation for the equation
+    plt.text(0.2, 0.95, equation, transform=plt.gca().transAxes, va='top',ha='center', color=color)
+    # plt.text(0.05, 0.90, f"R² = {r2:.2f}", transform=plt.gca().transAxes, verticalalignment='top', color=color)
+    
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.show()
     
 
