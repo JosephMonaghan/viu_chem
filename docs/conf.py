@@ -8,7 +8,7 @@
 import os
 import sys
 from pathlib import Path
-sys.path.insert(0,os.path.abspath("../src/"))
+sys.path.insert(0,os.path.abspath("../src/viu_chem"))
 # sys.path.insert(0, str(Path('../', 'src').resolve()))
 
 project = 'viu_chem'
@@ -36,4 +36,4 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = 'sphinx_rtd_theme'
-html_static_path = ['_static']
+html_static_path = ['_build/_static']
