@@ -1,1 +1,0 @@
-# viu_chem
