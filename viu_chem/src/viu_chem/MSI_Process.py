@@ -27,9 +27,6 @@ def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float
         )
     
 
-
-
-
 def get_image_matrix(src:str, mz:list | float = 104.1070,tol: list | float = 10.0):
     """Placeholder for now"""
 
