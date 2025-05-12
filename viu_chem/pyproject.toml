@@ -13,7 +13,7 @@ dependencies = [
     "numpy (>=2.2.3,<3.0.0)",
     "pandas (>=2.2.3,<3.0.0)",
     "matplotlib (>=3.10.0,<4.0.0)",
-    "imzml-writer (>=0.0.31,<2)"
+    "imzml-writer (>=1.1.1,<2.0.0)",
 ]
 
 [tool.poetry]

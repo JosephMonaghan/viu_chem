@@ -8,29 +8,12 @@ import imzml_writer.utils as iw_utils
 import time
 import cv2 as cv
 import scipy.ndimage
+import matplotlib.colors as mcolors
 
 
 def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw"):
     """Placeholder"""
-    iw_utils.RAW_to_mzML(dir,write_mode=mode)
-    
-    ##Waiting loop to check if msconvert has finished it's work:
-    all_files = os.listdir(dir)
-    num_raw_files = 0
-    for file in all_files:
-        if file.split(".")[-1] == filetype:
-            num_raw_files+=1
-
-    num_mzML = 0
-    while num_mzML < num_raw_files:
-        num_mzML = 0
-        all_files = os.listdir(dir)
-        for file in all_files:
-            if file.split(".")[-1] == "mzML":
-                num_mzML += 1
-        time.sleep(1)
-
-    time.sleep(5)
+    iw_utils.RAW_to_mzML(dir,write_mode=mode,blocking=True)
 
     iw_utils.clean_raw_files(dir,filetype)
     mzML_path = os.path.join(dir,"Output mzML Files")
@@ -125,7 +108,7 @@ def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str
     size = fig.get_size_inches()
     scaled_size = size * scale
     fig.set_size_inches(scaled_size)
-    
+
     if custom_size:
         fig.set_size_inches(custom_size)
 
@@ -190,6 +173,62 @@ def find_data_filt_string(path:str, search_pattern:str):
             return os.path.join(working_folder,file)
 
 
+def grid_image(dir:str, dims:tuple=None,names:list=None,ext:str=".tif", title_string:str=None, savepath:str=None, cbar_cutoffs:tuple=(5, 95)):
+    """Takes in a folder of images and makes a grid from them to display them all at once.
+    
+    :param dims: Tuple of form height, width"""
+    all_images = [image for image in os.listdir(dir) if image.endswith(ext)]
+    all_images = [image for name in names for image in all_images if name in image]
+
+    fig, axarr = plt.subplots(dims[0], dims[1])
+    fig.set_size_inches(dims[1]*1.5,dims[0]*1.5)
+    fig.set_facecolor("#440154")
+    my_axes = axarr.ravel()
+
+    for idx, image in enumerate(all_images):
+        local_img = plt.imread(os.path.join(dir,image))
+        my_axes[idx].imshow(local_img)
+        my_axes[idx].set_title(names[idx], color='white')
+        my_axes[idx].set_axis_off()
+    
+    ticker = 0
+    while idx < len(my_axes)-1:
+        ticker +=1
+        idx += 1
+        my_axes[idx].set_axis_off()
+        my_axes[idx].set_facecolor("#440154")
+        if ticker==1:
+            my_axes[idx].text(0.5, 0.5, title_string, color='white', weight='bold', ha='center', va='center')
+        if ticker==2:
+            plt.tight_layout()
+            norm = mcolors.Normalize(vmin=0, vmax=100)
+            ax_pos = my_axes[idx].get_position()
+            width = 0.2
+            height = 0.7
+            cbar_position = [ax_pos.x0 + 0.05, ax_pos.y0, ax_pos.width * width, ax_pos.height * height]
+            cbar_ax = fig.add_axes(cbar_position)  # Add the colorbar axes at the defined position
+            cbar = fig.colorbar(
+                plt.cm.ScalarMappable(norm=norm, cmap='viridis'),
+                cax=cbar_ax,
+                orientation='vertical'
+            )
+            cbar.set_label('Intensity', color='white', rotation=270, va='center')  # Set your label if needed
+            cbar.ax.yaxis.set_tick_params(color='white')  # Set color for colorbar ticks
+            cbar.ax.yaxis.set_ticks_position('left')
+            cbar.set_ticks([0, 100])
+            cbar.set_ticklabels([f"{cbar_cutoffs[0]}th", f"{cbar_cutoffs[1]}th"])
+            cbar.ax.set_yticklabels(cbar.ax.get_yticklabels(), color='white')  # Set tick labels to white
+    
+    if not savepath:
+        plt.show()
+    else:
+        plt.savefig(savepath)
+        plt.close()
+
+
+
+
+
 def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, target_list:list, uniform_scale:bool=False,smooth:bool=False,universal_cutoff:float=80, ROI_files:list=None, ROI_path:str=None):
     """Convenient API to convert a folder full of imzML files into ion images for a provided list of metabolites.
     
@@ -223,6 +262,7 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
     TIC_list = []
     scale_list = []
     roi_list = []
+    real_dims = [] #Actual image dimensions to draw in inches
 
     #Check all the scales etc. - hold the data in memory so you don't have to retrieve fresh
     for file_idx, folder in enumerate(data_folders):
@@ -259,6 +299,7 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
         TIC_list.append(TIC_image)
         scale_list.append(scale)
         roi_list.append(roi_mask)
+        real_dims.append((x_scale/2540, y_scale/2540))
 
     print("Saving images...")
     for file_idx, folder in enumerate(data_folders):
@@ -280,9 +321,9 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
             
             
             if uniform_scale:
-                draw_ion_image(normalized, 'viridis', mode='save', path=path, asp=aspect_ratio, cut_offs=(20, 95), scale=scale, NL_override=NLs[idx])
+                draw_ion_image(normalized, 'viridis', mode='save', path=path, asp=aspect_ratio, cut_offs=(20, 95), scale=scale, NL_override=NLs[idx], custom_size=real_dims[file_idx])
             else:
-                draw_ion_image(normalized, cmap='viridis', mode='save', path=path, asp=aspect_ratio, cut_offs=(20, 95), scale=scale)
+                draw_ion_image(normalized, cmap='viridis', mode='save', path=path, asp=aspect_ratio, cut_offs=(20, 95), scale=scale, custom_size=real_dims[file_idx])
 
 
 
