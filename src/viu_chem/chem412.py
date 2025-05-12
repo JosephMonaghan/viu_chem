@@ -94,5 +94,6 @@ def calcurve(x, y, xlabel:str="Your x label here!", ylabel:str="Your y label her
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.show()
+
     
 
