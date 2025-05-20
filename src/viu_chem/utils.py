@@ -55,6 +55,7 @@ def extract_calibration(datafiles:list[str], concs:list[float],mz:float,toleranc
 
     #Fit / draw the calibration curve
     slope, intercept, r_value, p_value, std_err = stats.linregress(concs[::-1], intensities)
+    r_value = r_value ** 2
     if plot:
         y_fit = (slope * np.array(concs[::-1])) + intercept
         axes[1].plot(concs[::-1], y_fit)
