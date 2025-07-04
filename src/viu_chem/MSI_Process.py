@@ -11,11 +11,13 @@ import scipy.ndimage
 import matplotlib.colors as mcolors
 
 
-def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw"):
+def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw", stop_at_mzML:bool=False):
     """Placeholder"""
     iw_utils.RAW_to_mzML(dir,write_mode=mode,blocking=True)
 
     iw_utils.clean_raw_files(dir,filetype)
+    if stop_at_mzML:
+        return
     mzML_path = os.path.join(dir,"Output mzML Files")
     iw_utils.mzML_to_imzML_convert(PATH=mzML_path)
 
@@ -54,7 +56,19 @@ def get_TIC_image(src:str):
             tic_image = ImzMLParser.getionimage(img,500,9999)
     
     return tic_image
+
+def get_weighted_median_image(src:str):
+
+    def wmi_reduce_func(seq):
+        no_zeros = seq[seq!=0]
+        return np.median(no_zeros)
+
+    with warnings.catch_warnings(action='ignore'):
+        with ImzMLParser.ImzMLParser(filename=src, parse_lib='lxml') as img:
+            wmi = ImzMLParser.getionimage(img,500,9999,reduce_func=wmi_reduce_func)  
     
+    return wmi
+
 
 def get_scale(src:str):
     """Returns the dimensions of the image in µm
@@ -108,6 +122,7 @@ def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str
 
     if custom_size:
         fig.set_size_inches(custom_size)
+
 
     if mode == "draw":
         plt.show()
@@ -226,7 +241,7 @@ def grid_image(dir:str, dims:tuple=None,names:list=None,ext:str=".tif", title_st
 
 
 
-def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, target_list:list, uniform_scale:bool=False,smooth:bool=False,universal_cutoff:float=80, ROI_files:list=None, ROI_path:str=None):
+def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, target_list:list, include_codes:list=None, tolerance:float=10, uniform_scale:bool=False,smooth:bool=False,universal_cutoff:float=80, ROI_files:list=None, ROI_path:str=None):
     """Convenient API to convert a folder full of imzML files into ion images for a provided list of metabolites.
     
     :param dir: Path to the directory containing the imzML files (organized by experiment - each one in its own subfolder)
@@ -234,6 +249,8 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
     :param save_path: Path to a folder where images should be saved.
     :param mz_list: List of m/z to generate images for
     :param target_list: List of names matching the m/z list
+    :param include_codes: List of strings that must be included to produce an output (when you want to subset a larger campaign)
+    :param tolerance: Tolerance (in ppm) with which to extract the images
     :param uniform_scale: Optional argument for whether images should be scaled to self (False; default) or normalized to the most intense image (True)
     :param smooth: Should the resulting images be smoothed
     :param universal_cutoff: Fudge factor for the uniform_scaling - where should the intensity cutoff percentile be
@@ -245,7 +262,10 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
     data_folders = []
     for folder in all_folders:
         if not folder.startswith("."):
-            data_folders.append(folder)
+            if not include_codes:
+                data_folders.append(folder)
+            elif any(code.lower() in folder.lower() for code in include_codes):
+                data_folders.append(folder)
     
     for target in target_list:
         path = os.path.join(save_path, "images", target)
@@ -266,7 +286,7 @@ def bulk_image_export(dir:str,search_pattern:str, save_path:str, mz_list:list, t
         print(f"Starting file {file_idx+1} / {len(data_folders)} - {folder}")
         image = find_data_filt_string(os.path.join(dir,folder),search_pattern=search_pattern)
         aspect_ratio = get_aspect_ratio(image)
-        data = get_image_matrix(image, mz_list)
+        data = get_image_matrix(image, mz_list,tol=tolerance)
         TIC_image = get_TIC_image(image)
 
         if ROI_path is not None and ROI_files is not None:

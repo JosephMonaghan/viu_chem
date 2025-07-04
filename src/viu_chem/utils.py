@@ -2,6 +2,51 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
+import os
+import viu_chem.MSI_Process as msi
+import viu_chem.chem412
+import pymzml
+import re
+
+def cv_to_csv(directory:str,mz_list:list,tolerance:float=10):
+    """Converts a directory of .raw files for a FAIMS CV Scan to mzML (if needed), then outputs a dataframe with each mz intensity
+    against the CV value (from scan filter) as a CSV (one for each raw file in the directory)
+    
+    :param directory: Folder containing .raw files
+    :param mz_list: list of mz to export a CV spectrum for
+    :param tolerance: Tolerance to search for each mz (in ppm)"""
+
+    cv_regex = r"(-?\d+(?:\.\d+)?)"
+
+    directory_files = os.listdir(directory)
+    if "Output mzML Files" not in directory_files:
+        msi.convert_from_RAW(os.path.abspath(directory),stop_at_mzML=True)
+
+    
+    active_path = os.path.join(directory, "Output mzML Files")
+    mzML_files = [file for file in os.listdir(active_path) if file.endswith(".mzML")]
+
+    os.makedirs(os.path.join(directory,"Output CSV Files"),exist_ok=True)
+    for file in mzML_files:
+        cv_vals = []
+        run = pymzml.run.Reader(os.path.join(active_path,file))
+        for spec in run:
+            mtch = re.search(cv_regex,spec['filter string'])
+            if mtch:
+                cv_vals.append(float(mtch.group(1)))
+        
+        data = viu_chem.chem412.extract_from_existing_run(run,mz_list,tol=tolerance)
+        df = pd.DataFrame.from_dict(data)
+        df.index = cv_vals
+        save_path = os.path.join(directory,"Output CSV Files",f"{file.split(".mzML")[0]}.csv")
+        df.to_csv(save_path)
+
+
+
+
+
+
+
 
 def extract_calibration(datafiles:list[str], concs:list[float],mz:float,tolerance:float=25, plot:bool=True) ->dict:
     """Reads in a list of thermo-formatted .csv holding mass spectral data and a list of calibration concentrations and extracts
