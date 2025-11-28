@@ -9,7 +9,12 @@ import time
 import cv2 as cv
 import scipy.ndimage
 import matplotlib.colors as mcolors
+# from lamp import anno, stats, utils
 
+
+
+def annotate_by_mz_list(mz:list[float],tolerance:float=5):
+    pass
 
 def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw", stop_at_mzML:bool=False):
     """Placeholder"""
@@ -30,7 +35,11 @@ def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float
     
 
 def get_image_matrix(src:str, mz:list | float = 104.1070,tol: list | float = 10.0):
-    """Placeholder for now"""
+    """Retrieves the requested ion image as a numpy array
+    
+    :param src: File path to the imzML source
+    :param mz: m/z or list of m/z to retrieve images for
+    :param tol: Tolerance with which to retrieve the images"""
 
     with warnings.catch_warnings(action="ignore"):
         with ImzMLParser.ImzMLParser(filename=src,parse_lib='lxml') as img:
@@ -40,7 +49,7 @@ def get_image_matrix(src:str, mz:list | float = 104.1070,tol: list | float = 10.
             elif isinstance(mz,list):
                 img_raw = []
                 for idx, spp in enumerate(mz):
-                    if isinstance(tol,float):
+                    if isinstance(tol,float) or isinstance(tol,int):
                         tolerance = spp * tol / 1e6
                     elif isinstance(tol,list):
                         tolerance = spp * tol[idx] / 1e6
@@ -153,6 +162,13 @@ def smooth_image(img_data,asp:float, factor:int=3,base_sigma:float=10,weight_fac
 
 def find_matching_ROI(ROI_files:list,match_folder:str, ROI_folder:str):
     matching_npz = None
+
+    if f"{match_folder}.npz" in ROI_files:
+        matching_npz = os.path.join(ROI_folder, f"{match_folder}.npz")
+        all_data = np.load(matching_npz)
+        roi_mask = all_data['roi_mask']
+        return roi_mask
+
     for file in ROI_files:
         file_string = file.split(".npz")[0]
         if file_string in match_folder:
@@ -183,6 +199,68 @@ def find_data_filt_string(path:str, search_pattern:str):
     for file in os.listdir(working_folder):
         if search_pattern in file:
             return os.path.join(working_folder,file)
+
+
+
+
+def drawGrid(images:list[np.array],dims:tuple[int,int]=None,cut_off:float=95, title:str=None, aspects:list[float]=None, names:list[str]=None,):
+    """param images: List of np image arrays
+    param dims: Dimensions to draw the ion images in
+    param cut_off: Percentile cutoff to use for the global dataset
+    param title: Title to draw above the entire image
+    param aspects: aspect values for each image
+    param names: list of names to draw above each image"""
+
+    def add_cbar(ax:plt.Axes,fig:plt.figure,cbar_cutoffs:float=90):
+        ax_pos = ax.get_position()
+        width = 0.2
+        height = 0.7
+        cbar_position = [ax_pos.x0 + 0.05, ax_pos.y0, ax_pos.width * width, ax_pos.height * height]
+        cbar_ax = fig.add_axes(cbar_position) 
+        norm = mcolors.Normalize(vmin=0, vmax=cbar_cutoffs)
+        cbar = fig.colorbar(
+            plt.cm.ScalarMappable(norm=norm, cmap='viridis'),
+            cax=cbar_ax,
+            orientation='vertical'
+        )
+        cbar.set_label('Intensity', color='white', rotation=270, va='center') 
+        cbar.ax.yaxis.set_tick_params(color='white')
+        cbar.ax.yaxis.set_ticks_position('left')
+        cbar.set_ticks([0, cbar_cutoffs])
+        cbar.set_ticklabels(["0th", f"{cbar_cutoffs}th"])
+        cbar.ax.set_yticklabels(cbar.ax.get_yticklabels(), color='white')
+
+    if not dims:
+        dims = (4, int(np.ceil(len(images)/4)))
+    if not aspects:
+        aspects = [1 for _ in len(images)]
+
+
+    fig, ax = plt.subplots(dims[0], dims[1])
+    ax = ax.ravel()
+    fig.set_size_inches(dims[0]*1.5, dims[1]*1.5)
+    fig.set_facecolor("#440154")
+    if title:
+        fig.suptitle(title,color='white')
+    
+    scale_limit = 0
+    for image in images:
+        if np.percentile(image, cut_off) > scale_limit:
+            scale_limit = np.percentile(image, cut_off)
+    
+    for idx, (image, asp) in enumerate(zip(images,aspects)):
+        ax[idx].imshow(image, aspect=asp, vmax=scale_limit)
+        if names:
+            ax[idx].set_title(names[idx],color='white')
+        ax[idx].set_axis_off()
+    
+    for i in range(idx,len(ax)):
+        ax[i].set_axis_off()
+        ax[i].set_facecolor("#440154")
+    
+    add_cbar(ax[-1],fig,cut_off)
+
+    return fig
 
 
 def grid_image(dir:str, dims:tuple=None,names:list=None,ext:str=".tif", title_string:str=None, savepath:str=None, cbar_cutoffs:tuple=(5, 95)):

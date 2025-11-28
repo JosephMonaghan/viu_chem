@@ -6,6 +6,7 @@ import sys, os
 import json
 import numpy as np
 
+
 def convert_to_mzML(path:str, file_type:str):
     try:
         utils.RAW_to_mzML(path,blocking=True)
@@ -37,13 +38,14 @@ def extract_from_existing_run(run, mz_list:list, tol_mode:str='ppm', tol:float =
     return data
         
 
-def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10):
+def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10, ms_level:list[int]=[1]):
     run = pymzml.run.Reader(path)
         
     filt_strings = []
     data = {}
     for idx, spectrum in enumerate(run):
-        filt_strings.append(spectrum["filter string"])
+        if spectrum.ms_level in ms_level:
+            filt_strings.append(spectrum["filter string"])
         length = idx
         
     unique_filts = list(set(filt_strings)) #Gets unique filters
@@ -56,6 +58,10 @@ def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10):
     for filt in unique_filts:
         filt_idx = -1
         for spectrum in run:
+            mzs = np.array(spectrum.mz)
+            intensities = np.array(spectrum.i)
+
+
             if spectrum["filter string"] == filt:
                 filt_idx +=1
                 data[filt][filt_idx, 0] = spectrum.scan_time_in_minutes()
@@ -68,10 +74,21 @@ def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10):
                                 data[filt][filt_idx, mz_idx+1] = float(spectrum.i[idx])
 
                     elif tol_mode == "ppm":
-                        for idx, mz in enumerate(spectrum.mz):
-                            if (float(mz) > (mz_search - (mz_search*tol/1e6))) and (float(mz) < (mz_search + (mz_search*tol/1e6))):
-                                data[filt][filt_idx, mz_idx+1] = float(spectrum.i[idx])
+                        low = mz_search - (mz_search*tol/1e6)
+                        high = mz_search + (mz_search*tol/1e6)
 
+                        matches = intensities[(mzs > low) & (mzs < high)]
+                        if len(matches) > 0:
+                            data[filt][filt_idx, mz_idx+1] = np.max(matches)
+
+
+    for filt, data_vals in data.items():
+        if data_vals[0,0] == 0:
+            first_line = data_vals[0,:]
+            non_zeros = data_vals[data_vals[:,0] != 0,:]
+            data[filt] = np.vstack((first_line, non_zeros))
+        else:
+            data[filt] = data_vals[data_vals[:,0] != 0,:]
 
     if None in data.keys() and len(data.keys()) == 1:
         return data[None]
