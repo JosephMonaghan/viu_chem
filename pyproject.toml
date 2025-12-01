@@ -1,6 +1,6 @@
 [project]
 name = "viu-chem"
-version = "0.1.19"
+version = "0.1.22"
 description = "Collection of commonly used functions by VIU chemistry"
 authors = [
     {name = "Joseph Monaghan",email = "Joseph_Monaghan@outlook.com"}
@@ -20,6 +20,14 @@ dependencies = [
 [tool.poetry]
 packages = [{include = "viu_chem", from = "src"}]
 
+# Extras appear HERE:
+[tool.poetry.extras]
+annotation = ["lamps"]
+
+# Optional dependencies go in the main dependency table:
+[tool.poetry.dependencies]
+lamps = { version = "^1.0", optional = true }
+
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"
@@ -28,8 +36,8 @@ sphinx-autobuild = "^2024.10.3"
 sphinx-autodoc-typehints = "^3.2.0"
 sphinx-rtd-theme = "^3.0.2"
 
-[tool.poetry.extras]
-lamp = ["lamp"]
+[tool.poetry.group.annotation.dependencies]
+lamps = "^1.0"
 
 
 [build-system]
