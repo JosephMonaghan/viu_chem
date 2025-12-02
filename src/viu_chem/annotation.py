@@ -61,11 +61,16 @@ def adducts_to_df(adduct_list: list[Adduct]) -> pd.DataFrame:
     return pd.DataFrame([vars(a) for a in adduct_list])
 
 def tol_range(mz:float, tol:float=5):
-    low_range = mz - mz*tol/1e6
-    high_range = mz + mz*tol/1e6
-    return low_range, high_range
+    return mz*tol/1e6
 
 def annotate_mz(mz:float,adducts:list[AdductLabel] | None=None,tol:float=5) ->pd.DataFrame:
+    """Annotates a mz based on matching within a tolerance to the HMDB database for specified adducts.
+    
+    :param mz: m/z value to search for (as observed, do not compensate for adduct weight)
+    :param adducts: Which m/z adducts to search for, specified as a list of AdductLabel.[adduct] objects (typehinting should help here)
+    :param tol: m/z tolerance to search the database with
+    
+    :return: Dataframe containing matching metabolites with their respective adducts, sorted by their ppm offset"""
     if adducts is None:
         adducts = DEFAULT
 
@@ -74,17 +79,16 @@ def annotate_mz(mz:float,adducts:list[AdductLabel] | None=None,tol:float=5) ->pd
 
 
     match_lib = {}
+    # m/z range
+    window = tol_range(mz, tol)
     for _, row in adducts_lib.iterrows():
         # Convert observed m/z into neutral mass by subtracting adduct mass
         neutral_mass = mz - row.exact_mass
 
-        # m/z range
-        low, high = tol_range(neutral_mass, tol)
-
         # Filter HMDB within tolerance
         subset = hmdb_metabolites[
-            (hmdb_metabolites["exact_mass"] >= low) &
-            (hmdb_metabolites["exact_mass"] <= high)
+            (hmdb_metabolites["exact_mass"] >= (neutral_mass - window)) &
+            (hmdb_metabolites["exact_mass"] <= (neutral_mass + window))
         ].copy()
 
         if len(subset) == 0:
