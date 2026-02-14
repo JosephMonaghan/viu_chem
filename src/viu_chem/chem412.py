@@ -1,9 +1,6 @@
 import imzml_writer.utils as utils
 import pymzml
-import pandas as pd
 import matplotlib.pyplot as plt
-import sys, os
-import json
 import numpy as np
 
 
@@ -14,28 +11,6 @@ def convert_to_mzML(path:str, file_type:str):
         return True
     except Exception as e:
         return e
-
-
-
-
-def extract_from_existing_run(run, mz_list:list, tol_mode:str='ppm', tol:float = 10):
-    data = {mz:[] for mz in mz_list}
-    for spectrum in run:
-        for mz_idx, mz_search in enumerate(mz_list):
-            if tol_mode == "unit":
-                for idx, mz in enumerate(spectrum.mz):
-                    if (float(mz) > (mz_search - 0.5) and float(mz) < (mz_search + 0.5)):
-                        data[mz_search].append(float(spectrum.i[idx]))
-
-            elif tol_mode == "ppm":
-                summed_signal = 0
-                for idx, mz in enumerate(spectrum.mz):
-                    if (float(mz) > (mz_search - (mz_search*tol/1e6))) and (float(mz) < (mz_search + (mz_search*tol/1e6))):
-                        summed_signal+=float(spectrum.i[idx])
-
-                data[mz_search].append(summed_signal)
-    
-    return data
         
 
 def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10, ms_level:list[int]=[1]):

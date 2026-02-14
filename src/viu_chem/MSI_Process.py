@@ -5,16 +5,10 @@ import warnings
 import numpy as np
 import os
 import imzml_writer.utils as iw_utils
-import time
 import cv2 as cv
 import scipy.ndimage
 import matplotlib.colors as mcolors
-# from lamp import anno, stats, utils
 
-
-
-def annotate_by_mz_list(mz:list[float],tolerance:float=5):
-    pass
 
 def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw", stop_at_mzML:bool=False):
     """Placeholder"""
@@ -185,20 +179,36 @@ def find_matching_ROI(ROI_files:list,match_folder:str, ROI_folder:str):
         
             
 
-def find_data_filt_string(path:str, search_pattern:str):
-    bad_options = ["Initial RAW files", "Output mzML Files"]
-    top_files = os.listdir(path)
-    for candidate in top_files:
-        if os.path.isdir(os.path.join(path, candidate)):
-            if not candidate.startswith(".") and candidate not in bad_options:
-                working_folder = os.path.join(path,candidate)
-                break
-        elif candidate.endswith(search_pattern):
-            return os.path.join(path, candidate)
+# def find_data_filt_string(path:str, search_pattern:str):
+#     bad_options = ["Initial RAW files", "Output mzML Files"]
+#     top_files = os.listdir(path)
+#     for candidate in top_files:
+#         if os.path.isdir(os.path.join(path, candidate)):
+#             if not candidate.startswith(".") and candidate not in bad_options:
+#                 if ".imzML" in any(os.listdir(candidate)):
+#                     working_folder = os.path.join(path, candidate)
+#                     break
+#         elif candidate.endswith(search_pattern):
+#             return os.path.join(path, candidate)
         
-    for file in os.listdir(working_folder):
-        if search_pattern in file:
-            return os.path.join(working_folder,file)
+#     for file in os.listdir(working_folder):
+#         if search_pattern in file:
+#             return os.path.join(working_folder,file)
+def find_data_filt_string(path: str, search_pattern: str):
+    bad_options = {"Initial RAW files", "Output mzML Files"}
+
+    for root, dirs, files in os.walk(path):
+        # Modify dirs *in-place* to prevent descending into bad folders
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".") and d not in bad_options
+        ]
+
+        for file in files:
+            if search_pattern in file:
+                return os.path.join(root, file)
+
+    return None
 
 
 
