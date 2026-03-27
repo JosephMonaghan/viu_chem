@@ -481,6 +481,7 @@ def rewrite_imzml_with_common_mz(
     tol_ppm: float = 5.0,
     suffix: str = "-common",
     overwrite: bool = True,
+    annotate_imzML: bool = True
 ) -> list[Path]:
     """
     Rewrite imzML files so each spectrum shares a common m/z axis.
@@ -492,6 +493,7 @@ def rewrite_imzml_with_common_mz(
     :param tol_ppm: ppm tolerance used to map peaks to common_mz
     :param suffix: suffix appended to output filename stem
     :param overwrite: allow overwriting existing outputs
+    :param annotate_imzML: Whether or not to annotate resulting imzML files based on the source
     :return: list of output imzML paths
     """
     if not image_paths:
@@ -542,7 +544,8 @@ def rewrite_imzml_with_common_mz(
 
                         out_imzml.addSpectrum(common_mz, out_int, (x, y, z))
 
-        iw_utils.annotate_from_model_imzML(str(p), str(out_path))
+        if annotate_imzML:
+            iw_utils.annotate_from_model_imzML(str(p), str(out_path))
         out_paths.append(out_path)
 
     return out_paths

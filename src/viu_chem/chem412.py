@@ -2,6 +2,9 @@ import imzml_writer.utils as utils
 import pymzml
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import csv
+from pathlib import Path
 
 
 def convert_to_mzML(path:str, file_type:str):
@@ -109,6 +112,40 @@ def calcurve(x, y, xlabel:str="Your x label here!", ylabel:str="Your y label her
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.show()
+
+def extract_7010(path:Path) -> pd.DataFrame:
+    
+    data = {}
+    row_header = None
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[0] == "#Point":
+                continue
+            try:
+                float(row[0])
+                times.append(float(row[1]))
+                signals.append(float(row[2]))
+            except ValueError:
+                if row_header != None:
+                    data[row_header] = {"times":times, "sig":signals}
+                row_header = row[0]
+                times = []
+                signals = []
+    
+    data[row_header] = {"times": times,"sig": signals}
+    
+    new = True
+    for key, val in data.items():
+        if new:
+            df = pd.DataFrame(data=val)
+            df.columns = ["Time (mins)", key]
+            new = False
+        
+        df[key] = val['sig']
+    
+    return df
+
 
     
 
