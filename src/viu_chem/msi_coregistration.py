@@ -921,6 +921,7 @@ def launch_coregistration_gui(
     active_dataset_label: str | None = None
     dataset_choice_to_key: dict[str, str] = {}
     suppress_registration_control_autocall = False
+    startup_camera_state: dict[str, Any] | None = None
 
     def dataset_choice_text(state: dict[str, Any]) -> str:
         label = str(state["label"]).strip() or str(state["id"])
@@ -1773,6 +1774,39 @@ def launch_coregistration_gui(
                 registered_cs=registered_cs,
             )
 
+    @magicgui(call_button="Export Current View TIFF")
+    def export_current_view_widget():
+        default_name = f"{get_active_state()['label']}_view.tif"
+        dialog = QFileDialog(None, "Export current MSI view")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter("TIFF (*.tif *.tiff)")
+        dialog.setDirectory(str(Path(get_active_state()["dataset"].zarr_path).parent))
+        dialog.selectFile(default_name)
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selectedFiles()
+        if not selected:
+            return
+        path = Path(selected[0]).expanduser()
+        if path.suffix.lower() not in {".tif", ".tiff"}:
+            path = path.with_suffix(".tif")
+        screenshot = viewer.screenshot(canvas_only=True, flash=False)
+        iio.imwrite(path, np.asarray(screenshot))
+
+    @magicgui(call_button="Reset Canvas View")
+    def reset_canvas_view_widget():
+        nonlocal startup_camera_state
+        if not startup_camera_state:
+            return
+        try:
+            viewer.camera.center = startup_camera_state["center"]
+            viewer.camera.zoom = startup_camera_state["zoom"]
+            if "angles" in startup_camera_state:
+                viewer.camera.angles = startup_camera_state["angles"]
+        except Exception:
+            pass
+
     controls_scroll = QScrollArea()
     controls_scroll.setWidgetResizable(True)
     controls_container = QWidget()
@@ -1780,6 +1814,8 @@ def launch_coregistration_gui(
     controls_layout.setContentsMargins(6, 6, 6, 6)
     controls_layout.setSpacing(8)
     controls_layout.addWidget(spectrum_widget)
+    controls_layout.addWidget(reset_canvas_view_widget.native)
+    controls_layout.addWidget(export_current_view_widget.native)
     controls_layout.addWidget(rename_dataset_widget.native)
     controls_layout.addWidget(copy_affine_to_target_widget.native)
     controls_layout.addWidget(msi_layer_controls)
@@ -1810,6 +1846,11 @@ def launch_coregistration_gui(
     sync_controls_to_active_dataset()
     try:
         viewer.reset_view()
+        startup_camera_state = {
+            "center": tuple(viewer.camera.center),
+            "zoom": float(viewer.camera.zoom),
+            "angles": tuple(viewer.camera.angles),
+        }
     except Exception:
         pass
     napari.run()
