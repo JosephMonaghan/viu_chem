@@ -19,8 +19,11 @@ import napari
 from magicgui import magicgui
 from matplotlib import colormaps as mpl_colormaps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 from napari.utils.colormaps import Colormap
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QAction, QIcon
 from qtpy.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -32,6 +35,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QRadioButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -501,9 +505,16 @@ class CoregistrationDataset:
         ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
         return np.flatnonzero(ppm_errors <= ppm_tolerance).astype(int)
 
-    def find_local_max_idx_near_mz(self, target_mz: float) -> int:
-        local_idx = int(np.argmin(np.abs(self.mz_values[self.local_maxima_indices] - target_mz)))
-        return int(self.local_maxima_indices[local_idx])
+    def find_local_max_idx_near_mz(self, target_mz: float, mz_window: tuple[float, float] | None = None) -> int:
+        candidate_indices = self.local_maxima_indices
+        if mz_window is not None:
+            lo, hi = float(min(mz_window)), float(max(mz_window))
+            in_window = candidate_indices[(self.mz_values[candidate_indices] >= lo) & (self.mz_values[candidate_indices] <= hi)]
+            if in_window.size:
+                strongest_local = int(np.argmax(self.avg_spectrum[in_window]))
+                return int(in_window[strongest_local])
+        local_idx = int(np.argmin(np.abs(self.mz_values[candidate_indices] - target_mz)))
+        return int(candidate_indices[local_idx])
 
     def load_saved_registration_if_available(self) -> tuple[np.ndarray, bool]:
         try:
@@ -1186,23 +1197,102 @@ def launch_coregistration_gui(
     spectrum_widget = QWidget()
     spectrum_layout = QVBoxLayout(spectrum_widget)
     spectrum_layout.setContentsMargins(6, 6, 6, 6)
-    spectrum_layout.addWidget(QLabel("Average spectrum (click to select m/z)"))
+    spectrum_label = QLabel("Average spectrum (click to select m/z)")
+    spectrum_layout.addWidget(spectrum_label)
     spectrum_widget.setMinimumHeight(360)
     spectrum_widget.setMinimumWidth(560)
     spectrum_fig = Figure(figsize=(7.5, 3.8), constrained_layout=True)
     spectrum_canvas = FigureCanvas(spectrum_fig)
+    spectrum_toolbar = NavigationToolbar2QT(spectrum_canvas, spectrum_widget)
+    pick_mz_action = QAction("Pick m/z", spectrum_toolbar)
+    pick_mz_action.setCheckable(True)
+    pick_mz_action.setChecked(True)
+    spectrum_toolbar.addSeparator()
+    spectrum_toolbar.addAction(pick_mz_action)
+    for action in list(spectrum_toolbar.actions()):
+        text = str(action.text()).lower()
+        if any(token in text for token in ("back", "forward", "subplots", "customize")):
+            spectrum_toolbar.removeAction(action)
     spectrum_ax = spectrum_fig.add_subplot(111)
-    spectrum_ax.set_xlabel("m/z")
-    spectrum_ax.set_ylabel("Average intensity")
     current_mz_line = None
+    spectrum_layout.addWidget(spectrum_toolbar)
     spectrum_layout.addWidget(spectrum_canvas)
+
+    def recolor_toolbar_icons():
+        fg_hex = "#ffffff"
+        active_hex = "#d7191c"
+        for child in spectrum_toolbar.findChildren(QToolButton):
+            is_active = bool(child.isChecked())
+            child.setStyleSheet(f"color: {active_hex if is_active else fg_hex};")
+            icon = child.icon()
+            if icon.isNull():
+                continue
+            pixmap = icon.pixmap(18, 18)
+            if pixmap.isNull():
+                continue
+            mask = pixmap.createMaskFromColor(Qt.GlobalColor.transparent)
+            pixmap.fill(Qt.GlobalColor.red if is_active else Qt.GlobalColor.white)
+            pixmap.setMask(mask)
+            child.setIcon(QIcon(pixmap))
+
+    def schedule_toolbar_recolor(*_args):
+        QTimer.singleShot(0, recolor_toolbar_icons)
+        QTimer.singleShot(0, clamp_spectrum_ylim)
+
+    def clamp_spectrum_ylim(_axes=None):
+        ymin, ymax = spectrum_ax.get_ylim()
+        if ymin < 0.0:
+            spectrum_ax.set_ylim(bottom=0.0, top=max(ymax, 0.0))
+            spectrum_canvas.draw_idle()
+
+    def apply_spectrum_theme():
+        fg_hex = "#ffffff"
+        spectrum_widget.setStyleSheet(f"background-color: transparent; color: {fg_hex};")
+        spectrum_label.setStyleSheet(f"color: {fg_hex};")
+        spectrum_canvas.setStyleSheet("background: transparent;")
+        spectrum_fig.patch.set_alpha(0.0)
+        spectrum_ax.set_facecolor((0.0, 0.0, 0.0, 0.0))
+        spectrum_ax.xaxis.label.set_color(fg_hex)
+        spectrum_ax.yaxis.label.set_color(fg_hex)
+        spectrum_ax.title.set_color(fg_hex)
+        spectrum_ax.tick_params(colors=fg_hex)
+        for spine in spectrum_ax.spines.values():
+            spine.set_color(fg_hex)
+        spectrum_toolbar.setStyleSheet(f"color: {fg_hex};")
+        recolor_toolbar_icons()
+
+    def disable_toolbar_navigation_mode():
+        mode = str(getattr(spectrum_toolbar, "mode", ""))
+        if "zoom" in mode.lower():
+            spectrum_toolbar.zoom()
+        elif "pan" in mode.lower():
+            spectrum_toolbar.pan()
+
+    def on_pick_mz_toggled(checked: bool):
+        if checked:
+            disable_toolbar_navigation_mode()
+
+    def on_toolbar_nav_triggered(_checked=False):
+        if bool(getattr(spectrum_toolbar, "mode", "")):
+            pick_mz_action.setChecked(False)
+        schedule_toolbar_recolor()
+
+    pick_mz_action.toggled.connect(on_pick_mz_toggled)
+    for action in spectrum_toolbar.actions():
+        text = str(action.text()).lower()
+        if "pan" in text or "zoom" in text:
+            action.triggered.connect(on_toolbar_nav_triggered)
+        action.changed.connect(schedule_toolbar_recolor)
+        action.triggered.connect(schedule_toolbar_recolor)
+    spectrum_canvas.mpl_connect("button_release_event", lambda event: clamp_spectrum_ylim())
 
     def redraw_spectrum_for_active_dataset():
         nonlocal current_mz_line
         state = get_active_state()
         coreg_dataset = state["dataset"]
         spectrum_ax.clear()
-        spectrum_ax.vlines(coreg_dataset.mz_values, 0, coreg_dataset.avg_spectrum, color="#2c7fb8", linewidth=0.7, alpha=0.9)
+        apply_spectrum_theme()
+        spectrum_ax.vlines(coreg_dataset.mz_values, 0, coreg_dataset.avg_spectrum, color="#ffffff", linewidth=0.7, alpha=0.9)
         spectrum_ax.set_xlabel("m/z")
         spectrum_ax.set_ylabel("Average intensity")
         spectrum_ax.set_title(f"Average spectrum: {state['label']}")
@@ -1212,18 +1302,27 @@ def launch_coregistration_gui(
             linewidth=1.2,
             alpha=0.9,
         )
+        spectrum_ax.set_ylim(bottom=0.0)
         spectrum_canvas.draw_idle()
 
     def on_spectrum_click(event):
-        if event.xdata is None:
+        if event.xdata is None or event.inaxes is not spectrum_ax or not pick_mz_action.isChecked() or bool(getattr(spectrum_toolbar, "mode", "")):
             return
         state = get_active_state()
         coreg_dataset = state["dataset"]
-        idx = coreg_dataset.find_local_max_idx_near_mz(float(event.xdata))
+        x0, x1 = spectrum_ax.get_xlim()
+        x_span = abs(float(x1) - float(x0))
+        half_window = max(1e-9, 0.0075 * x_span)
+        idx = coreg_dataset.find_local_max_idx_near_mz(
+            float(event.xdata),
+            mz_window=(float(event.xdata) - half_window, float(event.xdata) + half_window),
+        )
         mz_selector.target_mz.value = f"{float(coreg_dataset.mz_values[idx]):.4f}"
         update_ion_view_for_mz(float(coreg_dataset.mz_values[idx]), float(state["current_ppm_tolerance"]))
 
     spectrum_canvas.mpl_connect("button_press_event", on_spectrum_click)
+    spectrum_ax.callbacks.connect("ylim_changed", clamp_spectrum_ylim)
+    apply_spectrum_theme()
 
     @magicgui(
         normalize_to_tic={"widget_type": "CheckBox", "text": "Normalize to TIC"},
