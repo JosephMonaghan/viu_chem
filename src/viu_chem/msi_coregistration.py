@@ -23,9 +23,14 @@ from matplotlib.figure import Figure
 from napari.utils.colormaps import Colormap
 from qtpy.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
+    QGridLayout,
     QLabel,
     QMessageBox,
+    QRadioButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -855,23 +860,40 @@ def launch_coregistration_gui(
 
     _ensure_qapplication(QApplication)
 
-    def make_transparent_zero_colormap(cmap_name: str, display_name: str):
+    def make_transparent_zero_colormap(cmap_name: str):
         colors = np.asarray(mpl_colormaps[cmap_name](np.linspace(0, 1, 256)), dtype=float)
         colors[0, 3] = 0.0
-        return Colormap(colors=colors, name=f"{display_name.lower()}_zero_transparent")
+        return Colormap(colors=colors, name=f"{cmap_name.lower()}_zero_transparent")
 
     def make_binary_overlay_colormap(rgb=(1.0, 0.1, 0.1), alpha=0.45):
         colors = np.array([[0.0, 0.0, 0.0, 0.0], [float(rgb[0]), float(rgb[1]), float(rgb[2]), float(alpha)]], dtype=float)
         return Colormap(colors=colors, name="binary_overlay")
 
     viewer = napari.Viewer()
-    overlay_colormaps = {
-        "Viridis": make_transparent_zero_colormap("viridis", "Viridis"),
-        "Red": make_transparent_zero_colormap("Reds", "Red"),
-        "Blue": make_transparent_zero_colormap("Blues", "Blue"),
-        "Green": make_transparent_zero_colormap("Greens", "Green"),
-    }
-    overlay_colormap_order = list(overlay_colormaps.keys())
+    overlay_colormap_order = [
+        "viridis",
+        "magma",
+        "inferno",
+        "plasma",
+        "cividis",
+        "turbo",
+        "Reds",
+        "Blues",
+        "Greens",
+        "Purples",
+        "Oranges",
+        "Greys",
+        "YlOrRd",
+        "YlGnBu",
+        "cubehelix",
+    ]
+    overlay_colormap_cache: dict[str, Any] = {}
+
+    def get_overlay_colormap(cmap_name: str):
+        if cmap_name not in overlay_colormap_cache:
+            overlay_colormap_cache[cmap_name] = make_transparent_zero_colormap(cmap_name)
+        return overlay_colormap_cache[cmap_name]
+
     roi_overlay_colormap = make_binary_overlay_colormap()
 
     def choose_dataset_label(base_value: str | Path, existing: set[str]) -> str:
@@ -896,6 +918,16 @@ def launch_coregistration_gui(
     def current_dataset_choices() -> list[str]:
         return [dataset_choice_text(state) for state in datasets.values()]
 
+    def clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                clear_layout(child_layout)
+
     def build_dataset_state(coreg_dataset: CoregistrationDataset, label: str) -> dict[str, Any]:
         initial_idx = int(np.abs(coreg_dataset.mz_values - 268.1040).argmin())
         initial_img = coreg_dataset.reconstruct_ion_image(initial_idx, normalize_to_tic=True)
@@ -907,24 +939,13 @@ def launch_coregistration_gui(
             scale_guess, _ = coreg_dataset.estimate_initial_scale_from_pixel_sizes()
             saved_xy_matrix = scale_guess
 
-        tic_layer = viewer.add_image(coreg_dataset.tic_array, name=f"{label} TIC", visible=False)
-        overlay_name = overlay_colormap_order[len(datasets) % len(overlay_colormap_order)]
+        overlay_name = "viridis"
         ion_layer = viewer.add_image(
             prepare_ion_for_display(initial_img),
             name=f"{label} m/z {coreg_dataset.mz_values[initial_idx]:.4f}",
             opacity=0.6,
-            colormap=overlay_colormaps[overlay_name],
+            colormap=get_overlay_colormap(overlay_name),
             contrast_limits=auto_contrast_limits(initial_img),
-            visible=False,
-        )
-        roi_mask_layer = viewer.add_image(
-            np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8),
-            name=f"{label} ROI selection mask",
-            colormap=roi_overlay_colormap,
-            contrast_limits=(0, 1),
-            interpolation2d="nearest",
-            blending="translucent",
-            opacity=1.0,
             visible=False,
         )
         msi_landmarks = viewer.add_points(name=f"{label} MSI landmarks", ndim=2, face_color="#ff7f0e", size=8, visible=False)
@@ -945,12 +966,12 @@ def launch_coregistration_gui(
             "current_feature_indices": np.array([initial_idx], dtype=int),
             "current_normalize_to_tic": True,
             "current_colormap_name": overlay_name,
+            "current_opacity": 0.6,
             "current_contrast_low_pct": 1.0,
             "current_contrast_high_pct": 99.5,
             "current_transform_xy": np.asarray(saved_xy_matrix, dtype=float).copy(),
-            "tic_layer": tic_layer,
             "ion_layer": ion_layer,
-            "roi_mask_layer": roi_mask_layer,
+            "roi_mask_layer": None,
             "msi_landmarks": msi_landmarks,
         }
         return state
@@ -965,11 +986,34 @@ def launch_coregistration_gui(
 
     def apply_transform_to_state(state: dict[str, Any]):
         aff_yx = xy_to_yx_matrix(state["current_transform_xy"])
-        for layer_key in ("ion_layer", "roi_mask_layer"):
+        for layer_key in ("ion_layer",):
             layer = state[layer_key]
             layer.affine = aff_yx
             layer.scale = (1.0, 1.0)
             layer.translate = (0.0, 0.0)
+        roi_mask_layer = state.get("roi_mask_layer")
+        if roi_mask_layer is not None:
+            roi_mask_layer.affine = aff_yx
+            roi_mask_layer.scale = (1.0, 1.0)
+            roi_mask_layer.translate = (0.0, 0.0)
+
+    def ensure_roi_mask_layer(state: dict[str, Any]):
+        if state.get("roi_mask_layer") is not None:
+            return state["roi_mask_layer"]
+        coreg_dataset = state["dataset"]
+        roi_mask_layer = viewer.add_image(
+            np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8),
+            name=f"{state['label']} ROI selection mask",
+            colormap=roi_overlay_colormap,
+            contrast_limits=(0, 1),
+            interpolation2d="nearest",
+            blending="translucent",
+            opacity=1.0,
+            visible=False,
+        )
+        state["roi_mask_layer"] = roi_mask_layer
+        apply_transform_to_state(state)
+        return roi_mask_layer
 
     def add_dataset_to_view(coreg_dataset: CoregistrationDataset, label: str):
         state = build_dataset_state(coreg_dataset, label)
@@ -1086,6 +1130,7 @@ def launch_coregistration_gui(
 
     initial_state = next(iter(datasets.values()))
     active_dataset_label = str(initial_state["id"])
+    initial_state["ion_layer"].visible = True
 
     def get_active_state() -> dict[str, Any]:
         assert active_dataset_label is not None
@@ -1182,7 +1227,6 @@ def launch_coregistration_gui(
 
     @magicgui(
         normalize_to_tic={"widget_type": "CheckBox", "text": "Normalize to TIC"},
-        overlay_colormap={"widget_type": "ComboBox", "choices": overlay_colormap_order},
         contrast_percentiles={
             "widget_type": "FloatRangeSlider",
             "min": 0.0,
@@ -1194,14 +1238,10 @@ def launch_coregistration_gui(
     )
     def ion_display_options(
         normalize_to_tic=True,
-        overlay_colormap: str = overlay_colormap_order[0],
         contrast_percentiles: tuple[float, float] = (1.0, 99.5),
     ):
         state = get_active_state()
         state["current_normalize_to_tic"] = bool(normalize_to_tic)
-        if overlay_colormap in overlay_colormaps:
-            state["current_colormap_name"] = overlay_colormap
-            state["ion_layer"].colormap = overlay_colormaps[overlay_colormap]
         low, high = contrast_percentiles
         low = float(low)
         high = float(high)
@@ -1233,10 +1273,12 @@ def launch_coregistration_gui(
     def roi_mask_controls(show_mask: bool = False, roi_shape_key: str = "(none)", region_mode: str = "regular_only"):
         state = get_active_state()
         coreg_dataset = state["dataset"]
-        roi_mask_layer = state["roi_mask_layer"]
         if not show_mask or roi_shape_key not in coreg_dataset.sdata.shapes:
-            roi_mask_layer.visible = False
+            roi_mask_layer = state.get("roi_mask_layer")
+            if roi_mask_layer is not None:
+                roi_mask_layer.visible = False
             return
+        roi_mask_layer = ensure_roi_mask_layer(state)
         rois = coreg_dataset.sdata.transform_element_to_coordinate_system(roi_shape_key, registered_cs)
         areas = np.array([geom.area for geom in rois.geometry], dtype=float)
         whole_idx = int(np.argmax(areas))
@@ -1402,20 +1444,16 @@ def launch_coregistration_gui(
     initial_dataset_choices = current_dataset_choices()
     initial_active_choice = dataset_choice_text(initial_state)
 
-    @magicgui(dataset={"widget_type": "ComboBox", "choices": initial_dataset_choices}, auto_call=True)
-    def dataset_selector(dataset: str = initial_active_choice):
-        target = dataset_choice_to_key.get(str(dataset))
-        if target in datasets:
-            set_active_dataset(str(target))
-
     @magicgui(display_name={"widget_type": "LineEdit"}, call_button="Rename Active Dataset")
     def rename_dataset_widget(display_name: str = str(initial_state["label"])):
         state = get_active_state()
         new_name = rename_msi_dataset(state["dataset"].zarr_path, table_key=state["dataset"].table_key, display_name=display_name)
         state["label"] = new_name
         state["dataset"].display_name = new_name
-        state["tic_layer"].name = f"{new_name} TIC"
-        state["roi_mask_layer"].name = f"{new_name} ROI selection mask"
+        roi_mask_layer = state.get("roi_mask_layer")
+        if roi_mask_layer is not None:
+            roi_mask_layer.name = f"{new_name} ROI selection mask"
+        state["msi_landmarks"].name = f"{new_name} MSI landmarks"
         update_ion_view(state["current_feature_idx"])
         refresh_all_landmark_numbering()
         sync_controls_to_active_dataset()
@@ -1437,6 +1475,63 @@ def launch_coregistration_gui(
         if str(target_state["id"]) == str(active_dataset_label):
             sync_controls_to_active_dataset()
 
+    msi_layer_controls = QWidget()
+    msi_layer_controls_layout = QGridLayout(msi_layer_controls)
+    msi_layer_controls_layout.setContentsMargins(0, 0, 0, 0)
+    msi_layer_controls_layout.setHorizontalSpacing(4)
+    msi_layer_controls_layout.setVerticalSpacing(2)
+    msi_layer_active_group = QButtonGroup(msi_layer_controls)
+    msi_layer_active_group.setExclusive(True)
+
+    def rebuild_msi_layer_controls():
+        nonlocal msi_layer_active_group
+        clear_layout(msi_layer_controls_layout)
+        msi_layer_active_group = QButtonGroup(msi_layer_controls)
+        msi_layer_active_group.setExclusive(True)
+        msi_layer_controls_layout.addWidget(QLabel("Dataset"), 0, 0)
+        msi_layer_controls_layout.addWidget(QLabel("Active"), 0, 1)
+        msi_layer_controls_layout.addWidget(QLabel("Show"), 0, 2)
+        msi_layer_controls_layout.addWidget(QLabel("Cmap"), 0, 3)
+
+        for row_idx, state in enumerate(datasets.values(), start=1):
+            dataset_key = str(state["id"])
+            label = QLabel(str(state["label"]))
+            active_button = QRadioButton()
+            active_button.setChecked(dataset_key == str(active_dataset_label))
+            checkbox = QCheckBox()
+            checkbox.setChecked(bool(state["ion_layer"].visible))
+            cmap_combo = QComboBox()
+            cmap_combo.addItems(list(overlay_colormap_order))
+            cmap_combo.setCurrentText(str(state["current_colormap_name"]))
+            cmap_combo.setMaximumWidth(110)
+            if hasattr(QComboBox, "SizeAdjustPolicy"):
+                cmap_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+
+            def _set_visible(checked, dataset_key=dataset_key):
+                if dataset_key not in datasets:
+                    return
+                datasets[dataset_key]["ion_layer"].visible = bool(checked)
+
+            def _set_active(checked, dataset_key=dataset_key):
+                if checked:
+                    set_active_dataset(dataset_key)
+
+            def _set_colormap(value, dataset_key=dataset_key):
+                if dataset_key not in datasets or value not in mpl_colormaps:
+                    return
+                datasets[dataset_key]["current_colormap_name"] = str(value)
+                datasets[dataset_key]["ion_layer"].colormap = get_overlay_colormap(str(value))
+
+            msi_layer_active_group.addButton(active_button)
+            active_button.toggled.connect(_set_active)
+            checkbox.toggled.connect(_set_visible)
+            cmap_combo.currentTextChanged.connect(_set_colormap)
+
+            msi_layer_controls_layout.addWidget(label, row_idx, 0)
+            msi_layer_controls_layout.addWidget(active_button, row_idx, 1)
+            msi_layer_controls_layout.addWidget(checkbox, row_idx, 2)
+            msi_layer_controls_layout.addWidget(cmap_combo, row_idx, 3)
+
     def sync_controls_to_active_dataset():
         nonlocal suppress_registration_control_autocall
         state = get_active_state()
@@ -1447,18 +1542,13 @@ def launch_coregistration_gui(
             choice = dataset_choice_text(item)
             dataset_choice_to_key[choice] = str(item["id"])
             ordered_choices.append(choice)
-        dataset_selector.dataset.choices = ordered_choices
         copy_affine_to_target_widget.target_dataset.choices = ordered_choices
-        active_choice = dataset_choice_text(state)
-        if dataset_selector.dataset.value != active_choice:
-            dataset_selector.dataset.value = active_choice
         rename_dataset_widget.display_name.value = str(state["label"])
         target_choices = [choice for choice in ordered_choices if dataset_choice_to_key.get(choice) != str(state["id"])]
         copy_affine_to_target_widget.target_dataset.choices = target_choices if target_choices else [""]
         if copy_affine_to_target_widget.target_dataset.value not in copy_affine_to_target_widget.target_dataset.choices:
             copy_affine_to_target_widget.target_dataset.value = copy_affine_to_target_widget.target_dataset.choices[0]
         ion_display_options.normalize_to_tic.value = bool(state["current_normalize_to_tic"])
-        ion_display_options.overlay_colormap.value = str(state["current_colormap_name"])
         ion_display_options.contrast_percentiles.value = (
             float(state["current_contrast_low_pct"]),
             float(state["current_contrast_high_pct"]),
@@ -1469,6 +1559,7 @@ def launch_coregistration_gui(
         roi_mask_controls.roi_shape_key.choices = roi_shape_keys if roi_shape_keys else ["(none)"]
         if roi_mask_controls.roi_shape_key.value not in roi_mask_controls.roi_shape_key.choices:
             roi_mask_controls.roi_shape_key.value = roi_mask_controls.roi_shape_key.choices[0]
+        rebuild_msi_layer_controls()
         suppress_registration_control_autocall = True
         try:
             registration_controls.ty.value = float(state["current_transform_xy"][1, 2])
@@ -1479,10 +1570,10 @@ def launch_coregistration_gui(
             suppress_registration_control_autocall = False
         for key, other_state in datasets.items():
             other_state["msi_landmarks"].visible = (key == str(state["id"]))
-            other_state["ion_layer"].visible = (key == str(state["id"]))
             if key != str(state["id"]):
-                other_state["roi_mask_layer"].visible = False
-                other_state["tic_layer"].visible = False
+                roi_mask_layer = other_state.get("roi_mask_layer")
+                if roi_mask_layer is not None:
+                    roi_mask_layer.visible = False
         redraw_spectrum_for_active_dataset()
         try:
             roi_mask_controls()
@@ -1514,6 +1605,7 @@ def launch_coregistration_gui(
         except Exception:
             pass
         refresh_all_landmark_numbering()
+        state["ion_layer"].visible = True
         set_active_dataset(str(state["id"]))
 
     @magicgui(call_button="Add/Update Optical")
@@ -1589,9 +1681,9 @@ def launch_coregistration_gui(
     controls_layout.setContentsMargins(6, 6, 6, 6)
     controls_layout.setSpacing(8)
     controls_layout.addWidget(spectrum_widget)
-    controls_layout.addWidget(dataset_selector.native)
     controls_layout.addWidget(rename_dataset_widget.native)
     controls_layout.addWidget(copy_affine_to_target_widget.native)
+    controls_layout.addWidget(msi_layer_controls)
     controls_layout.addWidget(ion_display_options.native)
     controls_layout.addWidget(mz_selector.native)
     controls_layout.addWidget(roi_mask_controls.native)
@@ -1617,8 +1709,9 @@ def launch_coregistration_gui(
     enforce_reference_layers_at_bottom()
     add_annotation_shape_layers(initial_state)
     sync_controls_to_active_dataset()
+    try:
+        viewer.reset_view()
+    except Exception:
+        pass
     napari.run()
     return viewer
-
-
-
