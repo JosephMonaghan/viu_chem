@@ -197,9 +197,6 @@ def compute_campaign_mean_and_ref(
     # domain step clamp: helps keep domain size sane and reproducible
     min_step_ppm: float = 0.5,
     max_step_ppm: float = 2.0,
-    # peak picking on mean spectrum
-    presmooth_width: int = 201,
-    presmooth_order: int = 3,
     prominence: float | None = None,
     height_fraction: float = 1e-5,   # keep peaks >= fraction of max mean intensity
 ) -> CampaignRef:
@@ -245,23 +242,14 @@ def compute_campaign_mean_and_ref(
         tol_ppm=tol_ppm,
     )
 
-    # 4) smooth + peak-pick the mean spectrum
-    # SavGol requires odd window <= len
-    if presmooth_width % 2 == 0:
-        presmooth_width += 1
-    presmooth_width = min(presmooth_width, (len(mean_int) // 2) * 2 - 1)  # largest odd < len
-    presmooth_width = max(presmooth_width, 5)
-
-    mean_smooth = savgol_filter(mean_int, presmooth_width, presmooth_order)
-
     peak_kwargs = {}
     if prominence is not None:
         peak_kwargs["prominence"] = prominence
 
-    peak_idx, _ = find_peaks(mean_smooth, **peak_kwargs)
+    peak_idx, _ = find_peaks(mean_int, **peak_kwargs)
 
     ref_mz = domain_mz[peak_idx]
-    ref_int = mean_smooth[peak_idx]
+    ref_int = mean_int[peak_idx]
     ref_detect_freq = domain_detect_freq[peak_idx]
 
     # 5) threshold peaks by relative height
@@ -580,18 +568,17 @@ def _pool_spectra(image_path:Path | list[Path]):
 
 
 
-def generate_ref_list(image_path:Path | list[Path],tol:float=5, percentage_cutoff:float=0.0005,presmooth_width:int=201, presmooth_order:int=3):
+def generate_ref_list(image_path:Path | list[Path],tol:float=5, percentage_cutoff:float=0.0005):
 
     full_mz, full_intensity = _pool_spectra(image_path)
     
     mz_sort = np.argsort(full_mz)
     mz_raw = np.array(full_mz)[mz_sort]
     int_raw = np.array(full_intensity)[mz_sort]
-    int_smooth = savgol_filter(int_raw, presmooth_width, presmooth_order)
 
-    peak_idx, _ = find_peaks(int_smooth)
+    peak_idx, _ = find_peaks(int_raw)
     mz_peaks = mz_raw[peak_idx]
-    int_peaks = int_smooth[peak_idx]
+    int_peaks = int_raw[peak_idx]
 
     delta_mz = np.diff(mz_peaks)
     delta_ppm = delta_mz / mz_peaks[1:] * 1e6
