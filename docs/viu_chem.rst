@@ -12,10 +12,12 @@ viu\_chem.MSI\_Process module
    :undoc-members:
    :show-inheritance:
 
-Module contents
----------------
 
-.. automodule:: viu_chem
+viu\_chem.chem412
+-----------------------------
+.. automodule:: chem412
    :members:
    :undoc-members:
    :show-inheritance:
+
+

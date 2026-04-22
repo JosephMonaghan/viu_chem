@@ -6,9 +6,16 @@ import pandas as pd
 import csv
 from pathlib import Path
 from scipy.signal import find_peaks, savgol_filter
+from pathlib import Path
 
 
-def convert_to_mzML(path:str, file_type:str=".raw"):
+def convert_to_mzML(path:str | Path, file_type:str=".raw"):
+    """Converts a directory of raw MS files into mzML using imzML_Writer's utilities (via pwiz / Docker image)
+    
+    :param path: Path to target directory containing raw vendor files
+    :param file_type: File extension for files (e.g. '.raw' for Thermo)"""
+    if isinstance(path,Path):
+        path = str(path.absolute())
     try:
         utils.RAW_to_mzML(path)
         utils.clean_raw_files(path, file_type)
@@ -18,6 +25,12 @@ def convert_to_mzML(path:str, file_type:str=".raw"):
         
 
 def extract_spectra(path:str | Path, window:tuple[float,float],filter_str:str) -> list[np.array]:
+    """Extracts unaligned spectra from an mzML within the specified window and scan filter
+    
+    :param path: Path to the target mzML
+    :param window: Tuple of form (start, end) specifying where to extract spectra from
+    :param filter_str: Filter string from which to extract the spectra from
+    """
     run = pymzml.run.Reader(path)
 
     scans = []
@@ -31,6 +44,9 @@ def extract_spectra(path:str | Path, window:tuple[float,float],filter_str:str) -
     return scans
 
 def get_scan_filters(path:str | Path) -> list[str]:
+    """Scans through an mzML and returns a list of available scan filters
+    
+    :param path: Path to target mzML"""
     run = pymzml.run.Reader(path)
     filters = []
     for spec in run:
@@ -40,6 +56,12 @@ def get_scan_filters(path:str | Path) -> list[str]:
     return filters
 
 def get_ms2(path: str | Path, precursor_mz:float, window:tuple[float, float],tol:float=0.5) -> list[np.array]:
+    """Finds ms2 spectra (unaligned) within the window for the specified m/z in the target mzML. Tolerant to some float in precursor m/z from DDA.
+    
+    :param path: Path to the target mzML
+    :param precursor_mz: Target m/z
+    :window: Tuple of form (start, end) specifying the window in which to retrieve spectra
+    :tol: Tolerance window in which spectra can be extracted (default = 0.5)"""
     run = pymzml.run.Reader(path)
 
     spectra = []
@@ -54,8 +76,20 @@ def get_ms2(path: str | Path, precursor_mz:float, window:tuple[float, float],tol
     return spectra
 
 
-def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10, ms_level:list[int]=[1]):
+def extract_data(path:str | Path,mz_list:float | list[float], tol_mode:str='ppm', tol:float = 10, ms_level:list[int]=[1]) -> dict:
+    """Extracts chromatograms from the target mzML across all scan filters for the specified m/z list.
+    
+    :param path: Path to target mzML
+    :param mz_list: List of target m/z or single target (float)
+    :param tol_mode: Specify tolerance mode as either 'unit' or 'ppm'
+    :param tol: Tolerance for high resolution extraction (default 10 ppm)
+    :param ms_level: MS level filter, ignores MS2 by default for DDA compatibility
+    
+    :return: Dictionary containing a pd.Dataframe of form time, mz_1, mz_2, ... mz_n for each scan filter"""
     run = pymzml.run.Reader(path)
+
+    if isinstance(mz_list, float):
+        mz_list = [mz_list]
         
     filt_strings = []
     data = {}
@@ -111,48 +145,11 @@ def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10, ms_level:list
     else:
         return data
 
-def extract_peak(data:np.array, index:int, ret_window:tuple):
-    within_window = data[(data[:,0] > ret_window[0]) & (data[:,0] < ret_window[1]), index]
-    baseline_subtract = within_window - np.min(within_window)
-    sum_method = np.sum(baseline_subtract)
-
-    return sum_method
-
-
-def calcurve(x, y, xlabel:str="Your x label here!", ylabel:str="Your y label here!", color:str="#8C4FA4"):
-    if isinstance(x, list):
-        x = np.array(x)
-    if isinstance(y, list):
-        y = np.array(y)
-
-    #Generate linear fit
-    coeffs = np.polyfit(x, y, 1)
-    poly_eq = np.poly1d(coeffs)
-    x_fit = np.unique(x)
-    y_fit = poly_eq(x_fit)
-
-    y_pred = poly_eq(x)
-    ss_res = np.sum((y - y_pred) ** 2)  # Residual sum of squares
-    ss_tot = np.sum((y - np.mean(y)) ** 2)  # Total sum of squares
-    r2 = 1 - (ss_res / ss_tot)
+def extract_7010(path:Path | str) -> pd.DataFrame:
+    """Extracts data from an Agilent .csv file export.
     
-    plt.plot(x_fit, y_fit, color=color,linestyle='--')
-    plt.scatter(x, y, marker='s',edgecolors='k', color=color)
-
-    # Prepare the equation string
-    slope, intercept = coeffs
-    equation = f"y = {slope:.2f}x + {intercept:.2f}\nR² = {r2:.3f}"
-
-    # Add text annotation for the equation
-    plt.text(0.2, 0.95, equation, transform=plt.gca().transAxes, va='top',ha='center', color=color)
-    # plt.text(0.05, 0.90, f"R² = {r2:.2f}", transform=plt.gca().transAxes, verticalalignment='top', color=color)
-    
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.show()
-
-def extract_7010(path:Path) -> pd.DataFrame:
-    
+    :param path: path to target csv
+    :return: pd.Dataframe of form time, mz_1, mz_2, ... mz_n in the csv output"""
     data = {}
     row_header = None
     with open(path, newline="") as f:
@@ -185,8 +182,13 @@ def extract_7010(path:Path) -> pd.DataFrame:
     return df
 
 
-def average_centroided_spectra(spectra:list[np.array],mz_tolerance:float=0.001):
-    """Averages a small number of spectra (<1000) to a coherent mass frame"""
+def average_centroided_spectra(spectra:list[np.array],mz_tolerance:float=0.001) -> np.array:
+    """Averages a small number of spectra (<1000) to a coherent mass frame
+    
+    :param spectra: list of unaligned spectra to align
+    :param mz_tolerance: Minimum spacing between peaks
+    
+    :return: np.array of the coherent mz (first column) and intensity (2nd column)"""
 
     if len(spectra) < 1:
         return
@@ -271,7 +273,19 @@ def average_centroided_spectra(spectra:list[np.array],mz_tolerance:float=0.001):
     return np.column_stack((consensus_mz, mean_intensity))
 
 
-def metabolite_overview(path:str | Path, tgt_mz:float, MS1_filter:str, window:tuple[float, float]| None=None, default_window_width:float=0.3,plot:bool=True):
+def metabolite_overview(path:str | Path, tgt_mz:float, MS1_filter:str, window:tuple[float, float]| None=None, default_window_width:float=0.3,plot:bool=True) ->tuple[pd.DataFrame, float, np.array]:
+    """Utility function to quickly retrieve the chromatogram / average MS2 spectrum (if available) for the specified m/z
+    
+    :param path: Path to source mzML
+    :param tgt_mz: m/z to extract
+    :param MS1_filter: Filter for the chromatogram extraction
+    :param window: Optional specification of where to extract the MS2 spectra from
+    :param default_window_width: default window about the max intensity to extract MS2 from
+    :param plot: Boolean on whether to draw the chromatogram / MS2 spectra for the target ion
+    
+    :return tgt: Chromatogram data as a pd.Dataframe of form time, int
+    :return peak_time: Retention time of peak intensity (mins)
+    :return avg_spec: np array of average, aligned MS2 spectrum"""
     data = extract_data(path,[tgt_mz])
     tgt = data[MS1_filter]
 
@@ -316,7 +330,18 @@ def integrate_peak(
     max_width:float=None,
     plot:bool=False,
     times:tuple[float, float] | None = None,
-):
+) -> dict:
+    """Integrates under a peak from the specified x and y data, accounting for a moving baseline over the peak.
+    
+    :param x: X data
+    :param y: Y data
+    :param peak_x: optional specification of the peak time / location in x value. Finds automatically if unspecified
+    :param prominence: Required peak prominence for auto peak detection
+    :param smooth_window: Smoothing width for savitzsky-golay feature on peak finding
+    :param polyorder: Order of savitzsky-golay fit
+    :edge_frac: Threshold relative height over baseline to cut off integration
+    :max_width: Maximum width of peak integration window for autodetection
+    :times: Manual specification of start and end locations for integration (optional; tuple[start, end])"""
 
     x = np.asarray(x)
     y = np.asarray(y)
