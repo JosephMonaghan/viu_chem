@@ -5,16 +5,54 @@ import numpy as np
 import pandas as pd
 import csv
 from pathlib import Path
+from scipy.signal import find_peaks, savgol_filter
 
 
-def convert_to_mzML(path:str, file_type:str):
+def convert_to_mzML(path:str, file_type:str=".raw"):
     try:
-        utils.RAW_to_mzML(path,blocking=True)
+        utils.RAW_to_mzML(path)
         utils.clean_raw_files(path, file_type)
         return True
     except Exception as e:
         return e
         
+
+def extract_spectra(path:str | Path, window:tuple[float,float],filter_str:str) -> list[np.array]:
+    run = pymzml.run.Reader(path)
+
+    scans = []
+    for idx, spec in enumerate(run):
+        scan_time = spec.scan_time_in_minutes()
+        if scan_time > window[0] and scan_time < window[1]:
+            if spec['filter string'] == filter_str:
+                new_scan = np.column_stack([spec.mz, spec.i])
+                scans.append(new_scan)
+    
+    return scans
+
+def get_scan_filters(path:str | Path) -> list[str]:
+    run = pymzml.run.Reader(path)
+    filters = []
+    for spec in run:
+        if spec['filter string'] not in filters:
+            filters.append(spec['filter string'])
+
+    return filters
+
+def get_ms2(path: str | Path, precursor_mz:float, window:tuple[float, float],tol:float=0.5) -> list[np.array]:
+    run = pymzml.run.Reader(path)
+
+    spectra = []
+    for spec in run:
+        scan_time = spec.scan_time_in_minutes()
+        if scan_time > window[0] and scan_time<window[1]:                
+            if spec.ms_level >= 2:
+                selected_prec = spec['isolation window target m/z']
+                if selected_prec > (precursor_mz-tol) and selected_prec < (precursor_mz+tol):
+                    spectra.append(np.column_stack([spec.mz, spec.i]))
+                
+    return spectra
+
 
 def extract_data(path,mz_list, tol_mode:str='ppm', tol:float = 10, ms_level:list[int]=[1]):
     run = pymzml.run.Reader(path)
@@ -147,5 +185,242 @@ def extract_7010(path:Path) -> pd.DataFrame:
     return df
 
 
-    
+def average_centroided_spectra(spectra:list[np.array],mz_tolerance:float=0.001):
+    """Averages a small number of spectra (<1000) to a coherent mass frame"""
 
+    if len(spectra) < 1:
+        return
+    
+    all_mz = np.concatenate([spec[:,0] for spec in spectra])
+    all_intensities = np.concatenate([spec[:,1] for spec in spectra])
+
+    order = np.argsort(all_mz)
+    all_mz = all_mz[order]
+    all_intensities = all_intensities[order]
+
+    pooled_mz = []
+    pooled_intensity = []
+
+    start = 0
+    n = len(all_mz)
+
+    while start < n:
+        end = start + 1
+        center = all_mz[start]
+
+        while end < n and abs(all_mz[end] - center) <= mz_tolerance:
+            end += 1
+
+        mz_group = all_mz[start:end]
+        int_group = all_intensities[start:end]
+
+        # intensity-weighted center gives a better pooled location
+        if np.sum(int_group) > 0:
+            group_mz = np.sum(mz_group * int_group) / np.sum(int_group)
+        else:
+            group_mz = np.mean(mz_group)
+
+        group_intensity = np.sum(int_group)
+
+        pooled_mz.append(group_mz)
+        pooled_intensity.append(group_intensity)
+
+        start = end
+    
+    pooled_mz = np.asarray(pooled_mz)
+    pooled_intensity = np.asarray(pooled_intensity)
+
+    peak_idx, _ = find_peaks(
+        pooled_intensity,
+        prominence=2.5,
+    )
+
+    consensus_mz = pooled_mz[peak_idx]
+    aligned_spec = np.zeros([len(spectra), len(consensus_mz)])
+    for i, spec in enumerate(spectra):
+        spec_mz = spec[:,0]
+        spec_i = spec[:,1]
+                
+        # sorted assumption helps nearest-neighbor lookup
+        spec_order = np.argsort(spec_mz)
+        spec_mz = spec_mz[spec_order]
+        spec_i = spec_i[spec_order]
+
+        for j, target_mz in enumerate(consensus_mz):
+            pos = np.searchsorted(spec_mz, target_mz)
+
+            candidates = []
+            if pos < len(spec_mz):
+                candidates.append(pos)
+            if pos > 0:
+                candidates.append(pos - 1)
+
+            best_intensity = 0.0
+            best_delta = np.inf
+
+            for k in candidates:
+                delta = abs(spec_mz[k] - target_mz)
+                if delta <= mz_tolerance and delta < best_delta:
+                    best_delta = delta
+                    best_intensity = spec_i[k]
+
+            aligned_spec[i, j] = best_intensity
+
+
+    mean_intensity = aligned_spec.mean(axis=0)
+    return np.column_stack((consensus_mz, mean_intensity))
+
+
+def metabolite_overview(path:str | Path, tgt_mz:float, MS1_filter:str, window:tuple[float, float]| None=None, default_window_width:float=0.3,plot:bool=True):
+    data = extract_data(path,[tgt_mz])
+    tgt = data[MS1_filter]
+
+    if not window:
+        peak_idx, _ = find_peaks(tgt[:,1], prominence = 3)
+        peak_sigs = pd.DataFrame(tgt[peak_idx,:],columns=["time", "intensity"])
+        print(peak_sigs)
+        biggest = peak_sigs.loc[peak_sigs['intensity'].idxmax()]
+        print(biggest)
+        peak_time = biggest["time"]
+        window = (peak_time-default_window_width, peak_time+default_window_width)
+        print(window)
+    
+    spectra = get_ms2(path, tgt_mz,window)
+    avg_spec = average_centroided_spectra(spectra)
+
+    if plot:
+        fig, ax = plt.subplots()
+        ax.plot(tgt[:,0],tgt[:,1], color='k')
+        ax.set_xlabel("Time (mins)")
+        ax.set_ylabel("Signal")
+        ax.axvspan(window[0],window[1],facecolor='red',alpha=0.3,edgecolor=None)
+
+        ax2 = ax.inset_axes([0.6, 0.6, 0.3, 0.3])
+        ax2.vlines(avg_spec[:,0],0, avg_spec[:,1],color='red')
+        ax2.axhline(0,color='k')
+        ax2.set_ylim(0, np.max(avg_spec[:,1]*1.3))
+        ax2.set_xlabel("m/z",style='italic')
+        ax2.set_ylabel("Intensity")
+    
+    return tgt, peak_time, avg_spec
+
+
+def integrate_peak(
+    x:np.array,
+    y:np.array,
+    peak_x:float | None=None,
+    prominence:float=3,
+    smooth_window:int=11,
+    polyorder:int=2,
+    edge_frac:float=0.02,
+    max_width:float=None,
+    plot:bool=False,
+    times:tuple[float, float] | None = None,
+):
+
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    
+    y_smooth = savgol_filter(y, smooth_window, polyorder)
+    
+    # Determine peak apex index
+    if peak_x is not None:
+        peak_idx = int(np.argmin(np.abs(x - peak_x)))
+    else:
+        peaks, props = find_peaks(y_smooth, prominence=prominence)
+        if len(peaks) == 0:
+            raise ValueError("No peaks found.")
+        peak_idx = peaks[np.argmax(props["prominences"])]
+
+
+    # Crude valley estimate on each side
+    left_min_idx = np.argmin(y_smooth[:peak_idx]) if peak_idx > 0 else 0
+    right_min_idx = (
+        peak_idx + np.argmin(y_smooth[peak_idx:])
+        if peak_idx < len(y_smooth) - 1
+        else len(y_smooth) - 1
+    )
+
+    # Initial baseline estimate from crude valleys
+    x1_init, x2_init = x[left_min_idx], x[right_min_idx]
+    y1_init, y2_init = y_smooth[left_min_idx], y_smooth[right_min_idx]
+
+    if x2_init == x1_init:
+        baseline_at_apex = y1_init
+    else:
+        baseline_at_apex = y1_init + (y2_init - y1_init) * (x[peak_idx] - x1_init) / (x2_init - x1_init)
+
+    apex_y = y_smooth[peak_idx]
+    peak_height = apex_y - baseline_at_apex
+    threshold = baseline_at_apex + edge_frac * peak_height
+
+    # Walk left
+    left_idx = peak_idx
+    steps = 0
+    while left_idx > 0 and y_smooth[left_idx] > threshold:
+        left_idx -= 1
+        steps += 1
+        if max_width is not None and steps >= max_width:
+            break
+
+    # Walk right
+    right_idx = peak_idx
+    steps = 0
+    while right_idx < len(y_smooth) - 1 and y_smooth[right_idx] > threshold:
+        right_idx += 1
+        steps += 1
+        if max_width is not None and steps >= max_width:
+            break
+    
+    if times:
+        left_idx = int(np.argmin(np.abs(x-times[0])))
+        right_idx = int(np.argmin(np.abs(x-times[1])))
+
+
+    # Final baseline between chosen edges
+    x1, x2 = x[left_idx], x[right_idx]
+    y1, y2 = y[left_idx], y[right_idx]
+
+    if x2 == x1:
+        baseline_y = np.full(right_idx - left_idx + 1, y1)
+    else:
+        baseline_y = y1 + (y2 - y1) * (x[left_idx:right_idx + 1] - x1) / (x2 - x1)
+
+    x_seg = x[left_idx:right_idx + 1]
+    y_seg = y[left_idx:right_idx + 1]
+    y_corr = y_seg - baseline_y
+
+    area = np.trapezoid(y_corr, x_seg)
+
+    result = {
+        "peak_idx": peak_idx,
+        "peak_time": x[peak_idx],
+        "start_idx": left_idx,
+        "end_idx": right_idx,
+        "start_time": x[left_idx],
+        "end_time": x[right_idx],
+        "area": area,
+        "baseline_y": baseline_y,
+    }
+
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(x, y, label="raw")
+        ax.fill_between(
+            x_seg,
+            y_seg,
+            baseline_y,
+            where=(y_seg >= baseline_y),
+            alpha=0.4,
+            label="integrated area",
+        )
+        ax.legend()
+        ax.set_xlabel("Retention time")
+        ax.set_ylabel("Signal")
+        plt.show()
+
+    return result
+
+        
+    

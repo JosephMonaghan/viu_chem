@@ -197,7 +197,7 @@ def compute_campaign_mean_and_ref(
     # domain step clamp: helps keep domain size sane and reproducible
     min_step_ppm: float = 0.5,
     max_step_ppm: float = 2.0,
-    prominence: float | None = None,
+    prominence: float | None = 2,
     height_fraction: float = 1e-5,   # keep peaks >= fraction of max mean intensity
 ) -> CampaignRef:
     """
