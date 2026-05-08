@@ -1,1 +1,0 @@
-from .scripts.single_sample_segmentation import segment

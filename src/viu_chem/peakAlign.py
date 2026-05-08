@@ -15,12 +15,22 @@ from typing import Iterable
 from scipy.signal import find_peaks, savgol_filter
 
 def _iter_paths(image_path: Path | list[Path]) -> Iterable[Path]:
+    """Yields one or more image paths as Path objects.
+    
+    :param image_path: Single image path or list of image paths
+    :return: Iterable of image paths"""
     if isinstance(image_path, Path):
         yield image_path
     else:
         yield from image_path
 
 def _sample_indices(n: int, k: int, rng: np.random.Generator) -> np.ndarray:
+    """Samples up to k unique indices from a sequence length.
+    
+    :param n: Number of available indices
+    :param k: Number of indices to sample
+    :param rng: Numpy random number generator
+    :return: Array of sampled indices"""
     k = int(min(max(k, 0), n))
     if k == 0:
         return np.array([], dtype=int)
@@ -28,6 +38,12 @@ def _sample_indices(n: int, k: int, rng: np.random.Generator) -> np.ndarray:
 
 
 def _topk_peaks(mz: np.ndarray, inten: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Selects the top-k intensity peaks and returns them sorted by m/z.
+    
+    :param mz: m/z values
+    :param inten: Intensity values
+    :param k: Number of peaks to keep
+    :return: Tuple of selected m/z and intensity arrays"""
     if mz.size <= k:
         o = np.argsort(mz)
         return mz[o], inten[o]
@@ -37,7 +53,10 @@ def _topk_peaks(mz: np.ndarray, inten: np.ndarray, k: int) -> tuple[np.ndarray, 
 
 
 def _mad(x: np.ndarray) -> float:
-    """Median absolute deviation scaled to ~sigma for normal dist."""
+    """Calculates median absolute deviation scaled to sigma for normal data.
+    
+    :param x: Input numeric array
+    :return: Scaled median absolute deviation"""
     x = np.asarray(x, float)
     med = np.median(x)
     mad = np.median(np.abs(x - med))
@@ -45,10 +64,19 @@ def _mad(x: np.ndarray) -> float:
 
 
 def _ppm_window(mz: float, tol_ppm: float) -> float:
+    """Converts a ppm tolerance to an absolute m/z window.
+    
+    :param mz: Center m/z value
+    :param tol_ppm: Tolerance in ppm
+    :return: Absolute m/z tolerance window"""
     return mz * tol_ppm * 1e-6
 
 @dataclass
 class _Cluster:
+    """Container for a centroid cluster during jitter estimation.
+    
+    :param mz: Current cluster center m/z
+    :param n: Number of peaks assigned to the cluster"""
     mz: float
     n: int
 
@@ -64,10 +92,18 @@ def estimate_tol_ppm_from_jitter(
     min_tol_ppm: float = 0.75,
     max_tol_ppm: float = 5.0,
 ) -> float:
-    """
-    Estimate alignment tolerance from observed centroid peak jitter.
-    Returns a single scalar tol_ppm.
-    """
+    """Estimates alignment tolerance from observed centroid peak jitter.
+    
+    :param image_paths: Single imzML path or list of imzML paths
+    :param init_tol_ppm: Initial ppm tolerance for forming clusters
+    :param samples_per_file: Number of spectra to sample from each file
+    :param topk_per_spectrum: Number of highest-intensity peaks to use per spectrum
+    :param min_cluster_size: Minimum cluster size used for stable jitter estimation
+    :param rng_seed: Random seed for spectrum sampling
+    :param k_sigma: Multiplier applied to robust sigma ppm
+    :param min_tol_ppm: Minimum returned tolerance
+    :param max_tol_ppm: Maximum returned tolerance
+    :return: Estimated tolerance in ppm"""
     rng = np.random.default_rng(rng_seed)
 
     centers: list[_Cluster] = []
@@ -166,7 +202,12 @@ def estimate_tol_ppm_from_jitter(
 
 
 def _sample_spectrum_indices(n_spectra: int, k: int, rng: np.random.Generator) -> np.ndarray:
-    """Sample k unique indices from [0, n_spectra), safe if k > n_spectra."""
+    """Samples up to k unique spectrum indices.
+    
+    :param n_spectra: Number of available spectra
+    :param k: Number of indices to sample
+    :param rng: Numpy random number generator
+    :return: Array of sampled spectrum indices"""
     k = int(min(max(k, 0), n_spectra))
     if k == 0:
         return np.array([], dtype=int)
@@ -176,6 +217,16 @@ def _sample_spectrum_indices(n_spectra: int, k: int, rng: np.random.Generator) -
 # Dataclass to keep campaign formatted
 @dataclass(frozen=True)
 class CampaignRef:
+    """Container for a campaign-wide mean spectrum and reference peak list.
+    
+    :param domain_mz: Shared domain m/z axis
+    :param mean_intensity: Mean spectrum on the shared domain
+    :param ref_mz: Reference peak m/z values
+    :param ref_intensity: Reference peak intensities
+    :param step_ppm_est: Estimated domain step in ppm
+    :param n_pixels: Total number of spectra averaged
+    :param domain_detect_freq: Per-domain detection frequency values
+    :param ref_detect_freq: Detection frequency values for reference peaks"""
     domain_mz: np.ndarray        # shared domain axis
     mean_intensity: np.ndarray   # mean spectrum on that axis
     ref_mz: np.ndarray           # peak-picked reference m/z values
@@ -200,9 +251,19 @@ def compute_campaign_mean_and_ref(
     prominence: float | None = 2,
     height_fraction: float = 1e-5,   # keep peaks >= fraction of max mean intensity
 ) -> CampaignRef:
-    """
-    Compute a shared mean spectrum and a shared reference peak list for a campaign of centroid Orbitrap imzML files.
-    """
+    """Computes a shared mean spectrum and reference peak list for centroid imzML files.
+    
+    :param image_paths: Single imzML path or list of imzML paths
+    :param tol_ppm: Optional ppm tolerance for projecting peaks onto the shared domain
+    :param samples_per_file: Number of spectra to sample from each file
+    :param topk_peaks_per_spectrum: Number of highest-intensity peaks to use per sampled spectrum
+    :param trim_quantiles: Quantile bounds used when estimating domain spacing
+    :param rng_seed: Random seed for spectrum sampling
+    :param min_step_ppm: Minimum shared-domain step size in ppm
+    :param max_step_ppm: Maximum shared-domain step size in ppm
+    :param prominence: Peak prominence passed to scipy find_peaks
+    :param height_fraction: Minimum fraction of maximum intensity required to keep reference peaks
+    :return: Campaign reference object containing domain, mean spectrum, and reference peaks"""
 
     # 1) estimate a domain step from a sample
     step_ppm_est, mz_min, mz_max = _estimate_step_ppm_from_sample(
@@ -286,7 +347,13 @@ def _windowed_ref_detect_freq(
     ref_mz: np.ndarray,
     detect_tol_ppm: float,
 ) -> np.ndarray:
-    """Aggregate detection frequency in a ppm window around each ref m/z."""
+    """Aggregates detection frequency in a ppm window around each reference m/z.
+    
+    :param domain_mz: Shared domain m/z axis
+    :param domain_detect_freq: Detection frequency values on the shared domain
+    :param ref_mz: Reference peak m/z values
+    :param detect_tol_ppm: Detection tolerance in ppm
+    :return: Detection frequency values for reference peaks"""
     out = np.zeros_like(ref_mz, dtype=float)
     for i, m in enumerate(ref_mz):
         dmz = m * detect_tol_ppm * 1e-6
@@ -305,7 +372,13 @@ def _windowed_ref_signal(
     ref_mz: np.ndarray,
     detect_tol_ppm: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Aggregate mean intensity in a ppm window and compute intensity-weighted mean m/z."""
+    """Aggregates mean intensity in a ppm window and computes weighted m/z values.
+    
+    :param domain_mz: Shared domain m/z axis
+    :param mean_intensity: Mean intensity values on the shared domain
+    :param ref_mz: Reference peak m/z values
+    :param detect_tol_ppm: Detection tolerance in ppm
+    :return: Tuple of weighted reference m/z values and summed intensities"""
     mz_out = np.zeros_like(ref_mz, dtype=float)
     int_out = np.zeros_like(ref_mz, dtype=float)
     for i, m in enumerate(ref_mz):
@@ -328,7 +401,12 @@ def _windowed_ref_signal(
 
 
 def _take_topk(mz: np.ndarray, inten: np.ndarray, topk: int | None) -> tuple[np.ndarray, np.ndarray]:
-    """Optionally downselect to topk intensities (faster for domain estimation)."""
+    """Optionally downselects a spectrum to the top intensity peaks.
+    
+    :param mz: m/z values
+    :param inten: Intensity values
+    :param topk: Number of peaks to keep, or None to keep all peaks
+    :return: Tuple of selected m/z and intensity arrays"""
     if topk is None or mz.size <= topk:
         return mz, inten
     idx = np.argpartition(inten, -topk)[-topk:]
@@ -345,10 +423,14 @@ def _estimate_step_ppm_from_sample(
     trim_quantiles: tuple[float, float] = (0.01, 0.99),
     rng_seed: int = 0,
 ) -> tuple[float, float, float]:
-    """
-    Estimate a representative spacing in ppm from centroid m/z arrays, plus global mz_min/mz_max.
-    This is NOT the instrument mass accuracy; it's a domain step estimate driven by peak density.
-    """
+    """Estimates representative ppm spacing and m/z bounds from sampled centroid spectra.
+    
+    :param image_paths: Single imzML path or list of imzML paths
+    :param samples_per_file: Number of spectra to sample from each file
+    :param topk_peaks_per_spectrum: Number of highest-intensity peaks to use per sampled spectrum
+    :param trim_quantiles: Quantile bounds used when estimating spacing
+    :param rng_seed: Random seed for spectrum sampling
+    :return: Tuple of estimated step ppm, minimum m/z, and maximum m/z"""
     rng = np.random.default_rng(rng_seed)
 
     all_dppm = []
@@ -390,7 +472,12 @@ def _estimate_step_ppm_from_sample(
 
 # Generates shared domain (step_ppm bins)
 def _build_domain_ppm(mz_min: float, mz_max: float, step_ppm: float) -> np.ndarray:
-    """Multiplicative ppm grid: m_{k+1} = m_k * (1 + step_ppm*1e-6)."""
+    """Builds a multiplicative ppm-spaced m/z domain.
+    
+    :param mz_min: Minimum m/z value
+    :param mz_max: Maximum m/z value
+    :param step_ppm: Step size in ppm
+    :return: Shared m/z domain array"""
     if mz_min <= 0 or mz_max <= mz_min or step_ppm <= 0:
         raise ValueError("Invalid mz_min/mz_max/step_ppm for domain construction.")
     r = 1.0 + step_ppm * 1e-6
@@ -409,10 +496,13 @@ def _accumulate_mean_on_domain(
     tol_ppm: float = 3.0,
     detect_tol_ppm: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """
-    Stream over all spectra in all files, project centroid peaks onto ref_mz bins,
-    accumulate sum, then mean = sum / n_pixels.
-    """
+    """Accumulates a mean spectrum by projecting centroid peaks onto reference m/z bins.
+    
+    :param image_paths: Single imzML path or list of imzML paths
+    :param ref_mz: Reference m/z bins
+    :param tol_ppm: Alignment tolerance in ppm
+    :param detect_tol_ppm: Detection tolerance in ppm
+    :return: Tuple of mean intensity, detection frequency, and pixel count"""
     if detect_tol_ppm is None:
         detect_tol_ppm = tol_ppm
     print(ref_mz.size)
@@ -543,6 +633,10 @@ def rewrite_imzml_with_common_mz(
 
 
 def _pool_spectra(image_path:Path | list[Path]):
+    """Pools all m/z and intensity values from one or more imzML files.
+    
+    :param image_path: Single imzML path or list of imzML paths
+    :return: Tuple of concatenated m/z and intensity arrays"""
     full_mz, full_intensity = [], []
     if isinstance(image_path, Path):
         with warnings.catch_warnings(action="ignore"):
@@ -569,6 +663,12 @@ def _pool_spectra(image_path:Path | list[Path]):
 
 
 def generate_ref_list(image_path:Path | list[Path],tol:float=5, percentage_cutoff:float=0.0005):
+    """Generates a reference peak list by pooling spectra and keeping representative peaks.
+    
+    :param image_path: Single imzML path or list of imzML paths
+    :param tol: Clustering tolerance in ppm
+    :param percentage_cutoff: Fraction of maximum intensity required to keep a peak
+    :return: Tuple of reference m/z values and intensities"""
 
     full_mz, full_intensity = _pool_spectra(image_path)
     

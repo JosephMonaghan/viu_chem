@@ -11,6 +11,10 @@ from skimage.filters import threshold_otsu, threshold_yen, threshold_isodata, th
 
 
 def booltoint(v):
+    """Converts common string boolean values to integer flags.
+    
+    :param v: String boolean value
+    :return: Integer flag, or None if the value is not recognized"""
     if v == "false" or v == "False" or v == "0":
         return 0
     elif v == "true" or v == "True" or v == "1":
@@ -18,6 +22,11 @@ def booltoint(v):
 
 
 def apply_threshold(img, thresh_algorithm):
+    """Calculates an image threshold using a named thresholding algorithm.
+    
+    :param img: Image array to threshold
+    :param thresh_algorithm: Name of threshold algorithm to use
+    :return: Calculated threshold value"""
     if thresh_algorithm == 'otsu':
         thresh = threshold_otsu(img)
     elif thresh_algorithm == 'yen':
@@ -34,6 +43,12 @@ def apply_threshold(img, thresh_algorithm):
 
 
 def intensities_generator(imzmlParser, mz_index, selection=slice(None)):
+    """Generates aligned intensity arrays for each spectrum in an imzML parser.
+    
+    :param imzmlParser: imzML parser object
+    :param mz_index: Shared m/z index used for output spectra
+    :param selection: Slice selecting m/z values from each spectrum
+    :return: Generator yielding full intensity arrays"""
     for i in range(len(imzmlParser.coordinates)):
         full_spec = np.zeros(len(mz_index))
         mz_spec, unique_mz = np.unique(imzmlParser.getspectrum(i)[0][selection], return_index=True)
@@ -43,6 +58,10 @@ def intensities_generator(imzmlParser, mz_index, selection=slice(None)):
 
 
 def imzml_to_df(imzml_file_path):
+    """Converts an imzML file to a dataframe indexed by pixel coordinates and dataset name.
+    
+    :param imzml_file_path: Path to the imzML file
+    :return: Dataframe containing pixel spectra"""
     dataset_name, _ = os.path.splitext(os.path.basename(imzml_file_path))
 
     print('Loading', imzml_file_path)
@@ -131,6 +150,12 @@ def get_feature_subset(mzs, intensities, start=700, stop=1600):
 
 
 def get_mean_spectrum(p, plot=False, save=False):
+    """Calculates the mean spectrum across all pixels in an imzML parser.
+    
+    :param p: imzML parser object
+    :param plot: Whether to show the mean spectrum plot
+    :param save: Whether to save m/z and intensity arrays to disk
+    :return: Tuple of mean m/z and intensity lists"""
     # create dictionary with m/z value as key and values with intensities
     print("identifying m/z for all pixels...")
     mz_set = set()
@@ -170,16 +195,13 @@ def get_mean_spectrum(p, plot=False, save=False):
 
 
 def get_combined_dataframe_from_files(file_dir, file_list, multi_index=False, groups=False):
-    """
-    Creates one pandas data frame of multiple imzML files.
-
-    :param file_dir: directory of imzML files
-    :param file_list: a list of strings representing the files
-    :type file_dir: str
-    :type file_list: list[str]
-    :return: a data frame containing x, y and m/z values
-    :rtype: pandas.DataFrame
-    """
+    """Creates one dataframe from multiple imzML files.
+    
+    :param file_dir: Directory containing imzML files
+    :param file_list: List of imzML filenames
+    :param multi_index: Whether to return a dataframe with sample, x, and y as a multi-index
+    :param groups: Whether to include group names parsed from filenames
+    :return: Dataframe containing sample coordinates and m/z values"""
     spectra = []
     pixel = []
     file_names = []
@@ -220,18 +242,11 @@ def get_combined_dataframe_from_files(file_dir, file_list, multi_index=False, gr
 
 
 def get_combined_dataframe_from_group_files(file_dir, file_list):
-    """
-    Creates one pandas data frame of multiple imzML files of a specific group.
-
-    :param file_dir: directory of imzML files of a specific group
-    :param file_list: a list of strings representing the files, e.g. ['1-heart.imzML', '2-heart.imzML']
-    :type file_dir: str
-    :type file_list: list[str]
-    :return: a data frame containing group name, sample number, x, y and m/z values
-    :rtype: pandas.DataFrame
-
-    .. warning:: files must be named like "1-heart.imzML" starting with the sample number followed by "-".
-    """
+    """Creates one dataframe from multiple imzML files for a specific group.
+    
+    :param file_dir: Directory containing imzML files for a specific group
+    :param file_list: List of imzML filenames
+    :return: Dataframe containing group, sample, coordinates, and m/z values"""
     sample = []
     spectra = []
     pixel = []
@@ -255,16 +270,11 @@ def get_combined_dataframe_from_group_files(file_dir, file_list):
 
 
 def get_summarized_spectrum(df_spectra, method='median'):
-    """
-    Calculates mean/median spectrum of MSI data.
-
-    :param df_spectra: data frame representing the MSI data with columns 'x' 'y' and m/z values
-    :param method: method to summarize spectra, either 'mean' or 'median'
-    :type df_spectra: pandas.DataFrame
-    :type method: str
-    :return: summarized spectrum
-    :rtype: pandas.DataFrame (1 row and no_mz columns)
-    """
+    """Calculates a mean or median summary spectrum from MSI data.
+    
+    :param df_spectra: Dataframe containing x, y, and m/z columns
+    :param method: Summary method, either mean or median
+    :return: One-row dataframe containing the summarized spectrum"""
     df_spectra = df_spectra.iloc[:,2:]
     if method == 'mean':
         df_summarized = df_spectra.mean(axis=0, skipna=True).to_frame().T
@@ -275,11 +285,11 @@ def get_summarized_spectrum(df_spectra, method='median'):
 
 #@jit(nopython=True)
 def find_nearest_value(val, arr):
-    """
-    :param val: value to which closest should be found
-    :param arr: array in which to look for closest value
-    :return: smallest difference, index of nearest value and actual nearest value in array
-    """
+    """Finds the closest value in an array.
+    
+    :param val: Target value
+    :param arr: Array to search
+    :return: Tuple of smallest difference, nearest index, and nearest value"""
     abs_val_arr = np.abs(arr-val)
     smallest_diff_ind = abs_val_arr.argmin()
     smallest_diff = abs_val_arr[smallest_diff_ind]
@@ -287,20 +297,22 @@ def find_nearest_value(val, arr):
 
 
 def split_string(string, split_char, pos):
+    """Splits a string at the requested occurrence of a delimiter.
+    
+    :param string: String to split
+    :param split_char: Delimiter string
+    :param pos: Number of delimiter-separated fields to keep on the left
+    :return: Tuple of left and right string parts"""
     temp = string.split(split_char)
     res = split_char.join(temp[:pos]), split_char.join(temp[pos:])
     return res
 
 
 def get_spectra_coords_arrays(imzML_file):
-    """
-    Extracts spectra and coordinates as numpy arrays from an imzML file.
-
-    :param imzML_file: file path of imzML file
-    :type imzML_file: str
-    :return: spectra, coords, mzs
-    :rtype numpy array of shape (no_pixels, no_mz), numpy array of shape (no_pixels, 2), numpy array of shape (no_mzs,)
-    """
+    """Extracts spectra, coordinates, and m/z values from an imzML file.
+    
+    :param imzML_file: Path to an imzML file
+    :return: Tuple of spectra array, coordinate array, and m/z array"""
     p = ImzMLParser(imzML_file)
 
     spectra = []
@@ -361,6 +373,11 @@ def get_dataframe_from_imzML(imzML_file, multi_index=False, get_coords=False):
 
 
 def imzML_to_csv(imzML_file, output_file=''):
+    """Exports an imzML file to a CSV dataframe of spectra indexed by coordinates.
+    
+    :param imzML_file: Path to the imzML file
+    :param output_file: Optional output CSV path
+    :return: Exported dataframe"""
     spectra, coords, mzs = get_spectra_coords_arrays(imzML_file)
     coords = [tuple(i) for i in coords.tolist()]
     df = pd.DataFrame(columns=mzs, data=spectra, index=coords)
@@ -371,6 +388,12 @@ def imzML_to_csv(imzML_file, output_file=''):
 
 
 def get_mz_img(pyx, msi_df, mz):
+    """Constructs an ion image for a single m/z column from an MSI dataframe.
+    
+    :param pyx: Output image shape as y, x
+    :param msi_df: MSI dataframe indexed by x and y coordinates
+    :param mz: m/z column to draw
+    :return: Ion image array"""
     coords = msi_df.index.tolist()
     msi_img = np.zeros(pyx).astype('uint16')
     for x_val, y_val in coords:
@@ -379,6 +402,14 @@ def get_mz_img(pyx, msi_df, mz):
 
 
 def get_similarity_measures(mz, pyx, msi_df, img, contrast_stretch):
+    """Calculates similarity between an ion image and a reference image.
+    
+    :param mz: m/z column to compare
+    :param pyx: Output image shape as y, x
+    :param msi_df: MSI dataframe indexed by x and y coordinates
+    :param img: Flattened reference image
+    :param contrast_stretch: Whether to contrast-stretch the ion image before comparison
+    :return: Tuple of Pearson correlation and cosine similarity"""
     mz_img = get_mz_img(pyx, msi_df, mz)
     mz_img = np.nan_to_num(mz_img)
     if contrast_stretch:
@@ -389,4 +420,3 @@ def get_similarity_measures(mz, pyx, msi_df, img, contrast_stretch):
     pearson = pearsonr(x=img, y=mz_img)[0]
     cosine_sim = 1 - spatial.distance.cosine(img, mz_img)
     return pearson, cosine_sim
-

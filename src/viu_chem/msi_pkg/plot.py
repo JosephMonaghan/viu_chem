@@ -22,6 +22,16 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def plot_mz_umap(df, mz, out_file, df_control=None, show_neg_group_only=False, cmap='inferno', dot_size=1, plot=False):
+    """Plots UMAP coordinates colored by normalized intensity for one m/z feature.
+    
+    :param df: Dataframe containing UMAP coordinates and m/z intensity values
+    :param mz: m/z column to color by
+    :param out_file: Output figure path
+    :param df_control: Optional control dataframe for background plotting
+    :param show_neg_group_only: Whether to plot only the control group as background
+    :param cmap: Matplotlib colormap name
+    :param dot_size: Scatter dot size
+    :param plot: Whether to display the plot"""
     df[mz] = utils.NormalizeData(df[mz].to_numpy())
 
     colors = []
@@ -58,11 +68,22 @@ def plot_mz_umap(df, mz, out_file, df_control=None, show_neg_group_only=False, c
 
 @numba.njit()
 def find_between(data: np.ndarray, min_value: float, max_value: float):
-    """Find indices between windows."""
+    """Finds indices with values inside a closed numeric window.
+    
+    :param data: Input numeric array
+    :param min_value: Minimum value to include
+    :param max_value: Maximum value to include
+    :return: Array of matching indices"""
     return np.where(np.logical_and(data >= min_value, data <= max_value))[0]
 
 
 def get_ion_img_from_d(path, peak, window):
+    """Extracts an ion image for a peak from a Bruker .d dataset.
+    
+    :param path: Path to the .d dataset
+    :param peak: Center m/z value
+    :param window: Absolute m/z window around the peak
+    :return: Ion image array"""
     reader = get_reader(path)
     indices = reader.mz_index
     peak_min, peak_max = peak - window, peak + window
@@ -84,6 +105,13 @@ def get_ion_img_from_d(path, peak, window):
 
 
 def get_mz_img(pyx, msi_df, mz, tol=0.0):
+    """Constructs an ion image from MSI dataframe columns within an m/z tolerance.
+    
+    :param pyx: Output image shape as y, x
+    :param msi_df: MSI dataframe indexed by x and y coordinates
+    :param mz: Center m/z value
+    :param tol: Absolute tolerance around the center m/z
+    :return: Ion image array"""
     lower = mz - tol
     upper = mz + tol
     mzs_cols = msi_df.columns.to_numpy()
@@ -100,13 +128,13 @@ def get_mz_img(pyx, msi_df, mz, tol=0.0):
 
 
 def plot_img_heatmap(grayscale, output_file='', plot=False, cmap='jet', ticks=False):
-    """
-    Plots a grayscale image with colormap and colorbar
-
-    :param grayscale: grayscale image as 2D numpy array
-    :param output_file: file to save result
-    :param plot: set to True if image should be plotted
-    """
+    """Plots a grayscale image with a colormap and colorbar.
+    
+    :param grayscale: Grayscale image as a 2D numpy array
+    :param output_file: Optional file path to save the result
+    :param plot: Whether to display the plot
+    :param cmap: Matplotlib colormap name
+    :param ticks: Whether to show colorbar ticks"""
     max = np.max(grayscale)
     min = np.nanmin(np.array(grayscale)[grayscale != np.nanmin(grayscale)])
 
@@ -132,20 +160,13 @@ def plot_img_heatmap(grayscale, output_file='', plot=False, cmap='jet', ticks=Fa
 
 
 def construct_spot_image(imzML_file, vals, output_file='', cmap='Spectral'):
-    """
-    Constructs an image of a MSI data set (from an imzML file) with specific color values for each spot.
-
+    """Constructs an MSI spot image from per-pixel grayscale or RGB values.
+    
     :param imzML_file: imzML file to construct image from
-    :param vals: values of spots
-    :param output_file: spot image file path
-    :type imzML_file: str
-    :type vals: numpy array of shape (y, x, 1) will take values as labels and use spectral cmap as color code
-    or numpy array of shape (y, x, 3) will take values as RGB color code
-    :type output_file: str
-    :return: spot image
-    :rtype: numpy array of shape (y, x, 1) or (y, x, 3)
-    :raises: UserWarning if wrong array dimension
-    """
+    :param vals: Per-pixel grayscale labels or RGB values
+    :param output_file: Optional spot image output path
+    :param cmap: Matplotlib colormap name for grayscale output
+    :return: Spot image array"""
     p = ImzMLParser(imzML_file)
 
     # print("vals=",vals)
@@ -184,20 +205,22 @@ def construct_spot_image(imzML_file, vals, output_file='', cmap='Spectral'):
 
 def plot_ion_image(mz, input_file, output_file='', tol=0.1, unit='da', CLAHE=True, contrast_stretch=False, lower=0,
                    upper=99, plot=False, cmap='viridis', pyimzml=True, remove_isolated_px=False, output_dir=''):
-    """
-    Plots and saves an ion image from an imzML file.
-
-    :param input_file: MSI file path (imzML or .d) to plot ion image from
-    :param mz: m/z value
-    :param output_file: ion image file path
-    :param CLAHE: if set to True, do CLAHE
-    :param plot: if set to True, plot ion image
-    :type imzML_file: str
-    :type mz: float
-    :type output_file: str
-    :type CLAHE: bool
-    :type plot: bool
-    """
+    """Plots and saves an ion image from an imzML file or Bruker .d dataset.
+    
+    :param mz: Center m/z value
+    :param input_file: MSI file path to plot from
+    :param output_file: Optional ion image output path
+    :param tol: Tolerance around the center m/z
+    :param unit: Tolerance unit, either da or ppm
+    :param CLAHE: Whether to apply CLAHE contrast enhancement
+    :param contrast_stretch: Whether to apply percentile contrast stretching
+    :param lower: Lower percentile for contrast stretching
+    :param upper: Upper percentile for contrast stretching
+    :param plot: Whether to display the ion image
+    :param cmap: Matplotlib colormap name
+    :param pyimzml: Whether to use pyimzml ion image extraction
+    :param remove_isolated_px: Whether to remove isolated foreground pixels
+    :param output_dir: Optional output directory used when output_file is not provided"""
     # print("input_file: ", input_file)
     # print("mz: ", mz)
     # print("output_file:", output_file)
@@ -279,6 +302,12 @@ def plot_ion_image(mz, input_file, output_file='', tol=0.1, unit='da', CLAHE=Tru
 
 
 def plot_spectrum(mzs, intensities, plot=False, output_file=''):
+    """Plots a single mass spectrum.
+    
+    :param mzs: m/z axis values
+    :param intensities: Intensity values
+    :param plot: Whether to display the plot
+    :param output_file: Optional file path to save the plot"""
     plt.plot(mzs, intensities)
     plt.xlabel('m/z [Da]')
     plt.ylabel('Intensities [a.u.]')
@@ -290,6 +319,14 @@ def plot_spectrum(mzs, intensities, plot=False, output_file=''):
 
 
 def scatterplot_3D(data, filepath, c, cmap='Spectral', size=10, plot=False):
+    """Draws and saves a 3D scatterplot.
+    
+    :param data: Data array with x, y, and z columns
+    :param filepath: Output figure path
+    :param c: Point colors or labels
+    :param cmap: Matplotlib colormap name
+    :param size: Scatter point size
+    :param plot: Whether to display the plot"""
     fig = plt.figure()
     #ax = Axes3D(fig)
     ax = fig.add_subplot(111, projection='3d')
@@ -307,6 +344,14 @@ def scatterplot_3D(data, filepath, c, cmap='Spectral', size=10, plot=False):
 
 
 def scatterplot_2D(data, filepath, c, cmap='Spectral', size=10, plot=False):
+    """Draws and saves a 2D scatterplot.
+    
+    :param data: Data array with x and y columns
+    :param filepath: Output figure path
+    :param c: Point colors or labels
+    :param cmap: Matplotlib colormap name
+    :param size: Scatter point size
+    :param plot: Whether to display the plot"""
     if c is not None:
         if np.min(c) == 0:
             clustered = c > 0
@@ -322,6 +367,10 @@ def scatterplot_2D(data, filepath, c, cmap='Spectral', size=10, plot=False):
 
 
 def contrast_stretching(image):
+    """Applies percentile contrast stretching to an image.
+    
+    :param image: Image array to stretch
+    :return: Contrast-stretched image array"""
     upper_thr = np.percentile(image, 95)
     lower_thr = np.percentile(image, 5)
     image[image > upper_thr] = upper_thr
@@ -330,17 +379,16 @@ def contrast_stretching(image):
 
 
 def plot_venn2(label1, label2, data1, data2, title, output_file='', plot=False, weighted=True):
-    """
-    Plots a Venn diagram of 2  sets
-
-    :param label1: label of first set
-    :param label2: label of second set
-    :param data1: first data set
-    :param data2: second data set
-    :param title: title of figure
-    :param output_file: output file to save plot
-    :param plot: set to True to plot Venn diagram
-    """
+    """Plots a Venn diagram of two sets.
+    
+    :param label1: Label of first set
+    :param label2: Label of second set
+    :param data1: First data set
+    :param data2: Second data set
+    :param title: Title of figure
+    :param output_file: Optional output file path
+    :param plot: Whether to display the plot
+    :param weighted: Whether to use weighted region sizes"""
     label1 = label1 + '\n({})'.format(len(data1))
     label2 = label2 + '\n({})'.format(len(data2))
     inter_1_2 = data1 & data2
@@ -361,17 +409,15 @@ def plot_venn2(label1, label2, data1, data2, title, output_file='', plot=False, 
 
 
 def get_spec_img(pyxf, coords_f):
-    """Get the binary image representing the selected spectra according to their coordinates
-
-	Args:
-		pyxf: shape of the spectral image
-		coords_f: coordinates of selected spectra within the image
-	"""
+    """Gets a binary image representing selected spectra by coordinate.
+    
+    :param pyxf: Shape of the spectral image
+    :param coords_f: Coordinates of selected spectra within the image
+    :return: Binary image array"""
 
     spec_img_f = np.zeros(pyxf).astype(np.uint8)
     for xf, yf in coords_f:
         spec_img_f[yf, xf] = 1
     return spec_img_f
-
 
 

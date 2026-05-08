@@ -2,6 +2,11 @@ from bs4 import BeautifulSoup, Tag
 
 
 def reannotate_imzML(receiving_imzML:str,SRC_imzML:str,out_file:str):
+    """Copies scan and instrument annotations from a source imzML into another imzML.
+    
+    :param receiving_imzML: Path to the imzML file that needs annotation
+    :param SRC_imzML: Path to the source imzML containing annotation metadata
+    :param out_file: Path to write the reannotated imzML file"""
     #Error handling for when scan filter extraction fails
     result_file = out_file
 

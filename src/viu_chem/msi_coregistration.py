@@ -50,6 +50,10 @@ _QT_APP = None
 
 
 def _ensure_qapplication(QApplication):
+    """Ensures a Qt application exists and returns it.
+    
+    :param QApplication: Qt QApplication class
+    :return: Active QApplication instance"""
     global _QT_APP
     app = QApplication.instance()
     if app is None:
@@ -59,6 +63,10 @@ def _ensure_qapplication(QApplication):
 
 
 def sanitize_name(name: str) -> str:
+    """Sanitizes a string for use as a lowercase SpatialData element key.
+    
+    :param name: Input name to sanitize
+    :return: Sanitized name"""
     safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name.strip())
     while "__" in safe:
         safe = safe.replace("__", "_")
@@ -66,6 +74,10 @@ def sanitize_name(name: str) -> str:
 
 
 def _parse_image_to_spatial(img: np.ndarray):
+    """Parses a 2D or 3D image array into a SpatialData image element.
+    
+    :param img: Image array to parse
+    :return: SpatialData Image2DModel element"""
     if img.ndim == 2:
         return Image2DModel.parse(img, dims=("y", "x"))
     if img.ndim == 3:
@@ -74,6 +86,10 @@ def _parse_image_to_spatial(img: np.ndarray):
 
 
 def _clone_spatial_image_element(image) -> Any:
+    """Clones a SpatialData image element while preserving dimensional labels when possible.
+    
+    :param image: SpatialData image element to clone
+    :return: Cloned image element"""
     data = np.asarray(image).copy()
     dims = tuple(getattr(image, "dims", ()))
     if dims and len(dims) == data.ndim:
@@ -82,6 +98,10 @@ def _clone_spatial_image_element(image) -> Any:
 
 
 def _to_napari_image(arr: np.ndarray):
+    """Converts channel-first image arrays into napari-friendly display arrays.
+    
+    :param arr: Image array to convert
+    :return: Image array suitable for napari display"""
     if arr.ndim == 3 and arr.shape[0] == 1:
         return arr[0]
     if arr.ndim == 3 and arr.shape[0] in (3, 4):
@@ -90,6 +110,11 @@ def _to_napari_image(arr: np.ndarray):
 
 
 def _extract_xy(vec, axes):
+    """Extracts x and y values from a vector with optional named axes.
+    
+    :param vec: Vector containing coordinate values
+    :param axes: Optional axis labels for the vector
+    :return: Tuple of x and y values"""
     vals = np.asarray(vec, dtype=float).ravel()
     if axes is not None:
         axes = tuple(axes)
@@ -103,6 +128,10 @@ def _extract_xy(vec, axes):
 
 
 def _xy_matrix_from_transform(tr) -> np.ndarray:
+    """Converts a SpatialData transform object into a 3x3 xy affine matrix.
+    
+    :param tr: SpatialData transformation object
+    :return: 3x3 affine matrix in xy order"""
     name = tr.__class__.__name__
     if name == "Identity":
         return np.eye(3, dtype=float)
@@ -147,11 +176,21 @@ def _xy_matrix_from_transform(tr) -> np.ndarray:
 
 
 def xy_to_yx_matrix(matrix_xy: np.ndarray) -> np.ndarray:
+    """Converts a 3x3 affine matrix from xy order to yx order.
+    
+    :param matrix_xy: 3x3 affine matrix in xy order
+    :return: 3x3 affine matrix in yx order"""
     swap = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=float)
     return swap @ np.asarray(matrix_xy, dtype=float) @ swap
 
 
 def auto_contrast_limits(img: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.5) -> tuple[float, float]:
+    """Calculates robust contrast limits from finite positive image values.
+    
+    :param img: Image array
+    :param low_pct: Lower percentile for contrast limit
+    :param high_pct: Upper percentile for contrast limit
+    :return: Tuple of lower and upper contrast limits"""
     if np.ma.isMaskedArray(img):
         finite = np.asarray(img.compressed(), dtype=float)
     else:
@@ -168,12 +207,20 @@ def auto_contrast_limits(img: np.ndarray, low_pct: float = 1.0, high_pct: float 
 
 
 def prepare_ion_for_display(img: np.ndarray) -> np.ndarray:
+    """Prepares an ion image for display by zeroing nonfinite and nonpositive values.
+    
+    :param img: Ion image array
+    :return: Cleaned image array"""
     data = np.asarray(img, dtype=float).copy()
     data[(~np.isfinite(data)) | (data <= 0)] = 0.0
     return data
 
 
 def _infer_default_zarr_path(input_path: str | Path) -> Path:
+    """Infers the default zarr output path for an input file.
+    
+    :param input_path: Input file path
+    :return: Path with a .zarr suffix"""
     src = Path(input_path).expanduser()
     return src.with_suffix(".zarr")
 
@@ -184,6 +231,12 @@ def convert_input_to_zarr(
     *,
     converter: Any | None = None,
 ) -> Path:
+    """Converts an MSI input file into a SpatialData zarr store.
+    
+    :param input_path: Path to an imzML or npz input file
+    :param output_path: Optional zarr output path
+    :param converter: Optional converter callable
+    :return: Path to the converted zarr store"""
     src = Path(input_path).expanduser()
     dst = Path(output_path).expanduser() if output_path is not None else _infer_default_zarr_path(src)
     if dst.suffix.lower() != ".zarr":
@@ -205,12 +258,20 @@ def convert_input_to_zarr(
 
 
 def _sanitize_dataset_label(value: str | Path) -> str:
+    """Sanitizes a dataset label and falls back to msi when empty.
+    
+    :param value: Label or path value to sanitize
+    :return: Sanitized dataset label"""
     if isinstance(value, Path):
         value = value.stem or value.name
     return sanitize_name(str(value)) or "msi"
 
 
 def _infer_msi_dataset_specs(sdata) -> list[dict[str, Any]]:
+    """Infers MSI dataset table, TIC image, and pixel shape keys from SpatialData.
+    
+    :param sdata: SpatialData object to inspect
+    :return: List of inferred MSI dataset specifications"""
     tic_keys = [key for key in sdata.images.keys() if key.endswith("_tic")]
     tic_set = set(tic_keys)
     table_keys = list(sdata.tables.keys())
@@ -260,6 +321,11 @@ def _infer_msi_dataset_specs(sdata) -> list[dict[str, Any]]:
 
 
 def _choose_unique_element_key(existing: set[str], base: str) -> str:
+    """Chooses a sanitized element key that does not collide with existing keys.
+    
+    :param existing: Set of existing element keys
+    :param base: Preferred base key
+    :return: Unique element key"""
     candidate = _sanitize_dataset_label(base)
     if candidate not in existing:
         return candidate
@@ -270,6 +336,10 @@ def _choose_unique_element_key(existing: set[str], base: str) -> str:
 
 
 def _describe_zarr_layout(zarr_path: str | Path) -> dict[str, Any]:
+    """Summarizes top-level groups in a zarr store.
+    
+    :param zarr_path: Path to a zarr store
+    :return: Dictionary describing available zarr groups"""
     root = zarr.open_group(str(Path(zarr_path).expanduser()), mode="r")
     layout: dict[str, Any] = {"top_level_keys": list(root.keys())}
     for key in ("images", "labels", "shapes", "points", "tables"):
@@ -289,6 +359,14 @@ def embed_msi_dataset(
     registered_cs: str = "registered",
     converter: Any | None = None,
 ) -> dict[str, Any]:
+    """Embeds an MSI dataset into an existing SpatialData zarr store.
+    
+    :param host_zarr_path: Path to the host SpatialData zarr store
+    :param source_path: Path to a source MSI file or zarr store
+    :param dataset_label: Optional label for the embedded dataset
+    :param registered_cs: Coordinate system used for registration transforms
+    :param converter: Optional converter callable for non-zarr inputs
+    :return: Dictionary describing embedded table, TIC, and pixel shape keys"""
 
     host_zarr = Path(host_zarr_path).expanduser()
     src = Path(source_path).expanduser()
@@ -390,6 +468,12 @@ def rename_msi_dataset(
     table_key: str,
     display_name: str,
 ) -> str:
+    """Updates the display name stored for an MSI dataset table.
+    
+    :param zarr_path: Path to the SpatialData zarr store
+    :param table_key: MSI table key to rename
+    :param display_name: New display name
+    :return: Cleaned display name stored in the table"""
     from spatialdata._io import write_table
 
     zarr_path = Path(zarr_path).expanduser()
@@ -408,12 +492,19 @@ def rename_msi_dataset(
 
 @dataclass
 class CoregistrationDataset:
+    """Container for a SpatialData MSI dataset used by the coregistration GUI.
+    
+    :param zarr_path: Path to the SpatialData zarr store
+    :param registered_cs: Coordinate system used for registration transforms
+    :param table_key: Optional MSI table key to load
+    :param tic_key: Optional TIC image key to load"""
     zarr_path: Path
     registered_cs: str = "registered"
     table_key: str | None = None
     tic_key: str | None = None
 
     def __post_init__(self) -> None:
+        """Loads SpatialData elements and initializes cached MSI dataset state."""
         self.zarr_path = Path(self.zarr_path).expanduser()
         self.sdata = sd.read_zarr(self.zarr_path)
 
@@ -460,6 +551,9 @@ class CoregistrationDataset:
         self.local_maxima_indices = self._find_local_maxima()
 
     def _find_local_maxima(self) -> np.ndarray:
+        """Finds local maxima in the average spectrum.
+        
+        :return: Array of local maximum feature indices"""
         mask = np.zeros_like(self.avg_spectrum, dtype=bool)
         if self.avg_spectrum.size >= 3:
             mask[1:-1] = (
@@ -470,6 +564,11 @@ class CoregistrationDataset:
         return idx if idx.size else np.arange(self.avg_spectrum.size)
 
     def reconstruct_ion_image(self, feature_idx: int | Iterable[int] | np.ndarray, *, normalize_to_tic: bool = True) -> np.ndarray:
+        """Reconstructs an ion image from one or more feature indices.
+        
+        :param feature_idx: Feature index or indices to reconstruct
+        :param normalize_to_tic: Whether to normalize ion values by the TIC image
+        :return: Reconstructed ion image array"""
         feature_indices = np.atleast_1d(np.asarray(feature_idx, dtype=int))
         if feature_indices.size == 1:
             col = self.X[:, int(feature_indices[0])]
@@ -490,6 +589,11 @@ class CoregistrationDataset:
         return img
 
     def find_feature_idx_from_mz(self, target_mz: float, ppm_tolerance: float = 5.0) -> tuple[int | None, float]:
+        """Finds the nearest feature index to a target m/z within tolerance.
+        
+        :param target_mz: Target m/z value
+        :param ppm_tolerance: Maximum allowed ppm error
+        :return: Tuple of feature index or None and ppm error"""
         if target_mz <= 0:
             return None, float("inf")
         ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
@@ -500,12 +604,22 @@ class CoregistrationDataset:
         return None, ppm_error
 
     def find_feature_indices_from_mz(self, target_mz: float, ppm_tolerance: float = 5.0) -> np.ndarray:
+        """Finds all feature indices within ppm tolerance of a target m/z.
+        
+        :param target_mz: Target m/z value
+        :param ppm_tolerance: Maximum allowed ppm error
+        :return: Array of matching feature indices"""
         if target_mz <= 0 or ppm_tolerance <= 0:
             return np.array([], dtype=int)
         ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
         return np.flatnonzero(ppm_errors <= ppm_tolerance).astype(int)
 
     def find_local_max_idx_near_mz(self, target_mz: float, mz_window: tuple[float, float] | None = None) -> int:
+        """Finds the nearest local maximum feature index for a target m/z.
+        
+        :param target_mz: Target m/z value
+        :param mz_window: Optional m/z window to restrict the search
+        :return: Local maximum feature index"""
         candidate_indices = self.local_maxima_indices
         if mz_window is not None:
             lo, hi = float(min(mz_window)), float(max(mz_window))
@@ -517,6 +631,9 @@ class CoregistrationDataset:
         return int(candidate_indices[local_idx])
 
     def load_saved_registration_if_available(self) -> tuple[np.ndarray, bool]:
+        """Loads an existing registration transform when available.
+        
+        :return: Tuple of affine matrix and whether a saved transform was found"""
         try:
             transform = get_transformation(
                 self.sdata.images[self.tic_key],
@@ -530,6 +647,9 @@ class CoregistrationDataset:
             return np.eye(3, dtype=float), False
 
     def estimate_initial_scale_from_pixel_sizes(self) -> tuple[np.ndarray, tuple[Any, ...] | None]:
+        """Estimates an initial MSI-to-reference scale from pixel size metadata.
+        
+        :return: Tuple of scale matrix and metadata describing the estimate"""
         def as_pos_float(value: Any) -> float:
             try:
                 result = float(value)
@@ -583,6 +703,9 @@ class CoregistrationDataset:
         )
 
     def registration_sidecar_path(self) -> Path:
+        """Builds the registration sidecar path for this dataset.
+        
+        :return: Path to the registration sidecar JSON file"""
         return self.zarr_path.with_name(f"{self.zarr_path.name}.{self.dataset_label}.coregistration_params.json")
 
 
@@ -593,6 +716,13 @@ def add_reference_image(
     key: str,
     registered_cs: str = "registered",
 ) -> CoregistrationDataset:
+    """Adds an optical or H&E reference image to a SpatialData zarr store.
+    
+    :param zarr_path: Path to the SpatialData zarr store
+    :param image_path: Path to the reference image
+    :param key: Reference image key, either optical or hne
+    :param registered_cs: Coordinate system used for registration transforms
+    :return: Reloaded coregistration dataset"""
     if key not in {"optical", "hne"}:
         raise ValueError("Reference image `key` must be either 'optical' or 'hne'.")
 
@@ -639,6 +769,14 @@ def import_geojson_annotations(
     name_prefix: str = "anno_",
     registered_cs: str = "registered",
 ) -> list[str]:
+    """Imports GeoJSON annotation shapes into a SpatialData zarr store.
+    
+    :param zarr_path: Path to the SpatialData zarr store
+    :param annotation_paths: Iterable of GeoJSON annotation paths
+    :param target_image: Reference image key used to anchor annotations
+    :param name_prefix: Prefix for imported annotation element names
+    :param registered_cs: Coordinate system used for registration transforms
+    :return: List of imported annotation keys"""
 
     host_zarr_path = Path(zarr_path).expanduser()
     dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs)
@@ -688,6 +826,14 @@ def save_coregistration(
     tic_key: str | None = None,
     registered_cs: str = "registered",
 ) -> dict[str, Any]:
+    """Saves an MSI registration affine transform into a SpatialData zarr store.
+    
+    :param zarr_path: Path to the SpatialData zarr store
+    :param transform_xy: 3x3 affine transform matrix in xy order
+    :param table_key: Optional MSI table key to save registration for
+    :param tic_key: Optional TIC image key to save registration for
+    :param registered_cs: Coordinate system used for registration transforms
+    :return: Dictionary of saved coregistration parameters"""
 
     dataset = CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
     transform_xy = np.asarray(transform_xy, dtype=float)
@@ -756,6 +902,16 @@ def prepare_coregistration_zarr(
     registered_cs: str = "registered",
     converter: Any | None = None,
 ) -> Path:
+    """Prepares a SpatialData zarr store for coregistration.
+    
+    :param input_path: Optional raw MSI input path to convert
+    :param zarr_path: Optional existing or target zarr path
+    :param optical_image_path: Optional optical reference image path
+    :param hne_image_path: Optional H&E reference image path
+    :param annotation_paths: Optional annotation paths to import
+    :param registered_cs: Coordinate system used for registration transforms
+    :param converter: Optional converter callable for non-zarr inputs
+    :return: Path to the prepared zarr store"""
     if zarr_path is None:
         if input_path is None:
             raise ValueError("Provide either `zarr_path` or `input_path`.")
@@ -787,6 +943,12 @@ def prepare_coregistration_batch(
     registered_cs: str = "registered",
     converter: Any | None = None,
 ) -> list[Path]:
+    """Prepares multiple SpatialData zarr stores for coregistration.
+    
+    :param jobs: Iterable of job dictionaries passed to prepare_coregistration_zarr
+    :param registered_cs: Default coordinate system used for registration transforms
+    :param converter: Optional converter callable for non-zarr inputs
+    :return: List of prepared zarr paths"""
     outputs = []
     for job in jobs:
         outputs.append(
@@ -804,6 +966,10 @@ def prepare_coregistration_batch(
 
 
 def _pick_input_or_convert(default_zarr_path: str | Path | None = None) -> Path:
+    """Prompts for a startup input zarr or raw MSI file and converts when needed.
+    
+    :param default_zarr_path: Optional default zarr path to use if it exists
+    :return: Path to the selected or converted zarr store"""
 
     _ensure_qapplication(QApplication)
 
@@ -859,6 +1025,11 @@ def launch_coregistration_gui(
     input_path: str | Path | None = None,
     registered_cs: str = "registered",
 ):
+    """Launches the interactive napari coregistration GUI.
+    
+    :param zarr_path: Optional SpatialData zarr path to open
+    :param input_path: Optional raw MSI input path to convert before opening
+    :param registered_cs: Coordinate system used for registration transforms"""
 
     if zarr_path is None:
         if input_path is not None:

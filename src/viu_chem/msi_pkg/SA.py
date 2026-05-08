@@ -107,6 +107,10 @@ def Fastmap(k):
 
 
 def get_weight_matrix(r):
+    """Builds a Gaussian spatial weight matrix for a neighborhood radius.
+    
+    :param r: Pixel neighborhood radius
+    :return: Dataframe containing spatial weights"""
     # 1 create list with indices ranging from -r to r
     ind = list(range(-r, r + 1, 1))
 

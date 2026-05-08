@@ -15,6 +15,12 @@ hmdb_metabolites = pd.read_csv(path)
 
 @dataclass(frozen=True)
 class Adduct:
+    """Container describing an ion adduct.
+    
+    :param label: Display label for the adduct
+    :param exact_mass: Exact mass shift for the adduct
+    :param charge: Charge state for the adduct
+    :param ion_mode: Ionization mode for the adduct"""
     label:str
     exact_mass: float
     charge: int
@@ -22,6 +28,7 @@ class Adduct:
 
 
 class AdductLabel(str, Enum):
+    """Enumeration of supported adduct labels."""
     M = "M+"
     M_H = "[M+H]+"
     M_Na = "[M+Na]+"
@@ -54,13 +61,26 @@ ALL_ADDUCTS: dict[str, Adduct] = {
 DEFAULT = [AdductLabel.M, AdductLabel.M_H, AdductLabel.M_Na, AdductLabel.M_K]
 
 def resolve_adduct_labels(labels: list[AdductLabel]) -> list[Adduct]:
+    """Resolves adduct label enum values to their adduct definitions.
+    
+    :param labels: List of adduct labels to resolve
+    :return: List of matching adduct definitions"""
     return [ALL_ADDUCTS[lbl.value] for lbl in labels]
 
 
 def adducts_to_df(adduct_list: list[Adduct]) -> pd.DataFrame:
+    """Converts a list of adduct definitions into a dataframe.
+    
+    :param adduct_list: List of adduct definitions
+    :return: Dataframe containing adduct labels, masses, charges, and ion modes"""
     return pd.DataFrame([vars(a) for a in adduct_list])
 
 def tol_range(mz:float, tol:float=5):
+    """Calculates an m/z tolerance window in daltons from a ppm tolerance.
+    
+    :param mz: Center m/z value
+    :param tol: Tolerance in ppm
+    :return: Tolerance window in daltons"""
     return mz*tol/1e6
 
 def annotate_mz(mz:float,adducts:list[AdductLabel] | None=None,tol:float=5) ->pd.DataFrame:

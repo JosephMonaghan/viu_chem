@@ -12,6 +12,10 @@ from scipy.signal import find_peaks
 
 
 def _normalize_imzml_paths(imzml_paths: str | Path | Sequence[str | Path]) -> list[Path]:
+    """Normalizes one or more imzML path inputs into a non-empty list of Paths.
+    
+    :param imzml_paths: Single imzML path or sequence of imzML paths
+    :return: List of imzML paths as Path objects"""
     if isinstance(imzml_paths, (str, Path)):
         return [Path(imzml_paths)]
     if not isinstance(imzml_paths, Sequence) or len(imzml_paths) == 0:
@@ -20,6 +24,9 @@ def _normalize_imzml_paths(imzml_paths: str | Path | Sequence[str | Path]) -> li
 
 
 def _validate_file_continuous(imzml) -> None:
+    """Validates that an imzML parser represents a continuous aligned file.
+    
+    :param imzml: imzML parser object to validate"""
     metadata = imzml.metadata.pretty()
     is_continuous = metadata["file_description"]["continuous"]
     if not is_continuous:
@@ -27,6 +34,10 @@ def _validate_file_continuous(imzml) -> None:
 
 
 def _to_float_or_none(value) -> float | None:
+    """Extracts a float from a numeric value or numeric string when possible.
+    
+    :param value: Value to convert
+    :return: Float value, or None if no numeric value can be parsed"""
     if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value)
     if isinstance(value, str):
@@ -37,9 +48,16 @@ def _to_float_or_none(value) -> float | None:
 
 
 def _collect_numeric_metadata(metadata_obj) -> dict[str, float]:
+    """Collects numeric metadata values from a nested metadata object.
+    
+    :param metadata_obj: Metadata object containing nested dictionaries or sequences
+    :return: Dictionary mapping normalized metadata keys to numeric values"""
     out: dict[str, float] = {}
 
     def _walk(obj):
+        """Recursively walks nested metadata values and stores first numeric matches.
+        
+        :param obj: Metadata object or nested value to inspect"""
         if isinstance(obj, dict):
             for key, value in obj.items():
                 key_norm = str(key).strip().lower()
@@ -56,6 +74,10 @@ def _collect_numeric_metadata(metadata_obj) -> dict[str, float]:
 
 
 def _get_pixel_size(imzml) -> tuple[float, float]:
+    """Determines x and y pixel sizes from imzML metadata.
+    
+    :param imzml: imzML parser object
+    :return: Tuple of x and y pixel sizes"""
     metadata = imzml.metadata.pretty()
     numeric_meta = _collect_numeric_metadata(metadata)
     x_count = float(imzml.imzmldict.get("max count of pixels x", 0)) + 1.0
@@ -93,6 +115,11 @@ def _cluster_color_mapping(
     cluster_labels: Sequence[int] | np.ndarray,
     cmap: str = "tab20",
 ) -> dict[int, tuple[float, float, float, float]]:
+    """Maps cluster labels to RGBA colors from a matplotlib colormap.
+    
+    :param cluster_labels: Cluster labels to map
+    :param cmap: Matplotlib colormap name
+    :return: Dictionary mapping cluster labels to RGBA colors"""
     labels = np.sort(np.asarray(cluster_labels, dtype=int))
     cmap_obj = plt.get_cmap(cmap, len(labels))
     return {int(label): cmap_obj(idx) for idx, label in enumerate(labels)}
@@ -104,6 +131,13 @@ def _prominent_peak_indices(
     max_labels: int = 8,
     min_rel_prominence: float = 0.05,
 ) -> np.ndarray:
+    """Finds prominent peak indices for spectrum labeling.
+    
+    :param mz_axis: m/z axis values
+    :param intensities: Spectrum intensity values
+    :param max_labels: Maximum number of peaks to label
+    :param min_rel_prominence: Minimum relative prominence required for labeling
+    :return: Array of selected peak indices"""
     if max_labels < 1:
         return np.array([], dtype=int)
     y = np.asarray(intensities, dtype=float)
@@ -138,6 +172,14 @@ def _annotate_peaks(
     max_labels: int = 8,
     min_rel_prominence: float = 0.05,
 ):
+    """Annotates prominent peaks on a spectrum axis.
+    
+    :param ax: Matplotlib axes object to annotate
+    :param mz_axis: m/z axis values
+    :param intensities: Spectrum intensity values
+    :param color: Annotation text color
+    :param max_labels: Maximum number of peaks to label
+    :param min_rel_prominence: Minimum relative prominence required for labeling"""
     peak_idx = _prominent_peak_indices(
         mz_axis=mz_axis,
         intensities=intensities,
@@ -162,7 +204,10 @@ def _annotate_peaks(
         )
 
 def get_mean_spectrum(img:Path,):
-    """Extract mean spectrum from aligned imzML"""
+    """Extracts the mean spectrum from an aligned imzML file.
+    
+    :param img: Path to a continuous aligned imzML file
+    :return: Tuple of m/z axis and average intensity values"""
 
     with warnings.catch_warnings(action='ignore'):
         imzml = ImzMLParser.ImzMLParser(img)
@@ -192,41 +237,19 @@ def kmeans_cluster_imzml(
     min_cluster_fraction: float = 0.01,
     min_cluster_size: int = 25,
 ) -> pd.DataFrame:
-    """
-    Run k-means clustering on one or more continuous/aligned imzML datasets.
-
-    Parameters
-    ----------
-    imzml_paths
-        One imzML path or a sequence of imzML paths.
-    n_clusters
-        Number of clusters to compute, or "auto".
-    tic_normalize
-        If True, spectra are TIC-normalized before clustering.
-    random_state
-        Random state passed to sklearn KMeans.
-    n_init
-        Number of initializations for KMeans ("auto" or int).
-    max_iter
-        Maximum number of k-means iterations.
-    auto_k_min
-        Minimum initial k when `n_clusters="auto"`.
-    auto_k_max
-        Maximum initial k when `n_clusters="auto"`.
-    min_cluster_fraction
-        Minimum fraction of total pixels a cluster must contain to remain after
-        auto-pruning.
-    min_cluster_size
-        Minimum absolute pixel count a cluster must contain to remain after
-        auto-pruning.
-
-    Returns
-    -------
-    pandas.DataFrame
-        A DataFrame with columns:
-        `sample`, `x`, `y`, `z`, `pixel_size_x`, `pixel_size_y`, `cluster`.
-        Cluster labels are 1-based.
-    """
+    """Runs k-means clustering on one or more continuous aligned imzML datasets.
+    
+    :param imzml_paths: One imzML path or a sequence of imzML paths
+    :param n_clusters: Number of clusters to compute, or "auto"
+    :param tic_normalize: Whether to TIC-normalize spectra before clustering
+    :param random_state: Random state passed to sklearn KMeans
+    :param n_init: Number of initializations for KMeans
+    :param max_iter: Maximum number of k-means iterations
+    :param auto_k_min: Minimum initial k when n_clusters is "auto"
+    :param auto_k_max: Maximum initial k when n_clusters is "auto"
+    :param min_cluster_fraction: Minimum fraction of total pixels a cluster must contain
+    :param min_cluster_size: Minimum absolute pixel count a cluster must contain
+    :return: Dataframe containing sample, coordinates, pixel sizes, and cluster labels"""
     if isinstance(n_clusters, str) and n_clusters != "auto":
         raise ValueError("n_clusters must be an integer >= 1 or 'auto'.")
     if isinstance(n_clusters, int) and n_clusters < 1:
@@ -356,25 +379,13 @@ def plot_cluster_classification(
     ncols: int = 3,
     figsize: tuple[float, float] | None = None,
 ):
-    """
-    Plot pixel-wise cluster assignments from `kmeans_cluster_imzml` using imshow.
-
-    Parameters
-    ----------
-    cluster_df
-        DataFrame with columns `x`, `y`, `cluster`, and optionally `sample`.
-    cmap
-        Matplotlib colormap name used for clusters.
-    ncols
-        Number of subplot columns when multiple samples are present.
-    figsize
-        Optional figure size. If None, size is inferred from subplot count.
-
-    Returns
-    -------
-    tuple[matplotlib.figure.Figure, np.ndarray]
-        Figure and flattened array of active axes.
-    """
+    """Plots pixel-wise cluster assignments from kmeans_cluster_imzml using imshow.
+    
+    :param cluster_df: Dataframe with x, y, cluster, and optional sample columns
+    :param cmap: Matplotlib colormap name used for clusters
+    :param ncols: Number of subplot columns when multiple samples are present
+    :param figsize: Optional figure size
+    :return: Tuple of matplotlib figure and active axes array"""
     required = {"x", "y", "cluster"}
     if not required.issubset(cluster_df.columns):
         missing = required - set(cluster_df.columns)
@@ -500,24 +511,12 @@ def mean_spectra_by_cluster(
     imzml_paths: str | Path | Sequence[str | Path],
     tic_normalize: bool | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Compute mean spectra for each cluster label in a clustering result.
-
-    Parameters
-    ----------
-    cluster_df
-        Output DataFrame from `kmeans_cluster_imzml`.
-    imzml_paths
-        One imzML path or a sequence of paths used in the clustering.
-    tic_normalize
-        If True, TIC-normalize spectra before averaging. If None, use
-        `cluster_df.attrs["tic_normalized"]` when present, otherwise True.
-
-    Returns
-    -------
-    tuple[np.ndarray, pandas.DataFrame]
-        `mz_axis`, `mean_spectra_df` where columns are cluster labels.
-    """
+    """Computes mean spectra for each cluster label in a clustering result.
+    
+    :param cluster_df: Output dataframe from kmeans_cluster_imzml
+    :param imzml_paths: One imzML path or sequence of paths used in clustering
+    :param tic_normalize: Whether to TIC-normalize spectra before averaging
+    :return: Tuple of m/z axis and mean spectra dataframe"""
     required = {"sample", "x", "y", "cluster"}
     if not required.issubset(cluster_df.columns):
         missing = required - set(cluster_df.columns)
@@ -618,11 +617,20 @@ def plot_mean_spectra_by_cluster(
     max_peak_labels: int = 8,
     min_rel_prominence: float = 0.05,
 ):
-    """
-    Plot mean cluster spectra returned by `mean_spectra_by_cluster`.
-
-    Peak labels show m/z values to 4 decimal places.
-    """
+    """Plots mean cluster spectra returned by mean_spectra_by_cluster.
+    
+    :param mz_axis: m/z axis values
+    :param mean_spectra_df: Mean spectra dataframe with cluster labels as columns
+    :param ax: Optional target axes when drawing all spectra on one axis
+    :param separate_axes: Whether to draw each cluster on a separate axis
+    :param ncols: Number of subplot columns when separate axes are used
+    :param linewidth: Width of spectrum lines
+    :param cmap: Matplotlib colormap name for cluster colors
+    :param cluster_colors: Optional mapping of cluster labels to RGBA colors
+    :param label_peaks: Whether to annotate prominent peaks
+    :param max_peak_labels: Maximum number of peaks to label per spectrum
+    :param min_rel_prominence: Minimum relative prominence required for labeling
+    :return: Tuple of matplotlib figure and active axes array"""
     if mean_spectra_df.empty:
         raise ValueError("mean_spectra_df is empty.")
 

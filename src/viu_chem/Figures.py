@@ -130,7 +130,21 @@ def volcano(data_numerator:pd.DataFrame,
             right_label:str="Numerator",
             xlabel:str = None,
             ylabel:str = "p-value"):
-
+    """Generates a volcano plot comparing two dataframes into the specified axes. If no axes provided it generates its own.
+    
+    :param data_numerator: Dataframe containing numerator group values
+    :param data_denom: Dataframe containing denominator group values
+    :param ax: Target axes
+    :param color_denom: Color for the denominator side gradient
+    :param color_numer: Color for the numerator side gradient
+    :param marker_color: Color to draw the data points
+    :param sig_cutoff: P-value cutoff for significance
+    :param left_label: Label for the denominator side of the plot
+    :param right_label: Label for the numerator side of the plot
+    :param xlabel: String for the x axis label
+    :param ylabel: String for the y axis label
+    :return ax: Returns the populated axes object
+    :return return_df: Dataframe containing fold changes and p-values"""
     
     # Check that dataframes are coherent and match
     if not data_numerator.index.equals(data_denom.index):
@@ -221,11 +235,16 @@ def volcano(data_numerator:pd.DataFrame,
 
 
 def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05):
-    """
-    Draws a 2D gradient:
-        - Horizontal fade (white <-> color)
-        - Vertical fade (white at bottom, strong color at top)
-    """
+    """Draws a 2D side gradient onto an axes object.
+    
+    :param ax: Target matplotlib axes object
+    :param x0: Gradient minimum x value
+    :param x1: Gradient maximum x value
+    :param y0: Gradient minimum y value
+    :param y1: Gradient maximum y value
+    :param color: Gradient color
+    :param direction: Horizontal fade direction
+    :param fade_y: Y value where the vertical fade reaches full color"""
     N = 256
 
     # Horizontal component
@@ -260,6 +279,4 @@ def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05)
     )
 
     
-
-
 

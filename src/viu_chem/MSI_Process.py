@@ -11,7 +11,14 @@ import matplotlib.colors as mcolors
 
 
 def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float=150.0,filetype:str="raw", stop_at_mzML:bool=False):
-    """Placeholder"""
+    """Converts a directory of RAW files to mzML and then imzML with processed metadata.
+    
+    :param dir: Path to the directory containing RAW files
+    :param mode: Conversion mode to use when writing mzML files
+    :param x_speed: X-axis scan speed used for imzML metadata processing
+    :param y_step: Y-axis step size used for imzML metadata processing
+    :param filetype: File extension for the raw data files
+    :param stop_at_mzML: Whether to stop after mzML conversion"""
     iw_utils.RAW_to_mzML(dir,write_mode=mode,blocking=True)
 
     iw_utils.clean_raw_files(dir,filetype)
@@ -33,7 +40,8 @@ def get_image_matrix(src:str, mz:list | float = 104.1070,tol: list | float = 10.
     
     :param src: File path to the imzML source
     :param mz: m/z or list of m/z to retrieve images for
-    :param tol: Tolerance with which to retrieve the images"""
+    :param tol: Tolerance with which to retrieve the images
+    :return img_raw: Ion image array or list of ion image arrays"""
 
     with warnings.catch_warnings(action="ignore"):
         with ImzMLParser.ImzMLParser(filename=src,parse_lib='lxml') as img:
@@ -53,7 +61,10 @@ def get_image_matrix(src:str, mz:list | float = 104.1070,tol: list | float = 10.
 
 
 def get_TIC_image(src:str):
-    """Placeholder"""
+    """Retrieves the total ion current image from an imzML file.
+    
+    :param src: File path to the imzML source
+    :return tic_image: Total ion current image as a numpy array"""
     with warnings.catch_warnings(action='ignore'):
         with ImzMLParser.ImzMLParser(filename=src,parse_lib='lxml') as img:
             tic_image = ImzMLParser.getionimage(img,500,9999)
@@ -61,8 +72,16 @@ def get_TIC_image(src:str):
     return tic_image
 
 def get_weighted_median_image(src:str):
+    """Retrieves a weighted median image from an imzML file.
+    
+    :param src: File path to the imzML source
+    :return wmi: Weighted median image as a numpy array"""
 
     def wmi_reduce_func(seq):
+        """Calculates the median of nonzero values in an intensity sequence.
+        
+        :param seq: Intensity sequence
+        :return: Median of nonzero intensity values"""
         no_zeros = seq[seq!=0]
         return np.median(no_zeros)
 
@@ -89,7 +108,10 @@ def get_scale(src:str):
         return scale_x, scale_y
 
 def get_aspect_ratio(src:str):
-    """Placeholder"""
+    """Calculates the image aspect ratio from imzML pixel size metadata.
+    
+    :param src: File path to the imzML source
+    :return: Ratio of y pixel size to x pixel size"""
     with warnings.catch_warnings(action="ignore"):
         img = ImzMLParser.ImzMLParser(filename=src,parse_lib='lxml')
         metadata = img.metadata.pretty()
@@ -104,7 +126,18 @@ def get_aspect_ratio(src:str):
 
 
 def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str = None, cut_offs:tuple=(5, 95),quality:int=100, asp:float=1,scale:float=1,NL_override=None, custom_size:tuple=None):
-    """Placeholder"""
+    """Draws or saves an ion image from a numpy array with percentile-based intensity cutoffs.
+    
+    :param data: Ion image data as a numpy array
+    :param cmap: Matplotlib colormap used to draw the image
+    :param mode: Whether to draw the image or save it to disk
+    :param path: Output path used when mode is save
+    :param cut_offs: Lower and upper percentile cutoffs for image intensity
+    :param quality: DPI to use when saving the image
+    :param asp: Aspect ratio to use when drawing the image
+    :param scale: Figure scale multiplier
+    :param NL_override: Optional override for the image maximum intensity
+    :param custom_size: Optional figure size override"""
     mpl.rcParams['savefig.pad_inches'] = 0
     up_cut = np.percentile(data,max(cut_offs))
     down_cut = np.percentile(data,min(cut_offs))
@@ -137,7 +170,15 @@ def draw_ion_image(data:np.array, cmap:str="viridis",mode:str = "draw", path:str
             plt.close(fig)
     
 def unsharp_mask(image, kernel_size=(5, 5), sigmaX=1.0, sigmaY=1.0, amount=1.0, threshold=0):
-    """Return a sharpened version of the image, using an unsharp mask."""
+    """Returns a sharpened image using an unsharp mask.
+    
+    :param image: Image array to sharpen
+    :param kernel_size: Gaussian blur kernel size
+    :param sigmaX: Gaussian blur sigma in the x direction
+    :param sigmaY: Gaussian blur sigma in the y direction
+    :param amount: Sharpening amount
+    :param threshold: Low-contrast threshold below which original pixels are preserved
+    :return: Sharpened image array"""
     blurred = cv.GaussianBlur(image, kernel_size, sigmaX=sigmaX, sigmaY=sigmaY)
     sharpened = float(amount + 1) * image - float(amount) * blurred
     sharpened = np.maximum(sharpened, np.zeros(sharpened.shape))
@@ -149,12 +190,26 @@ def unsharp_mask(image, kernel_size=(5, 5), sigmaX=1.0, sigmaY=1.0, amount=1.0, 
     return sharpened
 
 def smooth_image(img_data,asp:float, factor:int=3,base_sigma:float=10,weight_factor:float=0.5):
+    """Smooths and sharpens an ion image after zooming it by the specified factor.
+    
+    :param img_data: Ion image data as a numpy array
+    :param asp: Aspect ratio used to scale smoothing in the y direction
+    :param factor: Zoom factor applied before sharpening
+    :param base_sigma: Base Gaussian blur sigma for the unsharp mask
+    :param weight_factor: Amount of sharpening to apply
+    :return sharpened_img: Smoothed and sharpened image data"""
     zoomed_img = scipy.ndimage.zoom(img_data,factor)
     sharpened_img = unsharp_mask(zoomed_img, sigmaX=base_sigma, sigmaY=base_sigma/asp, kernel_size=(9,9), amount=weight_factor)
     return sharpened_img
 
 
 def find_matching_ROI(ROI_files:list,match_folder:str, ROI_folder:str):
+    """Finds and loads an ROI mask matching a data folder name.
+    
+    :param ROI_files: List of ROI npz filenames
+    :param match_folder: Folder name to match against ROI filenames
+    :param ROI_folder: Path to the folder containing ROI npz files
+    :return roi_mask: ROI mask loaded from the matching npz file"""
     matching_npz = None
 
     if f"{match_folder}.npz" in ROI_files:
@@ -195,6 +250,11 @@ def find_matching_ROI(ROI_files:list,match_folder:str, ROI_folder:str):
 #         if search_pattern in file:
 #             return os.path.join(working_folder,file)
 def find_data_filt_string(path: str, search_pattern: str):
+    """Finds the first file containing a search pattern while skipping known raw-data folders.
+    
+    :param path: Directory path to search recursively
+    :param search_pattern: String pattern to match in candidate filenames
+    :return: Path to the matching file, or None if no match is found"""
     bad_options = {"Initial RAW files", "Output mzML Files"}
 
     for root, dirs, files in os.walk(path):
@@ -214,14 +274,22 @@ def find_data_filt_string(path: str, search_pattern: str):
 
 
 def drawGrid(images:list[np.array],dims:tuple[int,int]=None,cut_off:float=95, title:str=None, aspects:list[float]=None, names:list[str]=None,):
-    """param images: List of np image arrays
-    param dims: Dimensions to draw the ion images in
-    param cut_off: Percentile cutoff to use for the global dataset
-    param title: Title to draw above the entire image
-    param aspects: aspect values for each image
-    param names: list of names to draw above each image"""
+    """Draws a grid of ion images with a shared intensity scale and colorbar.
+    
+    :param images: List of numpy image arrays
+    :param dims: Dimensions to draw the ion images in
+    :param cut_off: Percentile cutoff to use for the global dataset
+    :param title: Title to draw above the entire image
+    :param aspects: Aspect values for each image
+    :param names: List of names to draw above each image
+    :return fig: Populated matplotlib figure"""
 
     def add_cbar(ax:plt.Axes,fig:plt.figure,cbar_cutoffs:float=90):
+        """Adds a percentile colorbar to an ion image grid.
+        
+        :param ax: Axes used to position the colorbar
+        :param fig: Figure that receives the colorbar axes
+        :param cbar_cutoffs: Upper percentile label for the colorbar"""
         ax_pos = ax.get_position()
         width = 0.2
         height = 0.7
@@ -276,7 +344,13 @@ def drawGrid(images:list[np.array],dims:tuple[int,int]=None,cut_off:float=95, ti
 def grid_image(dir:str, dims:tuple=None,names:list=None,ext:str=".tif", title_string:str=None, savepath:str=None, cbar_cutoffs:tuple=(5, 95)):
     """Takes in a folder of images and makes a grid from them to display them all at once.
     
-    :param dims: Tuple of form height, width"""
+    :param dir: Path to the directory containing image files
+    :param dims: Tuple of form height, width
+    :param names: List of names used to select and label images
+    :param ext: File extension for images to include
+    :param title_string: Title string to draw into the grid
+    :param savepath: Optional path to save the figure instead of displaying it
+    :param cbar_cutoffs: Lower and upper percentile labels for the colorbar"""
     all_images = [image for image in os.listdir(dir) if image.endswith(ext)]
     all_images = [image for name in names for image in all_images if name in image]
 
