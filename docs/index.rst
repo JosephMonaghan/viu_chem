@@ -17,4 +17,5 @@ Welcome to the VIU Chemistry Python package documentation page!
    Quick Start Guide <quickstart>
    Function Documentation <viu_chem>
    Example #1 - MSI workflow <ExampleMSI>
+   Example #2 - Chromatograms and calibration <ExampleChem412>
    
