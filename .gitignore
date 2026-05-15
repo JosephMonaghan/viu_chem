@@ -7,7 +7,7 @@
 /cv_scans
 /peak_align
 /coreg
-
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
