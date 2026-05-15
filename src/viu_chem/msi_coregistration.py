@@ -42,6 +42,8 @@ from qtpy.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -519,6 +521,21 @@ def auto_contrast_limits(img: np.ndarray, low_pct: float = 1.0, high_pct: float 
     return (lo, hi)
 
 
+def finite_data_limits(img: np.ndarray) -> tuple[float, float]:
+    if np.ma.isMaskedArray(img):
+        finite = np.asarray(img.compressed(), dtype=float)
+    else:
+        vals = np.asarray(img, dtype=float)
+        finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    if hi <= lo:
+        hi = lo + 1e-9
+    return (lo, hi)
+
+
 def prepare_ion_for_display(img: np.ndarray) -> np.ndarray:
     data = np.asarray(img, dtype=float).copy()
     data[(~np.isfinite(data)) | (data <= 0)] = 0.0
@@ -983,6 +1000,15 @@ def add_reference_image(
 
     host_zarr_path = Path(zarr_path).expanduser()
     dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs)
+    saved_display_settings: dict[str, Any] = {}
+    try:
+        root = zarr.open_group(host_zarr_path, mode="r", use_consolidated=False)
+        if "images" in root and key in root["images"]:
+            raw_settings = root["images"][key].attrs.get("if_display_settings", {})
+            if isinstance(raw_settings, Mapping):
+                saved_display_settings = dict(raw_settings)
+    except Exception:
+        pass
     source_path = Path(image_path).expanduser()
     qptiff_meta: dict[str, float | int | str] = {}
     if source_path.suffix.lower() in {".qptiff", ".ome.tiff", ".ome.tif"} and qptiff_level is not None:
@@ -1015,6 +1041,9 @@ def add_reference_image(
     element.attrs["pixel_size_x_um"] = float(px_um_x)
     element.attrs["pixel_size_y_um"] = float(px_um_y)
     element.attrs["pixel_size_source"] = "image_metadata_or_default_10000dpi"
+    element.attrs["source_path"] = str(source_path)
+    if saved_display_settings:
+        element.attrs["if_display_settings"] = saved_display_settings
     for attr_key, attr_value in qptiff_meta.items():
         element.attrs[attr_key] = attr_value
 
@@ -1659,36 +1688,100 @@ def launch_coregistration_gui(
         except Exception:
             pass
 
+    def _apply_reference_layer_contrast(
+        layer,
+        mode: str,
+        percentiles: tuple[float, float] = (1.0, 99.8),
+        intensity_limits: tuple[float, float] | None = None,
+    ):
+        metadata = _layer_metadata(layer)
+        mode = str(mode).strip().lower()
+        if mode not in {"percentile", "intensity"}:
+            mode = "percentile"
+        metadata["reference_contrast_mode"] = mode
+
+        if mode == "intensity":
+            if intensity_limits is None:
+                intensity_limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+            low, high = float(intensity_limits[0]), float(intensity_limits[1])
+            if high <= low:
+                high = low + 1e-9
+            layer.contrast_limits = (low, high)
+            metadata["reference_contrast_limits"] = (low, high)
+            return
+
+        low_pct = float(percentiles[0])
+        high_pct = float(percentiles[1])
+        if high_pct <= low_pct:
+            high_pct = min(100.0, low_pct + 0.1)
+        layer.contrast_limits = auto_contrast_limits(np.asarray(layer.data), low_pct=low_pct, high_pct=high_pct)
+        metadata["reference_contrast_percentiles"] = (low_pct, high_pct)
+        metadata["reference_contrast_limits"] = tuple(float(v) for v in layer.contrast_limits)
+
+    def _apply_reference_layer_gamma(layer, gamma: float):
+        metadata = _layer_metadata(layer)
+        gamma = float(gamma)
+        if not np.isfinite(gamma) or gamma <= 0:
+            gamma = 1.0
+        metadata["reference_gamma"] = gamma
+        try:
+            layer.gamma = gamma
+        except Exception:
+            pass
+
+    def _read_reference_display_settings_from_zarr(reference_key: str) -> dict[str, Any]:
+        try:
+            root = zarr.open_group(host_zarr_path, mode="r", use_consolidated=False)
+            raw = root["images"][reference_key].attrs.get("if_display_settings", {})
+        except Exception:
+            raw = {}
+        return dict(raw) if isinstance(raw, Mapping) else {}
+
+    def _saved_reference_display_settings(image_attrs: Mapping[str, Any], channel_index: int, reference_key: str = "") -> dict[str, Any]:
+        raw = _read_reference_display_settings_from_zarr(reference_key) if reference_key else {}
+        if not isinstance(raw, Mapping) or not raw:
+            raw = image_attrs.get("if_display_settings", {}) if isinstance(image_attrs, Mapping) else {}
+        if not isinstance(raw, Mapping):
+            return {}
+        value = raw.get(str(channel_index), raw.get(channel_index, {}))
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _apply_saved_reference_display_metadata(layer, saved: Mapping[str, Any]):
+        if not saved:
+            return
+        metadata = _layer_metadata(layer)
+        for key in (
+            "display_name",
+            "visible",
+            "color_choice",
+            "contrast_mode",
+            "contrast_percentiles",
+            "contrast_limits",
+            "gamma",
+        ):
+            if key not in saved:
+                continue
+            value = saved[key]
+            if key == "display_name" and str(value).strip():
+                layer.name = str(value).strip()
+            elif key == "visible":
+                layer.visible = bool(value)
+            elif key == "color_choice":
+                metadata["reference_color_choice"] = str(value)
+            elif key == "contrast_mode":
+                metadata["reference_contrast_mode"] = str(value)
+            elif key == "contrast_percentiles" and isinstance(value, (list, tuple)) and len(value) >= 2:
+                metadata["reference_contrast_percentiles"] = (float(value[0]), float(value[1]))
+            elif key == "contrast_limits" and isinstance(value, (list, tuple)) and len(value) >= 2:
+                metadata["reference_contrast_limits"] = (float(value[0]), float(value[1]))
+            elif key == "gamma":
+                metadata["reference_gamma"] = float(value)
+
     def _refresh_if_toolbox_widgets(preferred_layer_name: str | None = None):
-        choices = _reference_channel_choice_names()
         try:
-            editor_widget = if_channel_editor
-        except NameError:
-            editor_widget = None
-        if editor_widget is not None:
-            current_value = str(if_channel_editor.layer_name.value)
-            if_channel_editor.layer_name.choices = choices
-            target_value = preferred_layer_name or current_value
-            if target_value not in choices:
-                target_value = choices[0]
-            if_channel_editor.layer_name.value = target_value
-        try:
-            visibility_widget = if_channel_visibility_widget
-        except NameError:
-            visibility_widget = None
-        if visibility_widget is not None:
-            current_value = str(if_channel_visibility_widget.layer_name.value)
-            if_channel_visibility_widget.layer_name.choices = choices
-            target_value = preferred_layer_name or current_value
-            if target_value not in choices:
-                target_value = choices[0]
-            if_channel_visibility_widget.layer_name.value = target_value
-        try:
-            layout = if_layer_controls_layout
-        except NameError:
-            layout = None
-        if layout is not None:
             rebuild_if_layer_controls()
+        except NameError:
+            pass
 
     def enforce_reference_layers_at_bottom():
         ordered = [key for key in ("optical", "hne") if key in reference_layers]
@@ -1788,12 +1881,26 @@ def launch_coregistration_gui(
             for idx, layer in enumerate(existing_layers):
                 metadata = _layer_metadata(layer)
                 default_rgb = tuple(float(v) for v in channel_colormaps[idx].colors[-1][:3])
+                _apply_saved_reference_display_metadata(layer, _saved_reference_display_settings(image_attrs, idx, key))
                 metadata["reference_key"] = key
                 metadata["reference_channel_index"] = idx
                 metadata["reference_default_name"] = channel_names[idx]
                 metadata["reference_default_rgb"] = default_rgb
                 metadata.setdefault("reference_color_choice", "metadata")
+                metadata.setdefault("reference_contrast_mode", "percentile")
+                metadata.setdefault("reference_contrast_percentiles", (1.0, 99.8))
+                metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data)))))
+                metadata.setdefault("reference_gamma", float(getattr(layer, "gamma", 1.0)))
+                layer.opacity = 1.0
+                layer.blending = "translucent"
                 _set_reference_layer_color(layer, str(metadata.get("reference_color_choice", "metadata")))
+                _apply_reference_layer_contrast(
+                    layer,
+                    str(metadata.get("reference_contrast_mode", "percentile")),
+                    percentiles=tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8))),
+                    intensity_limits=tuple(float(v) for v in metadata.get("reference_contrast_limits", getattr(layer, "contrast_limits", (0.0, 1.0)))),
+                )
+                _apply_reference_layer_gamma(layer, float(metadata.get("reference_gamma", 1.0)))
             reference_layers[key] = existing_layers
         else:
             layer = existing_layers[0] if existing_layers else None
@@ -1803,13 +1910,27 @@ def launch_coregistration_gui(
             else:
                 layer = viewer.add_image(arr, name=key, visible=visible)
             metadata = _layer_metadata(layer)
+            _apply_saved_reference_display_metadata(layer, _saved_reference_display_settings(image_attrs, 0, key))
             metadata["reference_key"] = key
             metadata["reference_channel_index"] = 0
             metadata["reference_default_name"] = key
             metadata.setdefault("reference_color_choice", "metadata")
+            metadata.setdefault("reference_contrast_mode", "percentile")
+            metadata.setdefault("reference_contrast_percentiles", (1.0, 99.8))
+            metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data)))))
+            metadata.setdefault("reference_gamma", float(getattr(layer, "gamma", 1.0)))
+            layer.opacity = 1.0
+            layer.blending = "translucent"
             if metadata.get("reference_default_rgb") is None:
                 metadata["reference_default_rgb"] = REFERENCE_CHANNEL_COLOR_PRESETS["white"]
             _set_reference_layer_color(layer, str(metadata.get("reference_color_choice", "metadata")))
+            _apply_reference_layer_contrast(
+                layer,
+                str(metadata.get("reference_contrast_mode", "percentile")),
+                percentiles=tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8))),
+                intensity_limits=tuple(float(v) for v in metadata.get("reference_contrast_limits", getattr(layer, "contrast_limits", (0.0, 1.0)))),
+            )
+            _apply_reference_layer_gamma(layer, float(metadata.get("reference_gamma", 1.0)))
             reference_layers[key] = [layer]
         enforce_reference_layers_at_bottom()
         _refresh_if_toolbox_widgets(preferred_layer_name=str(_reference_layer_list(key)[0].name))
@@ -1832,6 +1953,17 @@ def launch_coregistration_gui(
         add_dataset_to_view(embedded_dataset, str(embedded_dataset.display_name))
 
     annotation_shape_layers = {}
+    annotation_label_colors = {}
+    annotation_palette = [
+        "#ffcc00",
+        "#00d1ff",
+        "#ff5f87",
+        "#7bff57",
+        "#c18bff",
+        "#ff9f1c",
+        "#2ec4b6",
+        "#e71d36",
+    ]
     annotation_edge_width = 1.5
     annotation_edge_opacity = 0.9
     annotation_show_labels = False
@@ -1860,9 +1992,33 @@ def launch_coregistration_gui(
                 out.extend(geometry_to_napari_shapes(line))
         return out
 
+    def get_annotation_color(label: str) -> str:
+        cleaned = str(label).strip()
+        if not cleaned:
+            cleaned = "(unlabeled)"
+        if cleaned not in annotation_label_colors:
+            color_idx = len(annotation_label_colors) % len(annotation_palette)
+            annotation_label_colors[cleaned] = annotation_palette[color_idx]
+        return annotation_label_colors[cleaned]
+
+    def annotation_edge_colors(labels: Iterable[str], fallback_label: str) -> list[str]:
+        fallback = str(fallback_label).strip() or "(unlabeled)"
+        return [get_annotation_color(str(label).strip() or fallback) for label in labels]
+
     def apply_annotation_visuals():
         for layer in annotation_shape_layers.values():
             try:
+                metadata = _layer_metadata(layer)
+                fallback_label = str(metadata.get("annotation_shape_key", layer.name))
+                labels = []
+                try:
+                    labels = list(layer.properties.get("label", []))
+                except Exception:
+                    labels = []
+                if labels:
+                    layer.edge_color = annotation_edge_colors(labels, fallback_label)
+                else:
+                    layer.edge_color = get_annotation_color(fallback_label)
                 layer.edge_width = float(annotation_edge_width)
                 layer.face_color = [0, 0, 0, 0]
                 layer.opacity = float(annotation_edge_opacity)
@@ -1904,6 +2060,21 @@ def launch_coregistration_gui(
         choices.extend(labels)
         return choices
 
+    def transformed_msi_xy(state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        coreg_dataset = state["dataset"]
+        empty_xy = np.empty((0, 2), dtype=float)
+        empty_mask = np.zeros(len(coreg_dataset.x_coords), dtype=bool)
+        transform_xy = np.asarray(state["current_transform_xy"], dtype=float)
+        if transform_xy.shape != (3, 3) or not np.all(np.isfinite(transform_xy)):
+            return empty_xy, empty_mask
+        xy1 = np.column_stack(
+            [coreg_dataset.x_coords.astype(float), coreg_dataset.y_coords.astype(float), np.ones_like(coreg_dataset.x_coords, dtype=float)]
+        )
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            xy_t = (transform_xy @ xy1.T).T[:, :2]
+        finite = np.all(np.isfinite(xy_t), axis=1)
+        return xy_t[finite], finite
+
     def compute_annotation_region_mask(
         state: dict[str, Any],
         roi_shape_key: str,
@@ -1913,10 +2084,9 @@ def launch_coregistration_gui(
         if roi_shape_key not in coreg_dataset.sdata.shapes:
             return np.zeros(len(coreg_dataset.x_coords), dtype=bool)
         rois = coreg_dataset.sdata.transform_element_to_coordinate_system(roi_shape_key, registered_cs)
-        xy1 = np.column_stack(
-            [coreg_dataset.x_coords.astype(float), coreg_dataset.y_coords.astype(float), np.ones_like(coreg_dataset.x_coords, dtype=float)]
-        )
-        xy_t = (state["current_transform_xy"] @ xy1.T).T[:, :2]
+        xy_t, finite = transformed_msi_xy(state)
+        if not np.any(finite):
+            return np.zeros(len(coreg_dataset.x_coords), dtype=bool)
         points = np.array([Point(px, py) for px, py in xy_t], dtype=object)
         inside = [
             np.fromiter((point.within(rois.geometry.iloc[idx]) for point in points), dtype=bool, count=len(points))
@@ -1924,12 +2094,18 @@ def launch_coregistration_gui(
         ]
         inside = np.vstack(inside) if inside else np.zeros((0, len(points)), dtype=bool)
         if region_label == "(all regions)" or "_annotation_label" not in rois.columns:
-            return np.any(inside, axis=0) if inside.size else np.zeros(len(points), dtype=bool)
+            selected_finite = np.any(inside, axis=0) if inside.size else np.zeros(len(points), dtype=bool)
+            selected = np.zeros(len(coreg_dataset.x_coords), dtype=bool)
+            selected[finite] = selected_finite
+            return selected
         matching_idxs = [
             idx for idx, value in enumerate(rois["_annotation_label"])
             if str(value).strip() == str(region_label).strip()
         ]
-        return np.any(inside[matching_idxs], axis=0) if matching_idxs else np.zeros(len(points), dtype=bool)
+        selected_finite = np.any(inside[matching_idxs], axis=0) if matching_idxs else np.zeros(len(points), dtype=bool)
+        selected = np.zeros(len(coreg_dataset.x_coords), dtype=bool)
+        selected[finite] = selected_finite
+        return selected
 
     def compute_selected_annotation_mask(active_layer, *, include_same_label: bool = True) -> tuple[dict[str, Any] | None, str | None, np.ndarray | None, str]:
         if active_layer is None or active_layer not in annotation_shape_layers.values():
@@ -1969,16 +2145,17 @@ def launch_coregistration_gui(
         transformed_gdf = source_state["dataset"].sdata.transform_element_to_coordinate_system(shape_key, registered_cs)
         transformed_subset = transformed_gdf.iloc[row_indices].copy()
         coreg_dataset = source_state["dataset"]
-        xy1 = np.column_stack(
-            [coreg_dataset.x_coords.astype(float), coreg_dataset.y_coords.astype(float), np.ones_like(coreg_dataset.x_coords, dtype=float)]
-        )
-        xy_t = (source_state["current_transform_xy"] @ xy1.T).T[:, :2]
+        xy_t, finite = transformed_msi_xy(source_state)
+        if not np.any(finite):
+            return source_state, shape_key, np.zeros(len(coreg_dataset.x_coords), dtype=bool), default_label
         points = np.array([Point(px, py) for px, py in xy_t], dtype=object)
         inside = [
             np.fromiter((point.within(transformed_subset.geometry.iloc[idx]) for point in points), dtype=bool, count=len(points))
             for idx in range(len(transformed_subset))
         ]
-        selected_mask = np.any(np.vstack(inside), axis=0) if inside else np.zeros(len(points), dtype=bool)
+        selected_finite = np.any(np.vstack(inside), axis=0) if inside else np.zeros(len(points), dtype=bool)
+        selected_mask = np.zeros(len(coreg_dataset.x_coords), dtype=bool)
+        selected_mask[finite] = selected_finite
         return source_state, shape_key, selected_mask, default_label
 
     def refresh_annotation_widget_choices():
@@ -1996,8 +2173,7 @@ def launch_coregistration_gui(
     def add_annotation_shape_layers(state: dict[str, Any], shape_keys: Iterable[str] | None = None):
         source_dataset = state["dataset"]
         keys = [key for key in (shape_keys or source_dataset.sdata.shapes.keys()) if "pixels" not in key.lower()]
-        colors = ["#ffcc00", "#00d1ff", "#ff5f87", "#7bff57", "#c18bff"]
-        for idx, key in enumerate(keys):
+        for key in keys:
             try:
                 gdf = source_dataset.sdata.transform_element_to_coordinate_system(key, registered_cs)
             except Exception:
@@ -2021,10 +2197,12 @@ def launch_coregistration_gui(
             if not shape_data:
                 continue
             layer_name = f"anno:{state['label']}:{key}"
+            edge_colors = annotation_edge_colors(shape_labels, key)
             if layer_name in annotation_shape_layers:
                 annotation_shape_layers[layer_name].data = shape_data
                 try:
                     annotation_shape_layers[layer_name].properties = {"label": np.asarray(shape_labels, dtype=object)}
+                    annotation_shape_layers[layer_name].edge_color = edge_colors
                     annotation_shape_layers[layer_name].text = {
                         "string": "{label}",
                         "size": int(annotation_label_size),
@@ -2044,7 +2222,7 @@ def launch_coregistration_gui(
                 shape_data,
                 shape_type=shape_types,
                 name=layer_name,
-                edge_color=colors[idx % len(colors)],
+                edge_color=edge_colors,
                 face_color=[0, 0, 0, 0],
                 edge_width=float(annotation_edge_width),
                 opacity=float(annotation_edge_opacity),
@@ -2724,128 +2902,192 @@ def launch_coregistration_gui(
             msi_layer_controls_layout.addWidget(cmap_combo, row_idx, 3)
 
     if_layer_controls = QWidget()
-    if_layer_controls_layout = QGridLayout(if_layer_controls)
+    if_layer_controls_layout = QVBoxLayout(if_layer_controls)
     if_layer_controls_layout.setContentsMargins(0, 0, 0, 0)
-    if_layer_controls_layout.setHorizontalSpacing(4)
-    if_layer_controls_layout.setVerticalSpacing(2)
+    if_layer_controls_layout.setSpacing(6)
+    if_layer_table = QTableWidget()
+    if_layer_table.setColumnCount(7)
+    if_layer_table.setHorizontalHeaderLabels(["Show", "Name", "Color", "Mode", "Low", "High", "Gamma"])
+    if_layer_table.setAlternatingRowColors(True)
+    if_layer_table.setSortingEnabled(False)
+    try:
+        if_layer_table.horizontalHeader().setStretchLastSection(True)
+    except Exception:
+        pass
+    if_layer_table.setMinimumHeight(320)
+    if_apply_table_button = QPushButton("Save IF Settings to Zarr")
+    if_layer_controls_layout.addWidget(if_layer_table)
+    if_layer_controls_layout.addWidget(if_apply_table_button)
+    suppress_if_table_updates = False
+
+    def _configure_if_contrast_spin(spin: QDoubleSpinBox, mode: str):
+        if str(mode).lower() == "percentile":
+            spin.setRange(0.0, 100.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.1)
+        else:
+            spin.setRange(-1e15, 1e15)
+            spin.setDecimals(4)
+            spin.setSingleStep(1.0)
+
+    def _if_table_contrast_values(layer) -> tuple[str, float, float]:
+        metadata = _layer_metadata(layer)
+        mode = str(metadata.get("reference_contrast_mode", "percentile"))
+        if mode == "intensity":
+            limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+            return mode, limits[0], limits[1]
+        low, high = tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8)))
+        return "percentile", low, high
+
+    def apply_if_table_row(row_idx: int):
+        if suppress_if_table_updates:
+            return
+        name_item = if_layer_table.item(row_idx, 1)
+        if name_item is None:
+            return
+        layer = name_item.data(Qt.UserRole)
+        if layer is None:
+            return
+        show_box = if_layer_table.cellWidget(row_idx, 0)
+        color_combo = if_layer_table.cellWidget(row_idx, 2)
+        mode_combo = if_layer_table.cellWidget(row_idx, 3)
+        low_spin = if_layer_table.cellWidget(row_idx, 4)
+        high_spin = if_layer_table.cellWidget(row_idx, 5)
+        gamma_spin = if_layer_table.cellWidget(row_idx, 6)
+        layer.visible = bool(show_box.isChecked()) if isinstance(show_box, QCheckBox) else bool(layer.visible)
+        layer.opacity = 1.0
+        layer.blending = "translucent"
+        new_name = str(name_item.text()).strip()
+        if new_name:
+            layer.name = new_name
+        if isinstance(color_combo, QComboBox):
+            _set_reference_layer_color(layer, str(color_combo.currentText()))
+        mode = str(mode_combo.currentText()) if isinstance(mode_combo, QComboBox) else "percentile"
+        low = float(low_spin.value()) if isinstance(low_spin, QDoubleSpinBox) else 0.0
+        high = float(high_spin.value()) if isinstance(high_spin, QDoubleSpinBox) else 1.0
+        try:
+            if mode == "intensity":
+                _apply_reference_layer_contrast(layer, mode, intensity_limits=(low, high))
+            else:
+                _apply_reference_layer_contrast(layer, mode, percentiles=(low, high))
+        except Exception:
+            pass
+        if isinstance(gamma_spin, QDoubleSpinBox):
+            _apply_reference_layer_gamma(layer, float(gamma_spin.value()))
 
     def rebuild_if_layer_controls():
-        clear_layout(if_layer_controls_layout)
-        if_layer_controls_layout.addWidget(QLabel("IF channel"), 0, 0)
-        if_layer_controls_layout.addWidget(QLabel("Show"), 0, 1)
-        if_layer_controls_layout.addWidget(QLabel("Opacity"), 0, 2)
-        if_layer_controls_layout.addWidget(QLabel("Color"), 0, 3)
-        if_layer_controls_layout.addWidget(QLabel("Solo"), 0, 4)
-
+        nonlocal suppress_if_table_updates
+        suppress_if_table_updates = True
         layers = _reference_channel_layers()
         if not layers:
-            if_layer_controls_layout.addWidget(QLabel("No IF/reference layers loaded"), 1, 0, 1, 5)
+            if_layer_table.setRowCount(0)
+            suppress_if_table_updates = False
             return
 
-        for row_idx, layer in enumerate(layers, start=1):
+        if_layer_table.setRowCount(len(layers))
+        for row_idx, layer in enumerate(layers):
             metadata = _layer_metadata(layer)
-            label = QLabel(str(layer.name))
             show_box = QCheckBox()
             show_box.setChecked(bool(layer.visible))
-            opacity_spin = QDoubleSpinBox()
-            opacity_spin.setRange(0.0, 1.0)
-            opacity_spin.setSingleStep(0.05)
-            opacity_spin.setDecimals(2)
-            opacity_spin.setValue(float(getattr(layer, "opacity", 1.0)))
+            name_item = QTableWidgetItem(str(layer.name))
+            name_item.setData(Qt.UserRole, layer)
             color_combo = QComboBox()
             color_combo.addItems(_reference_color_choices())
             color_choice = str(metadata.get("reference_color_choice", "metadata"))
             color_combo.setCurrentText(color_choice if color_choice in _reference_color_choices() else "metadata")
-            solo_button = QPushButton("Solo")
+            mode, low, high = _if_table_contrast_values(layer)
+            mode_combo = QComboBox()
+            mode_combo.addItems(["percentile", "intensity"])
+            mode_combo.setCurrentText(mode)
+            low_spin = QDoubleSpinBox()
+            high_spin = QDoubleSpinBox()
+            gamma_spin = QDoubleSpinBox()
+            _configure_if_contrast_spin(low_spin, mode)
+            _configure_if_contrast_spin(high_spin, mode)
+            low_spin.setValue(float(low))
+            high_spin.setValue(float(high))
+            gamma_spin.setRange(0.01, 10.0)
+            gamma_spin.setDecimals(3)
+            gamma_spin.setSingleStep(0.05)
+            gamma_spin.setValue(float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))))
 
-            def _set_layer_visible(checked, layer=layer):
-                layer.visible = bool(checked)
+            def _set_mode(value, layer=layer, low_spin=low_spin, high_spin=high_spin):
+                mode = str(value)
+                _configure_if_contrast_spin(low_spin, mode)
+                _configure_if_contrast_spin(high_spin, mode)
+                if mode == "intensity":
+                    limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+                    low_spin.setValue(limits[0])
+                    high_spin.setValue(limits[1])
+                else:
+                    metadata = _layer_metadata(layer)
+                    low, high = tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8)))
+                    low_spin.setValue(low)
+                    high_spin.setValue(high)
 
-            def _set_layer_opacity(value, layer=layer):
-                layer.opacity = float(value)
+            mode_combo.currentTextChanged.connect(_set_mode)
+            show_box.toggled.connect(lambda _checked, row_idx=row_idx: apply_if_table_row(row_idx))
+            color_combo.currentTextChanged.connect(lambda _value, row_idx=row_idx: apply_if_table_row(row_idx))
+            mode_combo.currentTextChanged.connect(lambda _value, row_idx=row_idx: apply_if_table_row(row_idx))
+            low_spin.valueChanged.connect(lambda _value, row_idx=row_idx: apply_if_table_row(row_idx))
+            high_spin.valueChanged.connect(lambda _value, row_idx=row_idx: apply_if_table_row(row_idx))
+            gamma_spin.valueChanged.connect(lambda _value, row_idx=row_idx: apply_if_table_row(row_idx))
 
-            def _set_layer_color(value, layer=layer):
-                _set_reference_layer_color(layer, str(value))
+            if_layer_table.setCellWidget(row_idx, 0, show_box)
+            if_layer_table.setItem(row_idx, 1, name_item)
+            if_layer_table.setCellWidget(row_idx, 2, color_combo)
+            if_layer_table.setCellWidget(row_idx, 3, mode_combo)
+            if_layer_table.setCellWidget(row_idx, 4, low_spin)
+            if_layer_table.setCellWidget(row_idx, 5, high_spin)
+            if_layer_table.setCellWidget(row_idx, 6, gamma_spin)
+        if_layer_table.resizeColumnsToContents()
+        suppress_if_table_updates = False
 
-            def _solo_layer(_checked=False, layer=layer):
-                for other in _reference_channel_layers():
-                    other.visible = other is layer
-                rebuild_if_layer_controls()
+    def on_if_table_item_changed(item: QTableWidgetItem):
+        if item.column() == 1:
+            apply_if_table_row(item.row())
 
-            show_box.toggled.connect(_set_layer_visible)
-            opacity_spin.valueChanged.connect(_set_layer_opacity)
-            color_combo.currentTextChanged.connect(_set_layer_color)
-            solo_button.clicked.connect(_solo_layer)
+    if_layer_table.itemChanged.connect(on_if_table_item_changed)
 
-            if_layer_controls_layout.addWidget(label, row_idx, 0)
-            if_layer_controls_layout.addWidget(show_box, row_idx, 1)
-            if_layer_controls_layout.addWidget(opacity_spin, row_idx, 2)
-            if_layer_controls_layout.addWidget(color_combo, row_idx, 3)
-            if_layer_controls_layout.addWidget(solo_button, row_idx, 4)
-
-    @magicgui(
-        layer_name={"widget_type": "ComboBox", "choices": _reference_channel_choice_names()},
-        visible={"widget_type": "CheckBox", "text": "Visible"},
-        display_name={"widget_type": "LineEdit"},
-        blending={"widget_type": "ComboBox", "choices": ["translucent", "additive", "opaque"]},
-        color={"widget_type": "ComboBox", "choices": _reference_color_choices()},
-        contrast_percentiles={
-            "widget_type": "FloatRangeSlider",
-            "min": 0.0,
-            "max": 100.0,
-            "step": 0.1,
-            "label": "Contrast percentiles",
-        },
-        call_button="Apply IF Channel Settings",
-    )
-    def if_channel_editor(
-        layer_name: str = _reference_channel_choice_names()[0],
-        visible: bool = True,
-        display_name: str = "",
-        blending: str = "translucent",
-        color: str = "metadata",
-        contrast_percentiles: tuple[float, float] = (1.0, 99.8),
-    ):
-        layer = _get_reference_layer_by_name(layer_name)
-        if layer is None:
-            return
-        layer.visible = bool(visible)
-        layer.blending = str(blending)
-        new_name = str(display_name).strip()
-        if new_name:
-            layer.name = new_name
-        _set_reference_layer_color(layer, str(color))
-        low_pct = float(contrast_percentiles[0])
-        high_pct = float(contrast_percentiles[1])
-        if high_pct <= low_pct:
-            high_pct = min(100.0, low_pct + 0.1)
-        try:
-            layer.contrast_limits = auto_contrast_limits(np.asarray(layer.data), low_pct=low_pct, high_pct=high_pct)
-        except Exception:
-            pass
-        _refresh_if_toolbox_widgets(preferred_layer_name=str(layer.name))
-
-    @magicgui(
-        layer_name={"widget_type": "ComboBox", "choices": _reference_channel_choice_names()},
-        show_all={"widget_type": "CheckBox", "text": "Show all IF channels"},
-        opacity={"widget_type": "FloatSlider", "min": 0.0, "max": 1.0, "step": 0.05},
-        auto_call=True,
-    )
-    def if_channel_visibility_widget(layer_name: str = _reference_channel_choice_names()[0], show_all: bool = False, opacity: float = 1.0):
-        selected = _get_reference_layer_by_name(layer_name)
+    def save_if_table_settings():
+        for row_idx in range(if_layer_table.rowCount()):
+            apply_if_table_row(row_idx)
+        layers_by_key: dict[str, list[Any]] = {}
         for layer in _reference_channel_layers():
-            if bool(show_all):
-                layer.visible = True
-            elif selected is not None:
-                layer.visible = layer is selected or bool(layer.visible and layer is not selected)
-        if selected is not None:
-            selected.opacity = float(opacity)
-            metadata = _layer_metadata(selected)
-            if_channel_editor["visible"].value = bool(selected.visible)
-            if_channel_editor["display_name"].value = str(selected.name)
-            if_channel_editor["blending"].value = str(getattr(selected, "blending", "translucent"))
-            if_channel_editor["color"].value = str(metadata.get("reference_color_choice", "metadata"))
-        rebuild_if_layer_controls()
+            reference_key = str(_layer_metadata(layer).get("reference_key", ""))
+            if reference_key:
+                layers_by_key.setdefault(reference_key, []).append(layer)
+        settings_by_key: dict[str, dict[str, dict[str, Any]]] = {}
+        for layer in _reference_channel_layers():
+            metadata = _layer_metadata(layer)
+            reference_key = str(metadata.get("reference_key", ""))
+            if not reference_key:
+                continue
+            channel_index = str(int(metadata.get("reference_channel_index", 0)))
+            settings_by_key.setdefault(reference_key, {})[channel_index] = {
+                "display_name": str(layer.name),
+                "visible": bool(layer.visible),
+                "color_choice": str(metadata.get("reference_color_choice", "metadata")),
+                "contrast_mode": str(metadata.get("reference_contrast_mode", "percentile")),
+                "contrast_percentiles": [float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8))],
+                "contrast_limits": [float(v) for v in getattr(layer, "contrast_limits", metadata.get("reference_contrast_limits", (0.0, 1.0)))],
+                "gamma": float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))),
+            }
+        try:
+            root = zarr.open_group(host_zarr_path, mode="r+", use_consolidated=False)
+            for reference_key, saved_settings in settings_by_key.items():
+                if "images" not in root or reference_key not in root["images"]:
+                    continue
+                root["images"][reference_key].attrs["if_display_settings"] = saved_settings
+                for state in datasets.values():
+                    sdata = state["dataset"].sdata
+                    if reference_key in sdata.images:
+                        sdata.images[reference_key].attrs["if_display_settings"] = saved_settings
+            QMessageBox.information(None, "IF Display Settings", "Saved IF display settings to the zarr.")
+        except Exception as exc:
+            QMessageBox.warning(None, "IF Display Settings", f"Could not save IF display settings:\n{exc}")
+
+    if_apply_table_button.clicked.connect(save_if_table_settings)
 
     def sync_controls_to_active_dataset():
         state = get_active_state()
@@ -3151,14 +3393,11 @@ def launch_coregistration_gui(
     if_dialog = QDialog()
     if_dialog.setWindowTitle("IF Display Tools")
     if_dialog.setModal(False)
-    if_dialog.resize(520, 760)
+    if_dialog.resize(920, 430)
     if_dialog_layout = QVBoxLayout(if_dialog)
     if_dialog_layout.setContentsMargins(8, 8, 8, 8)
     if_dialog_layout.setSpacing(8)
     if_dialog_layout.addWidget(if_layer_controls)
-    if_dialog_layout.addWidget(if_channel_visibility_widget.native)
-    if_dialog_layout.addWidget(if_channel_editor.native)
-    if_dialog_layout.addStretch(1)
 
     def open_if_dialog():
         if_dialog.show()
