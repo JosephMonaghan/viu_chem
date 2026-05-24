@@ -72,7 +72,7 @@ def spectrum(mz:list[float], intensity:list[float],ax:plt.Axes=None, color:str="
     return ax
 
 
-def cal_curve(x:list[float], y:list[float], ax:plt.Axes=None,xlabel:str="Your x label here!", ylabel:str="Your y label here!", color:str="#8C4FA4") -> plt.Axes:
+def cal_curve(x:list[float], y:list[float], ax:plt.Axes=None,xlabel:str="Your x label here!", ylabel:str="Your y label here!", color:str="#8C4FA4",slope_pos:tuple[float,float]=(0.02,0.95)) -> plt.Axes:
     """Generates a calibration curve for a given set of data x / y into the specified axes. If not axes provided it generates its own.
     
     :param x: List of x values
@@ -81,6 +81,7 @@ def cal_curve(x:list[float], y:list[float], ax:plt.Axes=None,xlabel:str="Your x 
     :param xlabel: String for the x axis label
     :param ylabel: String for the y axis label
     :param color: What color to draw the points
+    :param slope_pos: Where to draw the slope and r2 text
     :return ax: Returns the populated axes object
     :return coeffs: Slope and intercept for the best-fit line
     :return r2: Coefficient of determination (R2) for the line"""
@@ -104,7 +105,7 @@ def cal_curve(x:list[float], y:list[float], ax:plt.Axes=None,xlabel:str="Your x 
     r2 = 1 - (ss_res / ss_tot)
     
     ax.plot(x_fit, y_fit, color=color,linestyle='--')
-    ax.scatter(x, y, marker='s',edgecolors='k', color=color)
+    ax.scatter(slope_pos[0], slope_pos[1], marker='s',edgecolors='k', color=color)
 
     # Prepare the equation string
     slope, intercept = coeffs

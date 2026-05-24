@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,15 +49,27 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
 from shapely import affinity
 from spatialdata._io import write_image, write_shapes, write_table
 
 
 import numpy as np
 import zarr
+from zarr.errors import ZarrUserWarning
 
 _QT_APP = None
+warnings.filterwarnings(
+    "ignore",
+    message=r"Object at .* is not recognized as a component of a Zarr hierarchy.*",
+    category=ZarrUserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Consolidated metadata is currently not part in the Zarr format 3 specification.*",
+    category=ZarrUserWarning,
+)
 
 
 def _ensure_qapplication(QApplication):
@@ -1171,13 +1184,26 @@ def delete_geojson_annotations(
     keys = [str(key) for key in annotation_keys]
     if not keys:
         return []
-    sdata = sd.read_zarr(host_zarr_path)
+    try:
+        sdata = sd.read_zarr(host_zarr_path)
+    except Exception:
+        sdata = None
+    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
+    shapes_root = root.require_group("shapes")
     deleted: list[str] = []
     for key in keys:
-        if key not in sdata.shapes:
-            continue
-        sdata.delete_element_from_disk(key)
-        deleted.append(key)
+        if sdata is not None and key in sdata.shapes:
+            try:
+                sdata.delete_element_from_disk(key)
+                deleted.append(key)
+                continue
+            except Exception:
+                pass
+        if key in shapes_root:
+            del shapes_root[key]
+            deleted.append(key)
+    if deleted:
+        zarr.consolidate_metadata(str(host_zarr_path))
     return deleted
 
 
@@ -1267,6 +1293,118 @@ def transform_geojson_annotations(
     if rewritten:
         sd.read_zarr(host_zarr_path).write_consolidated_metadata()
     return rewritten
+
+
+def create_msi_threshold_annotation(
+    zarr_path: str | Path,
+    *,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    target_mz: float,
+    ppm_tolerance: float = 5.0,
+    threshold: float,
+    normalize_to_tic: bool = True,
+    transform_xy: np.ndarray | None = None,
+    prefilter_mask: np.ndarray | None = None,
+    prefilter_shape_key: str = "",
+    prefilter_region_label: str = "",
+    annotation_name: str = "",
+    annotation_label: str = "",
+    registered_cs: str = "registered",
+) -> str:
+    host_zarr_path = Path(zarr_path).expanduser()
+    dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    indices = dataset.find_feature_indices_from_mz(float(target_mz), float(ppm_tolerance))
+    if indices.size == 0:
+        idx, _ = dataset.find_feature_idx_from_mz(float(target_mz), float("inf"))
+        if idx is None:
+            raise ValueError(f"No m/z feature found near {target_mz:g}.")
+        indices = np.array([idx], dtype=int)
+
+    img = dataset.reconstruct_ion_image(indices, normalize_to_tic=bool(normalize_to_tic))
+    values = img[dataset.y_coords, dataset.x_coords]
+    allowed = np.ones(len(values), dtype=bool)
+    if prefilter_mask is not None:
+        prefilter = np.asarray(prefilter_mask, dtype=bool)
+        if prefilter.shape[0] != values.shape[0]:
+            raise ValueError("prefilter_mask must match the number of MSI spectra.")
+        allowed &= prefilter
+    lower_selected = (values < float(threshold)) & allowed
+    higher_selected = (values >= float(threshold)) & allowed
+    if not np.any(lower_selected) and not np.any(higher_selected):
+        raise ValueError("Threshold selected no MSI pixels.")
+
+    transform = np.asarray(transform_xy if transform_xy is not None else np.eye(3, dtype=float), dtype=float)
+    if transform.shape != (3, 3) or not np.all(np.isfinite(transform)):
+        raise ValueError("transform_xy must be a finite 3x3 affine matrix.")
+
+    def mask_to_geometry(selected: np.ndarray):
+        polygons = []
+        for x, y in zip(dataset.x_coords[selected].astype(float), dataset.y_coords[selected].astype(float)):
+            corners = np.array(
+                [
+                    [x - 0.5, y - 0.5, 1.0],
+                    [x + 0.5, y - 0.5, 1.0],
+                    [x + 0.5, y + 0.5, 1.0],
+                    [x - 0.5, y + 0.5, 1.0],
+                ],
+                dtype=float,
+            )
+            transformed = (transform @ corners.T).T[:, :2]
+            polygons.append(Polygon(transformed))
+        if not polygons:
+            return None
+        geometry = unary_union(polygons)
+        return None if geometry.is_empty else geometry
+
+    label_prefix = str(annotation_label).strip()
+    lower_label = f"{label_prefix} Lower".strip() if label_prefix else "Lower"
+    higher_label = f"{label_prefix} Higher".strip() if label_prefix else "Higher"
+    key_base = sanitize_name(annotation_name) or sanitize_name(f"msi_threshold_{float(target_mz):.4f}_{float(threshold):g}")
+    key = f"anno_{key_base}"
+    sdata = sd.read_zarr(host_zarr_path)
+    if key in sdata.shapes:
+        suffix = 2
+        while f"{key}_{suffix}" in sdata.shapes:
+            suffix += 1
+        key = f"{key}_{suffix}"
+
+    rows = []
+    geometries = []
+    for label, threshold_side, selected in (
+        (lower_label, "lower", lower_selected),
+        (higher_label, "higher", higher_selected),
+    ):
+        geometry = mask_to_geometry(selected)
+        if geometry is None:
+            continue
+        rows.append(
+            {
+                "_annotation_label": label,
+                "source": "msi_threshold",
+                "target_mz": float(target_mz),
+                "ppm_tolerance": float(ppm_tolerance),
+                "threshold": float(threshold),
+                "threshold_side": threshold_side,
+                "normalize_to_tic": bool(normalize_to_tic),
+                "prefilter_shape_key": str(prefilter_shape_key),
+                "prefilter_region_label": str(prefilter_region_label),
+                "n_pixels": int(np.count_nonzero(selected)),
+            }
+        )
+        geometries.append(geometry)
+    if not rows:
+        raise ValueError("Threshold produced no annotation geometries.")
+    gdf = gpd.GeoDataFrame(rows, geometry=geometries)
+    shape_element = ShapesModel.parse(gdf)
+    set_transformation(shape_element, Identity(), to_coordinate_system=registered_cs)
+    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
+    shapes_root = root.require_group("shapes")
+    if key in shapes_root:
+        del shapes_root[key]
+    write_shapes(shape_element, shapes_root.require_group(key))
+    zarr.consolidate_metadata(str(host_zarr_path))
+    return key
 
 
 def save_coregistration(
@@ -1469,6 +1607,17 @@ def launch_coregistration_gui(
         colors = np.array([[0.0, 0.0, 0.0, 0.0], [float(rgb[0]), float(rgb[1]), float(rgb[2]), float(alpha)]], dtype=float)
         return Colormap(colors=colors, name="binary_overlay")
 
+    def make_threshold_preview_colormap():
+        colors = np.array(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.1, 0.35, 1.0, 0.25],
+                [1.0, 0.1, 0.1, 0.35],
+            ],
+            dtype=float,
+        )
+        return Colormap(colors=colors, name="threshold_blue_red")
+
     viewer = napari.Viewer()
     overlay_colormap_order = [
         "viridis",
@@ -1495,6 +1644,7 @@ def launch_coregistration_gui(
         return overlay_colormap_cache[cmap_name]
 
     roi_overlay_colormap = make_binary_overlay_colormap()
+    threshold_preview_colormap = make_threshold_preview_colormap()
 
     def choose_dataset_label(base_value: str | Path, existing: set[str]) -> str:
         base = _sanitize_dataset_label(base_value)
@@ -1573,6 +1723,14 @@ def launch_coregistration_gui(
             "ion_layer": ion_layer,
             "roi_mask_layer": None,
             "selected_annotation_mask_layer": None,
+            "threshold_preview_layer": None,
+            "threshold_preview_img": None,
+            "threshold_preview_feature_indices": None,
+            "threshold_preview_mz": None,
+            "threshold_preview_ppm": None,
+            "threshold_preview_normalize_to_tic": None,
+            "threshold_preview_prefilter_shape_key": "(none)",
+            "threshold_preview_prefilter_region_label": "(all regions)",
             "msi_landmarks": msi_landmarks,
         }
         return state
@@ -1598,6 +1756,11 @@ def launch_coregistration_gui(
                 overlay_layer.affine = aff_yx
                 overlay_layer.scale = (1.0, 1.0)
                 overlay_layer.translate = (0.0, 0.0)
+        preview_layer = state.get("threshold_preview_layer")
+        if preview_layer is not None:
+            preview_layer.affine = aff_yx
+            preview_layer.scale = (1.0, 1.0)
+            preview_layer.translate = (0.0, 0.0)
 
     def ensure_roi_mask_layer(state: dict[str, Any]):
         if state.get("roi_mask_layer") is not None:
@@ -1634,6 +1797,38 @@ def launch_coregistration_gui(
         state["selected_annotation_mask_layer"] = selected_mask_layer
         apply_transform_to_state(state)
         return selected_mask_layer
+
+    def ensure_threshold_preview_layer(state: dict[str, Any]):
+        if state.get("threshold_preview_layer") is not None:
+            return state["threshold_preview_layer"]
+        coreg_dataset = state["dataset"]
+        preview_layer = viewer.add_image(
+            np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8),
+            name=f"{state['label']} threshold preview",
+            colormap=threshold_preview_colormap,
+            contrast_limits=(0, 2),
+            interpolation2d="nearest",
+            blending="translucent",
+            opacity=1.0,
+            visible=False,
+        )
+        state["threshold_preview_layer"] = preview_layer
+        apply_transform_to_state(state)
+        return preview_layer
+
+    def remove_threshold_preview_layers():
+        for state in datasets.values():
+            preview_layer = state.get("threshold_preview_layer")
+            if preview_layer is None:
+                continue
+            try:
+                viewer.layers.remove(preview_layer)
+            except Exception:
+                try:
+                    preview_layer.visible = False
+                except Exception:
+                    pass
+            state["threshold_preview_layer"] = None
 
     def _reference_layer_list(key: str) -> list[Any]:
         layers = reference_layers.get(key)
@@ -2165,6 +2360,10 @@ def launch_coregistration_gui(
             remove_geojson_annotations.annotation_key.choices = choices
             if remove_geojson_annotations.annotation_key.value not in choices:
                 remove_geojson_annotations.annotation_key.value = choices[0]
+        if "delete_threshold_annotation_widget" in locals():
+            delete_threshold_annotation_widget.annotation_key.choices = choices
+            if delete_threshold_annotation_widget.annotation_key.value not in choices:
+                delete_threshold_annotation_widget.annotation_key.value = choices[0]
         if "rescale_geojson_annotations_widget" in locals():
             rescale_geojson_annotations_widget.annotation_key.choices = choices
             if rescale_geojson_annotations_widget.annotation_key.value not in choices:
@@ -2174,9 +2373,18 @@ def launch_coregistration_gui(
         source_dataset = state["dataset"]
         keys = [key for key in (shape_keys or source_dataset.sdata.shapes.keys()) if "pixels" not in key.lower()]
         for key in keys:
+            if key not in source_dataset.sdata.shapes:
+                try:
+                    source_dataset.sdata = sd.read_zarr(source_dataset.zarr_path)
+                except Exception:
+                    pass
+            if key not in source_dataset.sdata.shapes:
+                continue
             try:
                 gdf = source_dataset.sdata.transform_element_to_coordinate_system(key, registered_cs)
             except Exception:
+                if key not in source_dataset.sdata.shapes:
+                    continue
                 gdf = source_dataset.sdata.shapes[key]
             shape_data = []
             shape_types = []
@@ -2485,6 +2693,231 @@ def launch_coregistration_gui(
         except Exception:
             return
         update_ion_view_for_mz(parsed_target_mz, float(ppm_tolerance))
+
+    def update_threshold_preview_from_widget():
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        try:
+            parsed_target_mz = float(str(threshold_target_mz.value).strip())
+            ppm = float(threshold_ppm_tolerance.value)
+            normalize = bool(threshold_normalize_to_tic.value)
+            percentile = float(threshold_percentile.value)
+            prefilter_shape_key = str(threshold_prefilter_annotation.value)
+            prefilter_region_label = str(threshold_prefilter_region.value)
+        except Exception as exc:
+            QMessageBox.warning(None, "MSI Threshold Preview", str(exc))
+            return
+        if prefilter_shape_key not in coreg_dataset.sdata.shapes:
+            prefilter_shape_key = "(none)"
+            prefilter_region_label = "(all regions)"
+        prefilter_region_choices = annotation_region_choices(coreg_dataset, prefilter_shape_key)
+        threshold_prefilter_region.choices = prefilter_region_choices
+        if prefilter_region_label not in prefilter_region_choices:
+            prefilter_region_label = prefilter_region_choices[0]
+            threshold_prefilter_region.value = prefilter_region_label
+        state["threshold_preview_prefilter_shape_key"] = prefilter_shape_key
+        state["threshold_preview_prefilter_region_label"] = prefilter_region_label
+        needs_recompute = (
+            state.get("threshold_preview_img") is None
+            or state.get("threshold_preview_mz") != parsed_target_mz
+            or state.get("threshold_preview_ppm") != ppm
+            or state.get("threshold_preview_normalize_to_tic") != normalize
+        )
+        if needs_recompute:
+            indices = coreg_dataset.find_feature_indices_from_mz(parsed_target_mz, ppm)
+            if indices.size == 0:
+                idx, _ = coreg_dataset.find_feature_idx_from_mz(parsed_target_mz, float("inf"))
+                if idx is None:
+                    QMessageBox.warning(None, "MSI Threshold Preview", f"No m/z feature found near {parsed_target_mz:g}.")
+                    return
+                indices = np.array([idx], dtype=int)
+            state["threshold_preview_img"] = coreg_dataset.reconstruct_ion_image(indices, normalize_to_tic=normalize)
+            state["threshold_preview_feature_indices"] = np.asarray(indices, dtype=int)
+            state["threshold_preview_mz"] = parsed_target_mz
+            state["threshold_preview_ppm"] = ppm
+            state["threshold_preview_normalize_to_tic"] = normalize
+        img = np.asarray(state["threshold_preview_img"], dtype=float)
+        values = img[coreg_dataset.y_coords, coreg_dataset.x_coords]
+        allowed = np.ones(len(values), dtype=bool)
+        if prefilter_shape_key != "(none)":
+            allowed = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            if not np.any(allowed):
+                QMessageBox.warning(None, "MSI Threshold Preview", "No MSI pixels fall inside the selected prefilter annotation.")
+                return
+        finite_values = values[np.isfinite(values) & allowed]
+        if finite_values.size == 0:
+            QMessageBox.warning(None, "MSI Threshold Preview", "No finite MSI intensities available for this m/z.")
+            return
+        threshold = float(np.percentile(finite_values, percentile))
+        threshold_value_label.setText(f"Threshold: {threshold:.6g}")
+        preview = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+        below = (values < threshold) & allowed
+        above = (values >= threshold) & allowed
+        preview[coreg_dataset.y_coords[below], coreg_dataset.x_coords[below]] = 1
+        preview[coreg_dataset.y_coords[above], coreg_dataset.x_coords[above]] = 2
+        preview_layer = ensure_threshold_preview_layer(state)
+        preview_layer.data = preview
+        preview_layer.name = f"{state['label']} threshold preview {parsed_target_mz:.4f}"
+        preview_layer.visible = True
+        threshold_selected_count_label.setText(f"Above: {int(np.count_nonzero(above))} / {int(np.count_nonzero(allowed))} pixels")
+        try:
+            threshold_absolute_value.value = threshold
+        except Exception:
+            pass
+
+    @magicgui(
+        target_mz={"widget_type": "LineEdit"},
+        ppm_tolerance={"widget_type": "FloatSpinBox", "min": 0.1, "step": 0.5},
+        normalize_to_tic={"widget_type": "CheckBox", "text": "Normalize to TIC"},
+        prefilter_annotation={"widget_type": "ComboBox", "choices": ["(none)"], "label": "Prefilter annotation"},
+        prefilter_region={"widget_type": "ComboBox", "choices": ["(all regions)"], "label": "Prefilter region"},
+        auto_call=False,
+        call_button="Update Preview",
+    )
+    def threshold_preview_controls(
+        target_mz: str = f"{float(initial_state['dataset'].mz_values[initial_state['current_feature_idx']]):.4f}",
+        ppm_tolerance: float = 5.0,
+        normalize_to_tic: bool = True,
+        prefilter_annotation: str = "(none)",
+        prefilter_region: str = "(all regions)",
+    ):
+        update_threshold_preview_from_widget()
+
+    threshold_target_mz = threshold_preview_controls.target_mz
+    threshold_ppm_tolerance = threshold_preview_controls.ppm_tolerance
+    threshold_normalize_to_tic = threshold_preview_controls.normalize_to_tic
+    threshold_prefilter_annotation = threshold_preview_controls.prefilter_annotation
+    threshold_prefilter_region = threshold_preview_controls.prefilter_region
+
+    @magicgui(
+        percentile={
+            "widget_type": "FloatSlider",
+            "min": 0.0,
+            "max": 100.0,
+            "step": 0.1,
+            "label": "Threshold percentile",
+        },
+        auto_call=True,
+    )
+    def threshold_percentile_controls(percentile: float = 90.0):
+        update_threshold_preview_from_widget()
+
+    threshold_percentile = threshold_percentile_controls.percentile
+    threshold_value_label = QLabel("Threshold: --")
+    threshold_selected_count_label = QLabel("Above: --")
+
+    @magicgui(
+        threshold={"widget_type": "FloatSpinBox", "min": -1e15, "max": 1e15, "step": 0.001},
+        annotation_name={"widget_type": "LineEdit"},
+        annotation_label={"widget_type": "LineEdit", "label": "Label prefix"},
+        call_button="Create Lower/Higher Annotation",
+    )
+    def create_msi_threshold_annotation_from_preview(
+        threshold: float = 0.0,
+        annotation_name: str = "",
+        annotation_label: str = "",
+    ):
+        state = get_active_state()
+        try:
+            parsed_target_mz = float(str(threshold_target_mz.value).strip())
+            prefilter_shape_key = str(threshold_prefilter_annotation.value)
+            prefilter_region_label = str(threshold_prefilter_region.value)
+            prefilter_mask = None
+            if prefilter_shape_key in state["dataset"].sdata.shapes:
+                prefilter_mask = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            key = create_msi_threshold_annotation(
+                state["dataset"].zarr_path,
+                table_key=state["dataset"].table_key,
+                tic_key=state["dataset"].tic_key,
+                target_mz=parsed_target_mz,
+                ppm_tolerance=float(threshold_ppm_tolerance.value),
+                threshold=float(threshold),
+                normalize_to_tic=bool(threshold_normalize_to_tic.value),
+                transform_xy=state["current_transform_xy"],
+                prefilter_mask=prefilter_mask,
+                prefilter_shape_key=prefilter_shape_key if prefilter_mask is not None else "",
+                prefilter_region_label=prefilter_region_label if prefilter_mask is not None else "",
+                annotation_name=str(annotation_name),
+                annotation_label=str(annotation_label),
+                registered_cs=registered_cs,
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "Create MSI Threshold Annotation", str(exc))
+            return
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+            add_annotation_shape_layers(dataset_state, [key])
+        sync_controls_to_active_dataset()
+        try:
+            roi_mask_controls.roi_shape_key.value = key
+        except Exception:
+            pass
+
+    threshold_absolute_value = create_msi_threshold_annotation_from_preview.threshold
+    try:
+        threshold_absolute_value.native.setDecimals(12)
+        threshold_absolute_value.native.setSingleStep(1e-6)
+    except Exception:
+        pass
+
+    def refresh_threshold_prefilter_choices(
+        state: dict[str, Any] | None = None,
+        *,
+        preferred_annotation: str | None = None,
+        preferred_region: str | None = None,
+    ):
+        state = state or get_active_state()
+        coreg_dataset = state["dataset"]
+        shape_keys = [key for key in coreg_dataset.sdata.shapes.keys() if "pixels" not in key.lower()]
+        annotation_choices = ["(none)"] + shape_keys
+        threshold_prefilter_annotation.choices = annotation_choices
+        current_annotation = str(
+            preferred_annotation
+            or state.get("threshold_preview_prefilter_shape_key")
+            or threshold_prefilter_annotation.value
+            or "(none)"
+        )
+        if current_annotation not in annotation_choices:
+            current_annotation = "(none)"
+        threshold_prefilter_annotation.value = current_annotation
+        region_choices = annotation_region_choices(coreg_dataset, current_annotation)
+        threshold_prefilter_region.choices = region_choices
+        current_region = str(
+            preferred_region
+            or state.get("threshold_preview_prefilter_region_label")
+            or threshold_prefilter_region.value
+            or "(all regions)"
+        )
+        if current_region not in region_choices:
+            current_region = region_choices[0]
+        threshold_prefilter_region.value = current_region
+
+    def update_threshold_prefilter_region_choices(*_args):
+        state = get_active_state()
+        selected_annotation = str(threshold_prefilter_annotation.value)
+        refresh_threshold_prefilter_choices(state, preferred_annotation=selected_annotation)
+
+    try:
+        threshold_prefilter_annotation.changed.connect(update_threshold_prefilter_region_choices)
+    except Exception:
+        pass
+
+    @magicgui(
+        annotation_key={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Delete Annotation",
+    )
+    def delete_threshold_annotation_widget(annotation_key: str = "(none)"):
+        if annotation_key == "(none)":
+            return
+        state = get_active_state()
+        deleted = delete_geojson_annotations(state["dataset"].zarr_path, [annotation_key])
+        if not deleted:
+            QMessageBox.warning(None, "Delete Annotation", f"Could not find annotation {annotation_key!r} in the zarr.")
+            return
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+        remove_annotation_shape_layers(deleted)
+        sync_controls_to_active_dataset()
 
     @magicgui(
         show_mask={"widget_type": "CheckBox", "text": "Show ROI selection mask"},
@@ -3119,6 +3552,7 @@ def launch_coregistration_gui(
         roi_mask_controls.region_label.choices = roi_label_choices
         if roi_mask_controls.region_label.value not in roi_label_choices:
             roi_mask_controls.region_label.value = roi_label_choices[0]
+        refresh_threshold_prefilter_choices(state)
         refresh_annotation_widget_choices()
         rebuild_msi_layer_controls()
         _refresh_if_toolbox_widgets()
@@ -3135,6 +3569,9 @@ def launch_coregistration_gui(
                 selected_annotation_mask_layer = other_state.get("selected_annotation_mask_layer")
                 if selected_annotation_mask_layer is not None:
                     selected_annotation_mask_layer.visible = False
+                threshold_preview_layer = other_state.get("threshold_preview_layer")
+                if threshold_preview_layer is not None:
+                    threshold_preview_layer.visible = False
         redraw_spectrum_for_active_dataset()
         try:
             roi_mask_controls()
@@ -3250,7 +3687,7 @@ def launch_coregistration_gui(
 
     @magicgui(
         annotation_key={"widget_type": "ComboBox", "choices": ["(none)"]},
-        call_button="Remove GeoJSON",
+        call_button="Remove Annotation",
     )
     def remove_geojson_annotations(annotation_key: str = "(none)"):
         if annotation_key == "(none)":
@@ -3406,6 +3843,42 @@ def launch_coregistration_gui(
 
     if_button.clicked.connect(open_if_dialog)
 
+    threshold_launcher = QWidget()
+    threshold_launcher_layout = QVBoxLayout(threshold_launcher)
+    threshold_launcher_layout.setContentsMargins(0, 0, 0, 0)
+    threshold_launcher_layout.setSpacing(6)
+    threshold_button = QPushButton("Open MSI Threshold Tools")
+    threshold_launcher_layout.addWidget(threshold_button)
+    threshold_launcher_layout.addWidget(QLabel("Preview MSI intensity masks and save them as annotations"))
+
+    threshold_dialog = QDialog()
+    threshold_dialog.setWindowTitle("MSI Threshold Tools")
+    threshold_dialog.setModal(False)
+    threshold_dialog.resize(430, 360)
+    threshold_dialog_layout = QVBoxLayout(threshold_dialog)
+    threshold_dialog_layout.setContentsMargins(8, 8, 8, 8)
+    threshold_dialog_layout.setSpacing(8)
+    threshold_dialog_layout.addWidget(threshold_preview_controls.native)
+    threshold_dialog_layout.addWidget(threshold_percentile_controls.native)
+    threshold_dialog_layout.addWidget(threshold_value_label)
+    threshold_dialog_layout.addWidget(threshold_selected_count_label)
+    threshold_dialog_layout.addWidget(create_msi_threshold_annotation_from_preview.native)
+    threshold_dialog_layout.addWidget(delete_threshold_annotation_widget.native)
+    threshold_dialog.finished.connect(lambda *_args: remove_threshold_preview_layers())
+
+    def open_threshold_dialog():
+        state = get_active_state()
+        refresh_threshold_prefilter_choices(state)
+        threshold_target_mz.value = f"{float(state['current_target_mz']):.4f}"
+        threshold_ppm_tolerance.value = float(state["current_ppm_tolerance"])
+        threshold_normalize_to_tic.value = bool(state["current_normalize_to_tic"])
+        threshold_dialog.show()
+        threshold_dialog.raise_()
+        threshold_dialog.activateWindow()
+        update_threshold_preview_from_widget()
+
+    threshold_button.clicked.connect(open_threshold_dialog)
+
     alignment_launcher = QWidget()
     alignment_launcher_layout = QVBoxLayout(alignment_launcher)
     alignment_launcher_layout.setContentsMargins(0, 0, 0, 0)
@@ -3490,6 +3963,7 @@ def launch_coregistration_gui(
     viewer.window.add_dock_widget(controls_scroll, area="right", name="Controls")
     viewer.window.add_dock_widget(add_data_launcher, area="left", name="Add Data")
     viewer.window.add_dock_widget(if_launcher, area="right", name="IF Display")
+    viewer.window.add_dock_widget(threshold_launcher, area="right", name="MSI Threshold")
     viewer.window.add_dock_widget(alignment_launcher, area="right", name="Alignment")
     enforce_reference_layers_at_bottom()
     add_annotation_shape_layers(initial_state)
