@@ -7,6 +7,7 @@ import viu_chem.MSI_Process as msi
 import viu_chem.chem412
 import pymzml
 import re
+from sklearn.decomposition import PCA
 
 def cv_to_csv(directory:str,mz_list:list,tolerance:float=10):
     """Converts a directory of .raw files for a FAIMS CV Scan to mzML (if needed), then outputs a dataframe with each mz intensity
@@ -42,7 +43,47 @@ def cv_to_csv(directory:str,mz_list:list,tolerance:float=10):
         df.to_csv(save_path)
 
 
+def run_pca(data:pd.DataFrame):
+    data = data.T
 
+    stds = data.std()
+    drops = stds == 0
+    if any(drops):
+        num_drops = drops.sum()
+        print(f"Dropping {num_drops} features of {data.shape[1]} overall with SD = 0")
+
+    data = data.loc[:,~drops]
+
+
+    sample_names = data.index.get_level_values(0)
+    classes = data.index.get_level_values(1)
+
+    centred = data - data.mean()
+    pareto_scaled = centred / np.sqrt(data.std())
+
+    
+
+    pca = PCA()
+    scores = pca.fit_transform(pareto_scaled)
+    scores_df = pd.DataFrame({
+    "Classes": classes,
+    "Sample": sample_names,
+    })
+
+    for x in range(scores.shape[1]):
+        scores_df[f"PC{x+1}"] = scores[:,x]
+
+    loadings_df = pd.DataFrame(
+        pca.components_.T,
+        index=data.columns
+    )
+    
+    results = {
+        "scores": scores_df,
+        "explained": pca.explained_variance_ratio_,
+        "loadings": loadings_df,
+    }
+    return results
 
 
 

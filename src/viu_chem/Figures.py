@@ -2,9 +2,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
-from scipy.stats import ttest_ind
+from scipy.stats import ttest_ind, chi2
 import matplotlib.colors as mcolors
-
+from matplotlib.patches import Ellipse
 
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
@@ -105,14 +105,14 @@ def cal_curve(x:list[float], y:list[float], ax:plt.Axes=None,xlabel:str="Your x 
     r2 = 1 - (ss_res / ss_tot)
     
     ax.plot(x_fit, y_fit, color=color,linestyle='--')
-    ax.scatter(slope_pos[0], slope_pos[1], marker='s',edgecolors='k', color=color)
+    ax.scatter(x, y, marker='s',edgecolors='k', color=color)
 
     # Prepare the equation string
     slope, intercept = coeffs
     equation = f"y = {slope:.2f}x + {intercept:.2f}\nR² = {r2:.3f}"
 
     # Add text annotation for the equation
-    ax.text(0.2, 0.95, equation, transform=plt.gca().transAxes, va='top',ha='center', color=color)
+    ax.text(slope_pos[0], slope_pos[1], equation, transform=plt.gca().transAxes, va='top',ha='center', color=color)
     
     ax.set_xlabel(xlabel,fontweight='bold')
     ax.set_ylabel(ylabel, fontweight='bold')
@@ -278,6 +278,113 @@ def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05)
         aspect="auto",
         zorder=0
     )
+
+def scores_plot(results:dict, tgt_comp:tuple=(1,2), ax:plt.Axes|None=None,colors:list[str]|None=None):
+    scores = results['scores']
+    pc_x = f"PC{tgt_comp[0]}"
+    pc_y = f"PC{tgt_comp[1]}"
+
+    if not ax:
+        fig, ax = plt.subplots()
+
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    
+    for idx, (class_type, group) in enumerate(scores.groupby("Classes")):
+        if not colors:
+            color = default_colors[idx % len(default_colors)]
+        else:
+            color = colors[idx]
+
+        ax.scatter(
+            group[pc_x],
+            group[pc_y],
+            label=class_type,
+            edgecolors='k',
+            zorder=10,
+            color=color,
+        )
+        add_confidence_ellipse(ax,group[pc_x],group[pc_y], alpha=0.5, facecolor=color,edgecolor='none',zorder=5)
+
+
+    ax.scatter(scores[pc_x],scores[pc_y])
+    ax.axhline(0,linestyle='--', color='k',zorder=1)
+    ax.axvline(0,linestyle='--', color='k',zorder=1)
+    ax.legend()
+
+    ax.set_xlabel(f"{pc_x} ({results['explained'][tgt_comp[0]-1]*100:.1f})%")
+    ax.set_ylabel(f"{pc_y} ({results['explained'][tgt_comp[1]-1]*100:.1f})%")
+
+    return ax
+
+def loadings_plot(results,tgt_comp:tuple=(1,2),ax:plt.Axes | None = None, color:str="#7789E3",top_n:int=15):
+    loadings = results['loadings']
+    loadings['loading_strength'] = np.sqrt(loadings[tgt_comp[0]-1]**2 + loadings[tgt_comp[1]-1]**2)
+    top_loadings = loadings.nlargest(top_n,'loading_strength')
+    pc_x = f"PC{tgt_comp[0]}"
+    pc_y = f"PC{tgt_comp[1]}"
+
+    if not ax:
+        fig, ax = plt.subplots()
+    
+    ax.scatter(loadings[tgt_comp[0]-1], loadings[tgt_comp[1]-1], edgecolors='k', color=color,zorder=10)
+    ax.axhline(0,linestyle='--',color='k',zorder=1)
+    ax.axvline(0,linestyle='--',color='k',zorder=1)
+
+    for feature, row in top_loadings.iterrows():
+        if isinstance(feature,float):
+            text = f"{feature:.4f}"
+        else:
+            text = str(feature)
+        ax.text(row[tgt_comp[0]-1],row[tgt_comp[1]-1],text,fontsize=8)
+
+    ax.set_xlabel(f"{pc_x} ({results['explained'][tgt_comp[0]-1]*100:.1f})%")
+    ax.set_ylabel(f"{pc_y} ({results['explained'][tgt_comp[1]-1]*100:.1f})%")
+
+    return ax
+
+
+def add_confidence_ellipse(ax, x, y, confidence=0.95, **kwargs):
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    if len(x) < 3:
+        return
+
+    cov = np.cov(x, y)
+
+    # If covariance is singular or weird, skip
+    if np.linalg.det(cov) <= 0:
+        return
+
+    mean_x = np.mean(x)
+    mean_y = np.mean(y)
+
+    eigvals, eigvecs = np.linalg.eigh(cov)
+
+    order = eigvals.argsort()[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    angle = np.degrees(np.arctan2(
+        eigvecs[1, 0],
+        eigvecs[0, 0]
+    ))
+
+    # 95% ellipse scale for 2D normal distribution
+    scale = np.sqrt(chi2.ppf(confidence, df=2))
+
+    width, height = 2 * scale * np.sqrt(eigvals)
+
+    ellipse = Ellipse(
+        xy=(mean_x, mean_y),
+        width=width,
+        height=height,
+        angle=angle,
+        linewidth=2,
+        **kwargs
+    )
+
+    ax.add_patch(ellipse)
 
     
 
