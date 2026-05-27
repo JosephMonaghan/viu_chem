@@ -158,34 +158,83 @@ def volcano(data_numerator:pd.DataFrame,
     # Generate fold change and pval data
     index = data_numerator.index
 
-    fold_changes = np.zeros_like(index)
-    pvals = np.zeros_like(index)
-    invalid = np.zeros_like(index)
+    fold_changes = np.full(len(index), np.nan, dtype=float)
+    pvals = np.full(len(index), np.nan, dtype=float)
+    invalid = np.zeros(len(index), dtype=bool)
 
     for idx, mz in enumerate(index):
         local_numer = data_numerator.loc[mz]
         local_denom = data_denom.loc[mz]
+        numer_mean = local_numer.mean()
+        denom_mean = local_denom.mean()
 
-        if (local_denom.mean() != 0) and (local_numer.mean()!= 0):
-            fold_changes[idx] = np.log2(local_numer.mean() / local_denom.mean())
+        if (denom_mean != 0) and (numer_mean != 0) and ((numer_mean / denom_mean) > 0):
+            fold_changes[idx] = np.log2(numer_mean / denom_mean)
             _, p_val = ttest_ind(local_numer, local_denom, equal_var=False)
             pvals[idx] = p_val
         else:
-            invalid[idx] = 1
+            invalid[idx] = True
 
     
 
     # Actual plotting
-    ax.semilogy(fold_changes, pvals, linestyle="none", marker="s",markeredgecolor='k',markerfacecolor=marker_color)
+    valid = (~invalid) & np.isfinite(fold_changes) & np.isfinite(pvals) & (pvals >= 0)
+    return_df = pd.DataFrame({
+        "fold_change": fold_changes,
+        "pval": pvals,
+    }, index=index)
+    return_df = return_df[valid]
+
+    if not valid.any():
+        ax.set_yscale("log")
+        ax.set_ylabel(ylabel, fontweight='bold')
+        if not xlabel:
+            xlabel = f"log2({right_label} / {left_label})"
+        ax.set_xlabel(xlabel, fontweight='bold')
+        return ax, return_df
+
+    plot_pvals = pvals.copy()
+    positive_pvals = plot_pvals[valid & (plot_pvals > 0)]
+    if len(positive_pvals):
+        pval_floor = np.min(positive_pvals) * 0.1
+    else:
+        pval_floor = max(sig_cutoff * 0.1, np.nextafter(0, 1))
+    plot_pvals[valid & (plot_pvals <= 0)] = pval_floor
+
+    sig = valid & (np.abs(fold_changes) > 1) & (pvals < sig_cutoff)
+    ax.set_yscale("log")
+    ax.scatter(
+        fold_changes[valid],
+        plot_pvals[valid],
+        marker="s",
+        edgecolors='k',
+        facecolors=marker_color,
+        zorder=10,
+    )
+    if sig.any():
+        sig_colors = _volcano_sig_colors(
+            fold_changes[sig],
+            marker_color,
+            color_denom,
+            color_numer,
+        )
+        ax.scatter(
+            fold_changes[sig],
+            plot_pvals[sig],
+            marker="s",
+            edgecolors='k',
+            facecolors=sig_colors,
+            zorder=11,
+        )
 
     occupied = []
     x_sep = 0.2
     y_sep = 0.2
 
 
-    for change, pval, mz in zip(fold_changes, pvals, index):
+    for change, pval, mz, is_sig in zip(fold_changes, plot_pvals, index, sig):
         mz = float(mz)
-        if abs(change) > 1 and pval < sig_cutoff:
+        if is_sig:
             too_close = any(
                 abs(change - ox) < x_sep and abs(pval - oy) < y_sep
                 for ox, oy in occupied
@@ -205,8 +254,18 @@ def volcano(data_numerator:pd.DataFrame,
     ax.axvline(1, color=overlay_col,linestyle="--")
 
 
-    xmin, xmax = np.min(fold_changes)*1.2, np.max(fold_changes)*1.2
-    ymin, ymax = np.min(pvals), np.max(pvals)
+    xmin, xmax = np.min(fold_changes[valid])*1.2, np.max(fold_changes[valid])*1.2
+    ymin, ymax = np.min(plot_pvals[valid]), np.max(plot_pvals[valid])
+
+    if xmin == xmax:
+        xmin, xmax = xmin - 1, xmax + 1
+    if xmin > -1:
+        xmin = -1.2
+    if xmax < 1:
+        xmax = 1.2
+    if ymin == ymax:
+        ymin = max(ymin * 0.5, np.nextafter(0, 1))
+        ymax = ymax * 2
 
     # LEFT gradient (negative fold changes)
     _add_side_gradient(ax, xmin, 0, ymin, ymax, color_denom, direction="left", fade_y=sig_cutoff)
@@ -225,14 +284,28 @@ def volcano(data_numerator:pd.DataFrame,
     ax.text(xmax*0.95,ylim[1]*1.5,right_label, ha='right',fontweight='bold')
     ax.text(xmin*0.95,ylim[1]*1.5,left_label,ha='left',fontweight='bold')
 
-    return_df = pd.DataFrame({
-        "fold_change": fold_changes,
-        "pval": pvals,
-    }, index=index)
-
-    return_df = return_df[invalid==0]
-
     return ax, return_df
+
+
+def _volcano_sig_colors(fold_changes, marker_color, color_denom, color_numer):
+    """Returns marker fill colors that deepen with significant fold-change magnitude."""
+    colors = []
+    base = np.array(mcolors.to_rgb(marker_color))
+    denom = np.array(mcolors.to_rgb(color_denom))
+    numer = np.array(mcolors.to_rgb(color_numer))
+
+    denom_max = np.max(np.abs(fold_changes[fold_changes < 0])) if np.any(fold_changes < 0) else 1
+    numer_max = np.max(fold_changes[fold_changes > 0]) if np.any(fold_changes > 0) else 1
+
+    for change in fold_changes:
+        if change < 0:
+            amount = np.clip((abs(change) - 1) / max(denom_max - 1, 1), 0, 1)
+            colors.append(base + (denom - base) * amount)
+        else:
+            amount = np.clip((change - 1) / max(numer_max - 1, 1), 0, 1)
+            colors.append(base + (numer - base) * amount)
+
+    return colors
 
 
 def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05):
@@ -247,6 +320,9 @@ def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05)
     :param direction: Horizontal fade direction
     :param fade_y: Y value where the vertical fade reaches full color"""
     N = 256
+    y0 = max(y0, np.nextafter(0, 1))
+    if y1 <= y0:
+        y1 = y0 * 10
 
     # Horizontal component
     if direction == "left":
@@ -257,7 +333,10 @@ def _add_side_gradient(ax, x0, x1, y0, y1, color, direction="left", fade_y=0.05)
     # Vertical component (white at bottom → color at top)
 
     y_vals = np.linspace(y0, y1, N)
-    vert = 1 - np.clip((y_vals - y0) / (fade_y - y0), 0, 1)
+    if fade_y <= y0:
+        vert = np.zeros(N)
+    else:
+        vert = 1 - np.clip((y_vals - y0) / (fade_y - y0), 0, 1)
 
 
 
@@ -387,4 +466,3 @@ def add_confidence_ellipse(ax, x, y, confidence=0.95, **kwargs):
     ax.add_patch(ellipse)
 
     
-
