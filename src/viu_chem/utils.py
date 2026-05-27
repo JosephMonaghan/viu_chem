@@ -42,6 +42,10 @@ def cv_to_csv(directory:str,mz_list:list,tolerance:float=10):
         save_path = os.path.join(directory,"Output CSV Files",f"{file.split(".mzML")[0]}.csv")
         df.to_csv(save_path)
 
+def calculate_tolerance_window(mz:float,tol:float=5) -> tuple[float,float]:
+    low = mz - tol*mz/1e6
+    high = mz + tol*mz/1e6
+    return (low, high)
 
 def run_pca(data:pd.DataFrame):
     data = data.T

@@ -465,4 +465,61 @@ def add_confidence_ellipse(ax, x, y, confidence=0.95, **kwargs):
 
     ax.add_patch(ellipse)
 
+def boxplot(data:dict,ax:plt.Axes | None = None, colors:str | list[str] | None = None, autonormalize:bool=False):
+    if not ax:
+        fig, ax = plt.subplots()
+    
+    top_keys = list(data.keys())
+    subkeys_present = isinstance(data[top_keys[0]],dict)
+
+    if subkeys_present:
+        subkeys = [key for key in data[top_keys[0]].keys()]
+
+        if autonormalize:
+            for key in top_keys:
+                all_data = []
+                for subkey in subkeys:
+                    all_data.append(data[key][subkey])
+                data[key]['_norm_limit'] = np.max(all_data)
+                for subkey in subkeys:
+                    data[key][subkey] = np.divide(data[key][subkey],[data[key]['_norm_limit']])
+
+        default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        num_subkeys = len(subkeys)
+        positions = np.linspace(0.8,1.2,num_subkeys)
+        width = 0.4 * 3 / num_subkeys**2
+
+            
+        for idx, (key, pos) in enumerate(zip(subkeys,positions)):
+            key_data = [data[top_key][key] for top_key in top_keys]
+            positions = [pos+x for x in range(len(top_keys))]
+            if not colors:
+                color = default_colors[idx % len(default_colors)]
+            else:
+                color = colors[idx]
+
+            ax.boxplot(key_data,
+                       positions=positions,
+                       widths=width,
+                       label=key, 
+                       patch_artist=True,
+                       boxprops={'facecolor':color, 'edgecolor':'k'},
+                       medianprops={'color':'k'})
+        
+        ax.legend()
+    
+    else:
+        if not colors:
+            color = plt.rcParams['axes.prop_cycle'].by_key()['color'][0]
+        
+        bp_data = [data[top_key] for top_key in top_keys]
+        ax.boxplot(bp_data,
+                   patch_artist=True,
+                   boxprops={'facecolor':color,'edgecolor':'k'},
+                   medianprops={'color':'k'})
+    
+    ax.set_xticks([x+1 for x in range(len(top_keys))],top_keys, rotation=45,ha='right')
+        
+
+
     
