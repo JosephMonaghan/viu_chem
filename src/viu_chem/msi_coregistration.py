@@ -25,6 +25,7 @@ from matplotlib import colormaps as mpl_colormaps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.path import Path as MplPath
 from napari.utils.colormaps import Colormap
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QAction, QIcon
@@ -1387,6 +1388,220 @@ def create_msi_threshold_annotation(
                 "threshold": float(threshold),
                 "threshold_side": threshold_side,
                 "normalize_to_tic": bool(normalize_to_tic),
+                "prefilter_shape_key": str(prefilter_shape_key),
+                "prefilter_region_label": str(prefilter_region_label),
+                "n_pixels": int(np.count_nonzero(selected)),
+            }
+        )
+        geometries.append(geometry)
+    if not rows:
+        raise ValueError("Threshold produced no annotation geometries.")
+    gdf = gpd.GeoDataFrame(rows, geometry=geometries)
+    shape_element = ShapesModel.parse(gdf)
+    set_transformation(shape_element, Identity(), to_coordinate_system=registered_cs)
+    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
+    shapes_root = root.require_group("shapes")
+    if key in shapes_root:
+        del shapes_root[key]
+    write_shapes(shape_element, shapes_root.require_group(key))
+    zarr.consolidate_metadata(str(host_zarr_path))
+    return key
+
+
+def _reference_channel_image(
+    sdata,
+    reference_key: str,
+    channel_index: int = 0,
+) -> np.ndarray:
+    if reference_key not in sdata.images:
+        raise KeyError(f"Reference image {reference_key!r} was not found.")
+    image = sdata.images[reference_key]
+    raw_arr = np.asarray(image)
+    image_attrs = getattr(image, "attrs", {})
+    image_dims = tuple(getattr(image, "dims", ()))
+    source_channels = int(image_attrs.get("source_channels", 0)) if isinstance(image_attrs, Mapping) else 0
+    channel_index = int(channel_index)
+
+    if raw_arr.ndim == 2:
+        if channel_index != 0:
+            raise ValueError(f"Reference image {reference_key!r} has only one channel.")
+        return np.asarray(raw_arr, dtype=float)
+
+    if raw_arr.ndim != 3:
+        raise ValueError(f"Reference image {reference_key!r} has unsupported shape {raw_arr.shape}.")
+
+    if source_channels > 4:
+        if image_dims == ("c", "y", "x") and raw_arr.shape[0] == source_channels:
+            if channel_index < 0 or channel_index >= raw_arr.shape[0]:
+                raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
+            return np.asarray(raw_arr[channel_index], dtype=float)
+        if image_dims == ("y", "x", "c") and raw_arr.shape[-1] == source_channels:
+            if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
+                raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
+            return np.asarray(raw_arr[..., channel_index], dtype=float)
+
+    if image_dims == ("c", "y", "x") or (raw_arr.shape[0] > 4 and raw_arr.shape[-1] <= 4):
+        if channel_index < 0 or channel_index >= raw_arr.shape[0]:
+            raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
+        return np.asarray(raw_arr[channel_index], dtype=float)
+
+    if image_dims == ("y", "x", "c") or raw_arr.shape[-1] <= 4:
+        if channel_index == 0 and raw_arr.shape[-1] in (3, 4):
+            rgb = np.asarray(raw_arr[..., :3], dtype=float)
+            return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
+        if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
+            raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
+        return np.asarray(raw_arr[..., channel_index], dtype=float)
+
+    if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
+        raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
+    return np.asarray(raw_arr[..., channel_index], dtype=float)
+
+
+def _sample_reference_values_at_msi_pixels(
+    reference_img: np.ndarray,
+    dataset: CoregistrationDataset,
+    transform_xy: np.ndarray,
+) -> np.ndarray:
+    transform = np.asarray(transform_xy, dtype=float)
+    if transform.shape != (3, 3) or not np.all(np.isfinite(transform)):
+        raise ValueError("transform_xy must be a finite 3x3 affine matrix.")
+    if reference_img.ndim != 2:
+        raise ValueError("reference_img must be a 2D intensity image.")
+
+    img = np.asarray(reference_img, dtype=float)
+    values = np.full(dataset.x_coords.shape[0], np.nan, dtype=float)
+    height, width = img.shape
+
+    centers = np.column_stack(
+        [
+            dataset.x_coords.astype(float),
+            dataset.y_coords.astype(float),
+            np.ones_like(dataset.x_coords, dtype=float),
+        ]
+    )
+    ref_centers = (transform @ centers.T).T[:, :2]
+    nearest_x = np.rint(ref_centers[:, 0]).astype(int)
+    nearest_y = np.rint(ref_centers[:, 1]).astype(int)
+
+    for idx, (x, y) in enumerate(zip(dataset.x_coords.astype(float), dataset.y_coords.astype(float))):
+        corners = np.array(
+            [
+                [x - 0.5, y - 0.5, 1.0],
+                [x + 0.5, y - 0.5, 1.0],
+                [x + 0.5, y + 0.5, 1.0],
+                [x - 0.5, y + 0.5, 1.0],
+            ],
+            dtype=float,
+        )
+        poly_xy = (transform @ corners.T).T[:, :2]
+        min_x = max(0, int(np.floor(np.min(poly_xy[:, 0]))))
+        max_x = min(width - 1, int(np.ceil(np.max(poly_xy[:, 0]))))
+        min_y = max(0, int(np.floor(np.min(poly_xy[:, 1]))))
+        max_y = min(height - 1, int(np.ceil(np.max(poly_xy[:, 1]))))
+        if min_x <= max_x and min_y <= max_y:
+            yy, xx = np.mgrid[min_y : max_y + 1, min_x : max_x + 1]
+            sample_points = np.column_stack([xx.ravel().astype(float), yy.ravel().astype(float)])
+            inside = MplPath(poly_xy).contains_points(sample_points, radius=1e-9)
+            if np.any(inside):
+                local_values = img[yy.ravel()[inside], xx.ravel()[inside]]
+                finite = local_values[np.isfinite(local_values)]
+                if finite.size:
+                    values[idx] = float(np.mean(finite))
+                    continue
+
+        ref_x = nearest_x[idx]
+        ref_y = nearest_y[idx]
+        if 0 <= ref_x < width and 0 <= ref_y < height and np.isfinite(img[ref_y, ref_x]):
+            values[idx] = float(img[ref_y, ref_x])
+
+    return values
+
+
+def create_reference_threshold_annotation(
+    zarr_path: str | Path,
+    *,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    reference_key: str,
+    channel_index: int = 0,
+    channel_name: str = "",
+    threshold: float,
+    transform_xy: np.ndarray | None = None,
+    prefilter_mask: np.ndarray | None = None,
+    prefilter_shape_key: str = "",
+    prefilter_region_label: str = "",
+    annotation_name: str = "",
+    annotation_label: str = "",
+    registered_cs: str = "registered",
+) -> str:
+    host_zarr_path = Path(zarr_path).expanduser()
+    dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    sdata = sd.read_zarr(host_zarr_path)
+    reference_img = _reference_channel_image(sdata, reference_key, int(channel_index))
+    transform = np.asarray(transform_xy if transform_xy is not None else np.eye(3, dtype=float), dtype=float)
+    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, transform)
+    allowed = np.isfinite(values)
+    if prefilter_mask is not None:
+        prefilter = np.asarray(prefilter_mask, dtype=bool)
+        if prefilter.shape[0] != values.shape[0]:
+            raise ValueError("prefilter_mask must match the number of MSI spectra.")
+        allowed &= prefilter
+    lower_selected = (values < float(threshold)) & allowed
+    higher_selected = (values >= float(threshold)) & allowed
+    if not np.any(lower_selected) and not np.any(higher_selected):
+        raise ValueError("Threshold selected no MSI pixels.")
+
+    def mask_to_geometry(selected: np.ndarray):
+        polygons = []
+        for x, y in zip(dataset.x_coords[selected].astype(float), dataset.y_coords[selected].astype(float)):
+            corners = np.array(
+                [
+                    [x - 0.5, y - 0.5, 1.0],
+                    [x + 0.5, y - 0.5, 1.0],
+                    [x + 0.5, y + 0.5, 1.0],
+                    [x - 0.5, y + 0.5, 1.0],
+                ],
+                dtype=float,
+            )
+            transformed = (transform @ corners.T).T[:, :2]
+            polygons.append(Polygon(transformed))
+        if not polygons:
+            return None
+        geometry = unary_union(polygons)
+        return None if geometry.is_empty else geometry
+
+    label_prefix = str(annotation_label).strip()
+    lower_label = f"{label_prefix} Lower".strip() if label_prefix else "Lower"
+    higher_label = f"{label_prefix} Higher".strip() if label_prefix else "Higher"
+    channel_label = str(channel_name).strip() or f"{reference_key}_ch_{int(channel_index) + 1}"
+    key_base = sanitize_name(annotation_name) or sanitize_name(f"if_threshold_{channel_label}_{float(threshold):g}")
+    key = f"anno_{key_base}"
+    if key in sdata.shapes:
+        suffix = 2
+        while f"{key}_{suffix}" in sdata.shapes:
+            suffix += 1
+        key = f"{key}_{suffix}"
+
+    rows = []
+    geometries = []
+    for label, threshold_side, selected in (
+        (lower_label, "lower", lower_selected),
+        (higher_label, "higher", higher_selected),
+    ):
+        geometry = mask_to_geometry(selected)
+        if geometry is None:
+            continue
+        rows.append(
+            {
+                "_annotation_label": label,
+                "source": "reference_threshold",
+                "reference_key": str(reference_key),
+                "channel_index": int(channel_index),
+                "channel_name": channel_label,
+                "threshold": float(threshold),
+                "threshold_side": threshold_side,
+                "reference_pooling": "mean",
                 "prefilter_shape_key": str(prefilter_shape_key),
                 "prefilter_region_label": str(prefilter_region_label),
                 "n_pixels": int(np.count_nonzero(selected)),
@@ -2860,6 +3075,311 @@ def launch_coregistration_gui(
     except Exception:
         pass
 
+    def update_threshold_preview_from_absolute_widget(*_args):
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        try:
+            parsed_target_mz = float(str(threshold_target_mz.value).strip())
+            ppm = float(threshold_ppm_tolerance.value)
+            normalize = bool(threshold_normalize_to_tic.value)
+            threshold = float(threshold_absolute_value.value)
+            prefilter_shape_key = str(threshold_prefilter_annotation.value)
+            prefilter_region_label = str(threshold_prefilter_region.value)
+        except Exception as exc:
+            QMessageBox.warning(None, "MSI Threshold Preview", str(exc))
+            return
+        if prefilter_shape_key not in coreg_dataset.sdata.shapes:
+            prefilter_shape_key = "(none)"
+            prefilter_region_label = "(all regions)"
+        prefilter_region_choices = annotation_region_choices(coreg_dataset, prefilter_shape_key)
+        threshold_prefilter_region.choices = prefilter_region_choices
+        if prefilter_region_label not in prefilter_region_choices:
+            prefilter_region_label = prefilter_region_choices[0]
+            threshold_prefilter_region.value = prefilter_region_label
+        state["threshold_preview_prefilter_shape_key"] = prefilter_shape_key
+        state["threshold_preview_prefilter_region_label"] = prefilter_region_label
+        needs_recompute = (
+            state.get("threshold_preview_img") is None
+            or state.get("threshold_preview_mz") != parsed_target_mz
+            or state.get("threshold_preview_ppm") != ppm
+            or state.get("threshold_preview_normalize_to_tic") != normalize
+        )
+        if needs_recompute:
+            indices = coreg_dataset.find_feature_indices_from_mz(parsed_target_mz, ppm)
+            if indices.size == 0:
+                idx, _ = coreg_dataset.find_feature_idx_from_mz(parsed_target_mz, float("inf"))
+                if idx is None:
+                    QMessageBox.warning(None, "MSI Threshold Preview", f"No m/z feature found near {parsed_target_mz:g}.")
+                    return
+                indices = np.array([idx], dtype=int)
+            state["threshold_preview_img"] = coreg_dataset.reconstruct_ion_image(indices, normalize_to_tic=normalize)
+            state["threshold_preview_feature_indices"] = np.asarray(indices, dtype=int)
+            state["threshold_preview_mz"] = parsed_target_mz
+            state["threshold_preview_ppm"] = ppm
+            state["threshold_preview_normalize_to_tic"] = normalize
+        img = np.asarray(state["threshold_preview_img"], dtype=float)
+        values = img[coreg_dataset.y_coords, coreg_dataset.x_coords]
+        allowed = np.ones(len(values), dtype=bool)
+        if prefilter_shape_key != "(none)":
+            allowed = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            if not np.any(allowed):
+                QMessageBox.warning(None, "MSI Threshold Preview", "No MSI pixels fall inside the selected prefilter annotation.")
+                return
+        finite_values = values[np.isfinite(values) & allowed]
+        if finite_values.size == 0:
+            QMessageBox.warning(None, "MSI Threshold Preview", "No finite MSI intensities available for this m/z.")
+            return
+        threshold_value_label.setText(f"Threshold: {threshold:.6g}")
+        preview = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+        below = (values < threshold) & allowed
+        above = (values >= threshold) & allowed
+        preview[coreg_dataset.y_coords[below], coreg_dataset.x_coords[below]] = 1
+        preview[coreg_dataset.y_coords[above], coreg_dataset.x_coords[above]] = 2
+        preview_layer = ensure_threshold_preview_layer(state)
+        preview_layer.data = preview
+        preview_layer.name = f"{state['label']} threshold preview {parsed_target_mz:.4f}"
+        preview_layer.visible = True
+        threshold_selected_count_label.setText(f"Above: {int(np.count_nonzero(above))} / {int(np.count_nonzero(allowed))} pixels")
+
+    try:
+        threshold_absolute_value.changed.connect(update_threshold_preview_from_absolute_widget)
+    except Exception:
+        pass
+
+    def _reference_intensity_from_layer(layer) -> np.ndarray:
+        arr = np.asarray(layer.data)
+        if arr.ndim == 2:
+            return np.asarray(arr, dtype=float)
+        if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+            rgb = np.asarray(arr[..., :3], dtype=float)
+            return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
+        if arr.ndim == 3 and arr.shape[0] in (3, 4):
+            rgb = np.moveaxis(np.asarray(arr[:3], dtype=float), 0, -1)
+            return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
+        raise ValueError(f"Reference layer {layer.name!r} is not a 2D fluorescence/intensity channel.")
+
+    def update_if_threshold_preview_from_widget():
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        try:
+            layer_name = str(if_threshold_reference_channel.value)
+            percentile = float(if_threshold_percentile.value)
+            prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
+            prefilter_region_label = str(if_threshold_prefilter_region.value)
+        except Exception as exc:
+            QMessageBox.warning(None, "IF Threshold Preview", str(exc))
+            return
+        layer = _get_reference_layer_by_name(layer_name)
+        if layer is None:
+            QMessageBox.warning(None, "IF Threshold Preview", "Select a fluorescence/reference channel first.")
+            return
+        if prefilter_shape_key not in coreg_dataset.sdata.shapes:
+            prefilter_shape_key = "(none)"
+            prefilter_region_label = "(all regions)"
+        prefilter_region_choices = annotation_region_choices(coreg_dataset, prefilter_shape_key)
+        if_threshold_prefilter_region.choices = prefilter_region_choices
+        if prefilter_region_label not in prefilter_region_choices:
+            prefilter_region_label = prefilter_region_choices[0]
+            if_threshold_prefilter_region.value = prefilter_region_label
+
+        try:
+            reference_img = _reference_intensity_from_layer(layer)
+            values = _sample_reference_values_at_msi_pixels(
+                reference_img,
+                coreg_dataset,
+                state["current_transform_xy"],
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "IF Threshold Preview", str(exc))
+            return
+
+        allowed = np.isfinite(values)
+        if prefilter_shape_key != "(none)":
+            allowed &= compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            if not np.any(allowed):
+                QMessageBox.warning(None, "IF Threshold Preview", "No MSI pixels fall inside the selected prefilter annotation.")
+                return
+        finite_values = values[allowed]
+        if finite_values.size == 0:
+            QMessageBox.warning(None, "IF Threshold Preview", "No finite fluorescence intensities overlap the MSI pixels.")
+            return
+        threshold = float(np.percentile(finite_values, percentile))
+        if_threshold_value_label.setText(f"Threshold: {threshold:.6g}")
+        preview = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+        below = (values < threshold) & allowed
+        above = (values >= threshold) & allowed
+        preview[coreg_dataset.y_coords[below], coreg_dataset.x_coords[below]] = 1
+        preview[coreg_dataset.y_coords[above], coreg_dataset.x_coords[above]] = 2
+        preview_layer = ensure_threshold_preview_layer(state)
+        preview_layer.data = preview
+        preview_layer.name = f"{state['label']} IF threshold preview"
+        preview_layer.visible = True
+        if_threshold_selected_count_label.setText(f"Above: {int(np.count_nonzero(above))} / {int(np.count_nonzero(allowed))} pixels")
+        try:
+            if_threshold_absolute_value.value = threshold
+        except Exception:
+            pass
+
+    @magicgui(
+        reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        prefilter_annotation={"widget_type": "ComboBox", "choices": ["(none)"], "label": "Prefilter annotation"},
+        prefilter_region={"widget_type": "ComboBox", "choices": ["(all regions)"], "label": "Prefilter region"},
+        auto_call=False,
+        call_button="Update Preview",
+    )
+    def if_threshold_preview_controls(
+        reference_channel: str = "(none)",
+        prefilter_annotation: str = "(none)",
+        prefilter_region: str = "(all regions)",
+    ):
+        update_if_threshold_preview_from_widget()
+
+    if_threshold_reference_channel = if_threshold_preview_controls.reference_channel
+    if_threshold_prefilter_annotation = if_threshold_preview_controls.prefilter_annotation
+    if_threshold_prefilter_region = if_threshold_preview_controls.prefilter_region
+
+    @magicgui(
+        percentile={
+            "widget_type": "FloatSlider",
+            "min": 0.0,
+            "max": 100.0,
+            "step": 0.1,
+            "label": "Threshold percentile",
+        },
+        auto_call=True,
+    )
+    def if_threshold_percentile_controls(percentile: float = 90.0):
+        update_if_threshold_preview_from_widget()
+
+    if_threshold_percentile = if_threshold_percentile_controls.percentile
+    if_threshold_value_label = QLabel("Threshold: --")
+    if_threshold_selected_count_label = QLabel("Above: --")
+
+    @magicgui(
+        threshold={"widget_type": "FloatSpinBox", "min": -1e15, "max": 1e15, "step": 0.001},
+        annotation_name={"widget_type": "LineEdit"},
+        annotation_label={"widget_type": "LineEdit", "label": "Label prefix"},
+        call_button="Create Lower/Higher Annotation",
+    )
+    def create_if_threshold_annotation_from_preview(
+        threshold: float = 0.0,
+        annotation_name: str = "",
+        annotation_label: str = "",
+    ):
+        state = get_active_state()
+        layer = _get_reference_layer_by_name(str(if_threshold_reference_channel.value))
+        if layer is None:
+            QMessageBox.warning(None, "Create IF Threshold Annotation", "Select a fluorescence/reference channel first.")
+            return
+        metadata = _layer_metadata(layer)
+        reference_key = str(metadata.get("reference_key", ""))
+        channel_index = int(metadata.get("reference_channel_index", 0))
+        if not reference_key:
+            QMessageBox.warning(None, "Create IF Threshold Annotation", "Selected layer is missing reference image metadata.")
+            return
+        try:
+            prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
+            prefilter_region_label = str(if_threshold_prefilter_region.value)
+            prefilter_mask = None
+            if prefilter_shape_key in state["dataset"].sdata.shapes:
+                prefilter_mask = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            key = create_reference_threshold_annotation(
+                state["dataset"].zarr_path,
+                table_key=state["dataset"].table_key,
+                tic_key=state["dataset"].tic_key,
+                reference_key=reference_key,
+                channel_index=channel_index,
+                channel_name=str(layer.name),
+                threshold=float(threshold),
+                transform_xy=state["current_transform_xy"],
+                prefilter_mask=prefilter_mask,
+                prefilter_shape_key=prefilter_shape_key if prefilter_mask is not None else "",
+                prefilter_region_label=prefilter_region_label if prefilter_mask is not None else "",
+                annotation_name=str(annotation_name),
+                annotation_label=str(annotation_label),
+                registered_cs=registered_cs,
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "Create IF Threshold Annotation", str(exc))
+            return
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+            add_annotation_shape_layers(dataset_state, [key])
+        sync_controls_to_active_dataset()
+        try:
+            roi_mask_controls.roi_shape_key.value = key
+        except Exception:
+            pass
+
+    if_threshold_absolute_value = create_if_threshold_annotation_from_preview.threshold
+    try:
+        if_threshold_absolute_value.native.setDecimals(12)
+        if_threshold_absolute_value.native.setSingleStep(1e-6)
+    except Exception:
+        pass
+
+    def update_if_threshold_preview_from_absolute_widget(*_args):
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        try:
+            layer_name = str(if_threshold_reference_channel.value)
+            threshold = float(if_threshold_absolute_value.value)
+            prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
+            prefilter_region_label = str(if_threshold_prefilter_region.value)
+        except Exception as exc:
+            QMessageBox.warning(None, "IF Threshold Preview", str(exc))
+            return
+        layer = _get_reference_layer_by_name(layer_name)
+        if layer is None:
+            QMessageBox.warning(None, "IF Threshold Preview", "Select a fluorescence/reference channel first.")
+            return
+        if prefilter_shape_key not in coreg_dataset.sdata.shapes:
+            prefilter_shape_key = "(none)"
+            prefilter_region_label = "(all regions)"
+        prefilter_region_choices = annotation_region_choices(coreg_dataset, prefilter_shape_key)
+        if_threshold_prefilter_region.choices = prefilter_region_choices
+        if prefilter_region_label not in prefilter_region_choices:
+            prefilter_region_label = prefilter_region_choices[0]
+            if_threshold_prefilter_region.value = prefilter_region_label
+
+        try:
+            reference_img = _reference_intensity_from_layer(layer)
+            values = _sample_reference_values_at_msi_pixels(
+                reference_img,
+                coreg_dataset,
+                state["current_transform_xy"],
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "IF Threshold Preview", str(exc))
+            return
+
+        allowed = np.isfinite(values)
+        if prefilter_shape_key != "(none)":
+            allowed &= compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
+            if not np.any(allowed):
+                QMessageBox.warning(None, "IF Threshold Preview", "No MSI pixels fall inside the selected prefilter annotation.")
+                return
+        finite_values = values[allowed]
+        if finite_values.size == 0:
+            QMessageBox.warning(None, "IF Threshold Preview", "No finite fluorescence intensities overlap the MSI pixels.")
+            return
+        if_threshold_value_label.setText(f"Threshold: {threshold:.6g}")
+        preview = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+        below = (values < threshold) & allowed
+        above = (values >= threshold) & allowed
+        preview[coreg_dataset.y_coords[below], coreg_dataset.x_coords[below]] = 1
+        preview[coreg_dataset.y_coords[above], coreg_dataset.x_coords[above]] = 2
+        preview_layer = ensure_threshold_preview_layer(state)
+        preview_layer.data = preview
+        preview_layer.name = f"{state['label']} IF threshold preview"
+        preview_layer.visible = True
+        if_threshold_selected_count_label.setText(f"Above: {int(np.count_nonzero(above))} / {int(np.count_nonzero(allowed))} pixels")
+
+    try:
+        if_threshold_absolute_value.changed.connect(update_if_threshold_preview_from_absolute_widget)
+    except Exception:
+        pass
+
     def refresh_threshold_prefilter_choices(
         state: dict[str, Any] | None = None,
         *,
@@ -2899,6 +3419,46 @@ def launch_coregistration_gui(
 
     try:
         threshold_prefilter_annotation.changed.connect(update_threshold_prefilter_region_choices)
+    except Exception:
+        pass
+
+    def refresh_if_threshold_choices(
+        state: dict[str, Any] | None = None,
+        *,
+        preferred_layer: str | None = None,
+        preferred_annotation: str | None = None,
+        preferred_region: str | None = None,
+    ):
+        state = state or get_active_state()
+        coreg_dataset = state["dataset"]
+        channel_choices = _reference_channel_choice_names()
+        if_threshold_reference_channel.choices = channel_choices
+        current_layer = str(preferred_layer or if_threshold_reference_channel.value or "(none)")
+        if current_layer not in channel_choices:
+            current_layer = channel_choices[0]
+        if_threshold_reference_channel.value = current_layer
+
+        shape_keys = [key for key in coreg_dataset.sdata.shapes.keys() if "pixels" not in key.lower()]
+        annotation_choices = ["(none)"] + shape_keys
+        if_threshold_prefilter_annotation.choices = annotation_choices
+        current_annotation = str(preferred_annotation or if_threshold_prefilter_annotation.value or "(none)")
+        if current_annotation not in annotation_choices:
+            current_annotation = "(none)"
+        if_threshold_prefilter_annotation.value = current_annotation
+        region_choices = annotation_region_choices(coreg_dataset, current_annotation)
+        if_threshold_prefilter_region.choices = region_choices
+        current_region = str(preferred_region or if_threshold_prefilter_region.value or "(all regions)")
+        if current_region not in region_choices:
+            current_region = region_choices[0]
+        if_threshold_prefilter_region.value = current_region
+
+    def update_if_threshold_prefilter_region_choices(*_args):
+        state = get_active_state()
+        selected_annotation = str(if_threshold_prefilter_annotation.value)
+        refresh_if_threshold_choices(state, preferred_annotation=selected_annotation)
+
+    try:
+        if_threshold_prefilter_annotation.changed.connect(update_if_threshold_prefilter_region_choices)
     except Exception:
         pass
 
@@ -3553,6 +4113,7 @@ def launch_coregistration_gui(
         if roi_mask_controls.region_label.value not in roi_label_choices:
             roi_mask_controls.region_label.value = roi_label_choices[0]
         refresh_threshold_prefilter_choices(state)
+        refresh_if_threshold_choices(state)
         refresh_annotation_widget_choices()
         rebuild_msi_layer_controls()
         _refresh_if_toolbox_widgets()
@@ -3618,6 +4179,7 @@ def launch_coregistration_gui(
         if "optical" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("optical")
         add_or_update_reference_layer(coreg_dataset, "optical")
+        refresh_if_threshold_choices(state)
 
     @magicgui(call_button="Add/Update H&E")
     def add_hne_image():
@@ -3631,6 +4193,7 @@ def launch_coregistration_gui(
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
         add_or_update_reference_layer(coreg_dataset, "hne")
+        refresh_if_threshold_choices(state)
 
     @magicgui(
         qptiff_level={"widget_type": "SpinBox", "min": 0, "max": 12, "step": 1},
@@ -3647,6 +4210,7 @@ def launch_coregistration_gui(
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
         add_or_update_reference_layer(coreg_dataset, "hne")
+        refresh_if_threshold_choices(state)
 
     @magicgui(
         target_image={"widget_type": "ComboBox", "choices": ["hne", "optical"]},
@@ -3879,6 +4443,39 @@ def launch_coregistration_gui(
 
     threshold_button.clicked.connect(open_threshold_dialog)
 
+    if_threshold_launcher = QWidget()
+    if_threshold_launcher_layout = QVBoxLayout(if_threshold_launcher)
+    if_threshold_launcher_layout.setContentsMargins(0, 0, 0, 0)
+    if_threshold_launcher_layout.setSpacing(6)
+    if_threshold_button = QPushButton("Open IF Threshold Tools")
+    if_threshold_launcher_layout.addWidget(if_threshold_button)
+    if_threshold_launcher_layout.addWidget(QLabel("Preview fluorescence intensity masks and save them as annotations"))
+
+    if_threshold_dialog = QDialog()
+    if_threshold_dialog.setWindowTitle("IF Threshold Tools")
+    if_threshold_dialog.setModal(False)
+    if_threshold_dialog.resize(430, 360)
+    if_threshold_dialog_layout = QVBoxLayout(if_threshold_dialog)
+    if_threshold_dialog_layout.setContentsMargins(8, 8, 8, 8)
+    if_threshold_dialog_layout.setSpacing(8)
+    if_threshold_dialog_layout.addWidget(if_threshold_preview_controls.native)
+    if_threshold_dialog_layout.addWidget(if_threshold_percentile_controls.native)
+    if_threshold_dialog_layout.addWidget(if_threshold_value_label)
+    if_threshold_dialog_layout.addWidget(if_threshold_selected_count_label)
+    if_threshold_dialog_layout.addWidget(create_if_threshold_annotation_from_preview.native)
+    if_threshold_dialog_layout.addWidget(delete_threshold_annotation_widget.native)
+    if_threshold_dialog.finished.connect(lambda *_args: remove_threshold_preview_layers())
+
+    def open_if_threshold_dialog():
+        state = get_active_state()
+        refresh_if_threshold_choices(state)
+        if_threshold_dialog.show()
+        if_threshold_dialog.raise_()
+        if_threshold_dialog.activateWindow()
+        update_if_threshold_preview_from_widget()
+
+    if_threshold_button.clicked.connect(open_if_threshold_dialog)
+
     alignment_launcher = QWidget()
     alignment_launcher_layout = QVBoxLayout(alignment_launcher)
     alignment_launcher_layout.setContentsMargins(0, 0, 0, 0)
@@ -3964,6 +4561,7 @@ def launch_coregistration_gui(
     viewer.window.add_dock_widget(add_data_launcher, area="left", name="Add Data")
     viewer.window.add_dock_widget(if_launcher, area="right", name="IF Display")
     viewer.window.add_dock_widget(threshold_launcher, area="right", name="MSI Threshold")
+    viewer.window.add_dock_widget(if_threshold_launcher, area="right", name="IF Threshold")
     viewer.window.add_dock_widget(alignment_launcher, area="right", name="Alignment")
     enforce_reference_layers_at_bottom()
     add_annotation_shape_layers(initial_state)

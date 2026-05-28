@@ -203,10 +203,11 @@ def _annotate_peaks(
             color=color,
         )
 
-def get_mean_spectrum(img:Path,):
+def get_mean_spectrum(img:Path,normalize:bool=False):
     """Extracts the mean spectrum from an aligned imzML file.
     
     :param img: Path to a continuous aligned imzML file
+    :param normalize: Whether or not to TIC normalize each spectrum before averaging
     :return: Tuple of m/z axis and average intensity values"""
 
     with warnings.catch_warnings(action='ignore'):
@@ -215,10 +216,15 @@ def get_mean_spectrum(img:Path,):
     _validate_file_continuous(imzml)
     
     mz, intensity = imzml.getspectrum(0)
+    if normalize:
+        intensity = intensity / intensity.sum()
     for idx, coord in enumerate(imzml.coordinates):
         if idx == 0:
             continue
         _, local_int = imzml.getspectrum(idx)
+        if normalize:
+            if local_int.sum() > 0:
+                local_int = local_int / local_int.sum()
         intensity = local_int + intensity
     
     average_int = intensity / len(imzml.coordinates)
