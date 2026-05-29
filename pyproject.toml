@@ -1,6 +1,6 @@
 [project]
 name = "viu-chem"
-version = "0.1.45"
+version = "0.1.46"
 description = "Collection of commonly used functions by VIU chemistry"
 authors = [
     {name = "Joseph Monaghan",email = "Joseph_Monaghan@outlook.com"}
@@ -22,6 +22,7 @@ dependencies = [
 coregistration = [
     "spatialdata",
     "napari",
+    "simpleitk",
     "pydantic >=2.7,<2.11",
     "npe2 == 0.8.1",
     "magicgui",

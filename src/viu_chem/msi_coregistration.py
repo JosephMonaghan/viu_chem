@@ -42,6 +42,7 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QRadioButton,
     QScrollArea,
     QTableWidget,
@@ -80,6 +81,38 @@ def _ensure_qapplication(QApplication):
         _QT_APP = QApplication(sys.argv)
         app = _QT_APP
     return app
+
+
+def _show_busy_dialog(title: str, message: str):
+    app = QApplication.instance()
+    dialog = QProgressDialog(message, "", 0, 0)
+    dialog.setWindowTitle(title)
+    dialog.setCancelButton(None)
+    dialog.setWindowModality(Qt.ApplicationModal)
+    dialog.setMinimumDuration(0)
+    dialog.setValue(0)
+    dialog.show()
+    if app is not None:
+        app.processEvents()
+    return dialog
+
+
+def _close_busy_dialog(dialog):
+    if dialog is None:
+        return
+    dialog.close()
+    dialog.deleteLater()
+    app = QApplication.instance()
+    if app is not None:
+        app.processEvents()
+
+
+def _run_with_busy_dialog(title: str, message: str, func):
+    dialog = _show_busy_dialog(title, message)
+    try:
+        return func()
+    finally:
+        _close_busy_dialog(dialog)
 
 
 def sanitize_name(name: str) -> str:
@@ -548,6 +581,63 @@ def finite_data_limits(img: np.ndarray) -> tuple[float, float]:
     if hi <= lo:
         hi = lo + 1e-9
     return (lo, hi)
+
+
+def normalize_image_for_registration(img: np.ndarray) -> np.ndarray:
+    data = np.asarray(img, dtype=float).copy()
+    finite = np.isfinite(data)
+    if not np.any(finite):
+        return np.zeros(data.shape, dtype=np.float32)
+    fill_value = float(np.nanmin(data[finite]))
+    data[~finite] = fill_value
+    finite_values = data[np.isfinite(data)]
+    lo = float(np.percentile(finite_values, 1.0))
+    hi = float(np.percentile(finite_values, 99.5))
+    if hi <= lo:
+        hi = lo + 1e-9
+    data = np.clip(data, lo, hi)
+    data = (data - lo) / (hi - lo)
+    return data.astype(np.float32, copy=False)
+
+
+def sitk_affine_from_fixed_to_moving_matrix(matrix_xy: np.ndarray):
+    import SimpleITK as sitk
+
+    matrix = np.asarray(matrix_xy, dtype=float)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("SITK initializer matrix must be a finite 3x3 affine matrix.")
+    transform = sitk.AffineTransform(2)
+    transform.SetCenter((0.0, 0.0))
+    transform.SetMatrix(tuple(matrix[:2, :2].ravel()))
+    transform.SetTranslation(tuple(matrix[:2, 2]))
+    return transform
+
+
+def sitk_transform_to_homogeneous_matrix(transform) -> np.ndarray:
+    import SimpleITK as sitk
+
+    if isinstance(transform, sitk.CompositeTransform):
+        if transform.GetNumberOfTransforms() != 1:
+            raise ValueError("Composite transform has multiple components.")
+        transform = transform.GetNthTransform(0)
+    if transform.GetDimension() != 2:
+        raise ValueError("Only 2D transforms are supported.")
+    if transform.GetName() != "AffineTransform":
+        transform = sitk.AffineTransform(transform)
+
+    params = list(transform.GetParameters())
+    fixed_params = list(transform.GetFixedParameters())
+    a00, a01, a10, a11, tx, ty = params
+    cx, cy = fixed_params
+    linear = np.array([[a00, a01], [a10, a11]], dtype=float)
+    translation = np.array([tx, ty], dtype=float)
+    center = np.array([cx, cy], dtype=float)
+    offset = center + translation - linear @ center
+
+    matrix = np.eye(3, dtype=float)
+    matrix[:2, :2] = linear
+    matrix[:2, 2] = offset
+    return matrix
 
 
 def prepare_ion_for_display(img: np.ndarray) -> np.ndarray:
@@ -1946,6 +2036,9 @@ def launch_coregistration_gui(
             "threshold_preview_normalize_to_tic": None,
             "threshold_preview_prefilter_shape_key": "(none)",
             "threshold_preview_prefilter_region_label": "(all regions)",
+            "optimization_preview_layer": None,
+            "optimization_candidate_transform_xy": None,
+            "optimization_previous_ion_visible": None,
             "msi_landmarks": msi_landmarks,
         }
         return state
@@ -2996,7 +3089,11 @@ def launch_coregistration_gui(
         prefilter_annotation: str = "(none)",
         prefilter_region: str = "(all regions)",
     ):
-        update_threshold_preview_from_widget()
+        _run_with_busy_dialog(
+            "MSI Threshold Preview",
+            "Updating MSI threshold preview...",
+            update_threshold_preview_from_widget,
+        )
 
     threshold_target_mz = threshold_preview_controls.target_mz
     threshold_ppm_tolerance = threshold_preview_controls.ppm_tolerance
@@ -3033,14 +3130,14 @@ def launch_coregistration_gui(
         annotation_label: str = "",
     ):
         state = get_active_state()
-        try:
+        def create_annotation():
             parsed_target_mz = float(str(threshold_target_mz.value).strip())
             prefilter_shape_key = str(threshold_prefilter_annotation.value)
             prefilter_region_label = str(threshold_prefilter_region.value)
             prefilter_mask = None
             if prefilter_shape_key in state["dataset"].sdata.shapes:
                 prefilter_mask = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
-            key = create_msi_threshold_annotation(
+            return create_msi_threshold_annotation(
                 state["dataset"].zarr_path,
                 table_key=state["dataset"].table_key,
                 tic_key=state["dataset"].tic_key,
@@ -3056,12 +3153,25 @@ def launch_coregistration_gui(
                 annotation_label=str(annotation_label),
                 registered_cs=registered_cs,
             )
+
+        try:
+            key = _run_with_busy_dialog(
+                "Create MSI Threshold Annotation",
+                "Creating MSI threshold annotation...\nThis can take a little while for large datasets.",
+                create_annotation,
+            )
         except Exception as exc:
             QMessageBox.warning(None, "Create MSI Threshold Annotation", str(exc))
             return
-        for dataset_state in datasets.values():
-            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
-            add_annotation_shape_layers(dataset_state, [key])
+        def refresh_annotation_layers():
+            for dataset_state in datasets.values():
+                dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+                add_annotation_shape_layers(dataset_state, [key])
+        _run_with_busy_dialog(
+            "Create MSI Threshold Annotation",
+            "Refreshing annotation layers...",
+            refresh_annotation_layers,
+        )
         sync_controls_to_active_dataset()
         try:
             roi_mask_controls.roi_shape_key.value = key
@@ -3232,7 +3342,11 @@ def launch_coregistration_gui(
         prefilter_annotation: str = "(none)",
         prefilter_region: str = "(all regions)",
     ):
-        update_if_threshold_preview_from_widget()
+        _run_with_busy_dialog(
+            "IF Threshold Preview",
+            "Updating fluorescence threshold preview...",
+            update_if_threshold_preview_from_widget,
+        )
 
     if_threshold_reference_channel = if_threshold_preview_controls.reference_channel
     if_threshold_prefilter_annotation = if_threshold_preview_controls.prefilter_annotation
@@ -3277,13 +3391,14 @@ def launch_coregistration_gui(
         if not reference_key:
             QMessageBox.warning(None, "Create IF Threshold Annotation", "Selected layer is missing reference image metadata.")
             return
-        try:
+
+        def create_annotation():
             prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
             prefilter_region_label = str(if_threshold_prefilter_region.value)
             prefilter_mask = None
             if prefilter_shape_key in state["dataset"].sdata.shapes:
                 prefilter_mask = compute_annotation_region_mask(state, prefilter_shape_key, prefilter_region_label)
-            key = create_reference_threshold_annotation(
+            return create_reference_threshold_annotation(
                 state["dataset"].zarr_path,
                 table_key=state["dataset"].table_key,
                 tic_key=state["dataset"].tic_key,
@@ -3299,12 +3414,25 @@ def launch_coregistration_gui(
                 annotation_label=str(annotation_label),
                 registered_cs=registered_cs,
             )
+
+        try:
+            key = _run_with_busy_dialog(
+                "Create IF Threshold Annotation",
+                "Creating fluorescence threshold annotation...\nSampling and writing masks can take a little while.",
+                create_annotation,
+            )
         except Exception as exc:
             QMessageBox.warning(None, "Create IF Threshold Annotation", str(exc))
             return
-        for dataset_state in datasets.values():
-            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
-            add_annotation_shape_layers(dataset_state, [key])
+        def refresh_annotation_layers():
+            for dataset_state in datasets.values():
+                dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+                add_annotation_shape_layers(dataset_state, [key])
+        _run_with_busy_dialog(
+            "Create IF Threshold Annotation",
+            "Refreshing annotation layers...",
+            refresh_annotation_layers,
+        )
         sync_controls_to_active_dataset()
         try:
             roi_mask_controls.roi_shape_key.value = key
@@ -3738,6 +3866,575 @@ def launch_coregistration_gui(
         apply_transform_to_state(state)
         sync_controls_to_active_dataset()
 
+    def remove_optimization_preview(state: dict[str, Any], *, restore_visibility: bool = True):
+        preview_layer = state.get("optimization_preview_layer")
+        if preview_layer is not None:
+            try:
+                viewer.layers.remove(preview_layer)
+            except Exception:
+                pass
+        if restore_visibility and state.get("optimization_previous_ion_visible") is not None:
+            try:
+                state["ion_layer"].visible = bool(state["optimization_previous_ion_visible"])
+            except Exception:
+                pass
+        state["optimization_preview_layer"] = None
+        state["optimization_candidate_transform_xy"] = None
+        state["optimization_previous_ion_visible"] = None
+
+    def resample_moving_on_fixed_crop(
+        moving_img: np.ndarray,
+        fixed_crop_sitk,
+        crop_to_full_xy: np.ndarray,
+        moving_to_fixed_xy: np.ndarray,
+    ) -> np.ndarray:
+        import SimpleITK as sitk
+
+        moving_sitk = sitk.GetImageFromArray(normalize_image_for_registration(moving_img))
+        fixed_to_moving_xy = np.linalg.inv(np.asarray(moving_to_fixed_xy, dtype=float))
+        crop_fixed_to_moving_xy = fixed_to_moving_xy @ np.asarray(crop_to_full_xy, dtype=float)
+        transform = sitk_affine_from_fixed_to_moving_matrix(crop_fixed_to_moving_xy)
+        resampled = sitk.Resample(
+            moving_sitk,
+            fixed_crop_sitk,
+            transform,
+            sitk.sitkLinear,
+            0.0,
+            moving_sitk.GetPixelID(),
+        )
+        return sitk.GetArrayFromImage(resampled)
+
+    def active_msi_registration_image(state: dict[str, Any]) -> np.ndarray:
+        coreg_dataset = state["dataset"]
+        return coreg_dataset.reconstruct_ion_image(
+            state["current_feature_indices"],
+            normalize_to_tic=bool(state["current_normalize_to_tic"]),
+        )
+
+    def fixed_mask_from_moving_footprint(
+        fixed_shape: tuple[int, int],
+        moving_shape: tuple[int, int],
+        moving_to_fixed_xy: np.ndarray,
+    ) -> np.ndarray:
+        fixed_h, fixed_w = int(fixed_shape[0]), int(fixed_shape[1])
+        moving_h, moving_w = int(moving_shape[0]), int(moving_shape[1])
+        transform = np.asarray(moving_to_fixed_xy, dtype=float)
+        corners = np.array(
+            [
+                [-0.5, -0.5, 1.0],
+                [moving_w - 0.5, -0.5, 1.0],
+                [moving_w - 0.5, moving_h - 0.5, 1.0],
+                [-0.5, moving_h - 0.5, 1.0],
+            ],
+            dtype=float,
+        )
+        poly_xy = (transform @ corners.T).T[:, :2]
+        min_x = max(0, int(np.floor(np.min(poly_xy[:, 0]))))
+        max_x = min(fixed_w - 1, int(np.ceil(np.max(poly_xy[:, 0]))))
+        min_y = max(0, int(np.floor(np.min(poly_xy[:, 1]))))
+        max_y = min(fixed_h - 1, int(np.ceil(np.max(poly_xy[:, 1]))))
+        mask = np.zeros((fixed_h, fixed_w), dtype=np.uint8)
+        if min_x > max_x or min_y > max_y:
+            return mask
+        yy, xx = np.mgrid[min_y : max_y + 1, min_x : max_x + 1]
+        sample_points = np.column_stack([xx.ravel().astype(float), yy.ravel().astype(float)])
+        inside = MplPath(poly_xy).contains_points(sample_points, radius=1e-9)
+        if np.any(inside):
+            mask[yy.ravel()[inside], xx.ravel()[inside]] = 1
+        return mask
+
+    def fixed_mask_valid_for_transform(
+        fixed_shape: tuple[int, int],
+        moving_shape: tuple[int, int],
+        fixed_to_moving_xy: np.ndarray,
+    ) -> np.ndarray:
+        fixed_h, fixed_w = int(fixed_shape[0]), int(fixed_shape[1])
+        moving_h, moving_w = int(moving_shape[0]), int(moving_shape[1])
+        try:
+            moving_to_fixed_xy = np.linalg.inv(np.asarray(fixed_to_moving_xy, dtype=float))
+        except Exception:
+            return np.zeros((fixed_h, fixed_w), dtype=np.uint8)
+        footprint = fixed_mask_from_moving_footprint(fixed_shape, moving_shape, moving_to_fixed_xy)
+        yy, xx = np.nonzero(footprint)
+        if yy.size == 0:
+            return footprint
+        fixed_points = np.column_stack([xx.astype(float), yy.astype(float), np.ones_like(xx, dtype=float)])
+        moving_xy = (np.asarray(fixed_to_moving_xy, dtype=float) @ fixed_points.T).T[:, :2]
+        inside = (
+            (moving_xy[:, 0] >= -0.5)
+            & (moving_xy[:, 1] >= -0.5)
+            & (moving_xy[:, 0] <= moving_w - 0.5)
+            & (moving_xy[:, 1] <= moving_h - 0.5)
+        )
+        mask = np.zeros((fixed_h, fixed_w), dtype=np.uint8)
+        if np.any(inside):
+            mask[yy[inside], xx[inside]] = 1
+        return mask
+
+    def sitk_overlap_count_for_transform(transform, fixed_mask_arr: np.ndarray, moving_shape: tuple[int, int], *, max_points: int = 20000) -> int:
+        yy, xx = np.nonzero(fixed_mask_arr)
+        if yy.size == 0:
+            return 0
+        if yy.size > max_points:
+            pick = np.linspace(0, yy.size - 1, max_points).astype(int)
+            yy = yy[pick]
+            xx = xx[pick]
+        moving_h, moving_w = int(moving_shape[0]), int(moving_shape[1])
+        count = 0
+        for x, y in zip(xx.astype(float), yy.astype(float)):
+            mx, my = transform.TransformPoint((float(x), float(y)))
+            if -0.5 <= mx <= moving_w - 0.5 and -0.5 <= my <= moving_h - 0.5:
+                count += 1
+        return count
+
+    def prepare_affine_mi_inputs(
+        fixed_img: np.ndarray,
+        moving_img: np.ndarray,
+        initial_moving_to_fixed_xy: np.ndarray,
+    ) -> dict[str, Any]:
+        import SimpleITK as sitk
+
+        initial_xy = np.asarray(initial_moving_to_fixed_xy, dtype=float)
+        fixed_to_moving_candidates = [
+            ("stored affine inverse", np.linalg.inv(initial_xy)),
+            ("stored affine direct", initial_xy),
+        ]
+        candidate_masks = []
+        for label, fixed_to_moving_xy in fixed_to_moving_candidates:
+            for candidate_label, candidate_fixed_to_moving_xy in (
+                (f"{label} as fixed-to-moving", fixed_to_moving_xy),
+                (f"{label} as moving-to-fixed", np.linalg.inv(fixed_to_moving_xy)),
+            ):
+                mask_arr = fixed_mask_valid_for_transform(
+                    np.asarray(fixed_img).shape,
+                    np.asarray(moving_img).shape,
+                    candidate_fixed_to_moving_xy,
+                )
+                candidate_transform = sitk_affine_from_fixed_to_moving_matrix(candidate_fixed_to_moving_xy)
+                candidate_masks.append(
+                    (
+                        candidate_label,
+                        candidate_fixed_to_moving_xy,
+                        candidate_transform,
+                        mask_arr,
+                        sitk_overlap_count_for_transform(candidate_transform, mask_arr, np.asarray(moving_img).shape),
+                    )
+                )
+        transform_label, initial_fixed_to_moving_xy, _initial_transform, fixed_mask_arr, sitk_overlap_pixels = max(
+            candidate_masks,
+            key=lambda item: int(item[4]),
+        )
+        overlap_pixels = int(np.count_nonzero(fixed_mask_arr))
+        if sitk_overlap_pixels < 8:
+            raise ValueError(
+                "The current MSI/reference affine does not produce enough SimpleITK fixed-to-moving overlap for optimization. "
+                f"Overlap candidates: {', '.join(f'{label}={int(sitk_count)} SITK samples/{int(np.count_nonzero(mask))} mask pixels' for label, _matrix, _transform, mask, sitk_count in candidate_masks)}."
+            )
+
+        yy, xx = np.nonzero(fixed_mask_arr)
+        fixed_h, fixed_w = np.asarray(fixed_img).shape
+        pad = 16
+        min_x = max(0, int(np.min(xx)) - pad)
+        max_x = min(int(fixed_w) - 1, int(np.max(xx)) + pad)
+        min_y = max(0, int(np.min(yy)) - pad)
+        max_y = min(int(fixed_h) - 1, int(np.max(yy)) + pad)
+        fixed_crop_arr = np.asarray(fixed_img)[min_y : max_y + 1, min_x : max_x + 1]
+        fixed_crop_mask_arr = fixed_mask_arr[min_y : max_y + 1, min_x : max_x + 1]
+        crop_to_full_xy = np.array(
+            [[1.0, 0.0, float(min_x)], [0.0, 1.0, float(min_y)], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
+        initial_crop_fixed_to_moving_xy = np.asarray(initial_fixed_to_moving_xy, dtype=float) @ crop_to_full_xy
+        initial_transform = sitk_affine_from_fixed_to_moving_matrix(initial_crop_fixed_to_moving_xy)
+        fixed_crop_sitk = sitk.GetImageFromArray(normalize_image_for_registration(fixed_crop_arr))
+        fixed_crop_mask_sitk = sitk.GetImageFromArray(fixed_crop_mask_arr.astype(np.uint8, copy=False))
+        fixed_crop_mask_sitk.CopyInformation(fixed_crop_sitk)
+        moving_sitk = sitk.GetImageFromArray(normalize_image_for_registration(moving_img))
+        moving_on_fixed_crop = sitk.Resample(
+            moving_sitk,
+            fixed_crop_sitk,
+            initial_transform,
+            sitk.sitkLinear,
+            0.0,
+            moving_sitk.GetPixelID(),
+        )
+
+        return {
+            "fixed_crop_arr": fixed_crop_arr,
+            "fixed_crop_mask_arr": fixed_crop_mask_arr,
+            "fixed_crop_sitk": fixed_crop_sitk,
+            "fixed_crop_mask_sitk": fixed_crop_mask_sitk,
+            "moving_sitk": moving_sitk,
+            "moving_on_fixed_crop_arr": sitk.GetArrayFromImage(moving_on_fixed_crop),
+            "initial_transform": initial_transform,
+            "crop_to_full_xy": crop_to_full_xy,
+            "crop_bounds": (min_x, max_x, min_y, max_y),
+            "transform_label": transform_label,
+            "overlap_pixels": overlap_pixels,
+            "sitk_overlap_pixels": int(sitk_overlap_pixels),
+            "candidate_masks": candidate_masks,
+        }
+
+    def optimize_affine_with_mutual_information(
+        fixed_img: np.ndarray,
+        moving_img: np.ndarray,
+        initial_moving_to_fixed_xy: np.ndarray,
+        *,
+        histogram_bins: int,
+        learning_rate: float,
+        min_step: float,
+        iterations: int,
+        sampling_percentage: float,
+        seed: int,
+        max_translation: float,
+        max_linear_delta: float,
+        max_passes: int,
+        min_mi_improvement: float,
+    ) -> tuple[np.ndarray, float, float, str, int, int, int]:
+        import SimpleITK as sitk
+
+        sitk.ProcessObject_SetGlobalWarningDisplay(False)
+        current_transform_xy = np.asarray(initial_moving_to_fixed_xy, dtype=float).copy()
+        first_before_mi = None
+        last_after_mi = None
+        last_transform_label = ""
+        last_overlap_pixels = 0
+        accepted_passes = 0
+        evaluated_passes = 0
+
+        for pass_idx in range(max(1, int(max_passes))):
+            evaluated_passes = pass_idx + 1
+            mi_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, current_transform_xy)
+            candidate_transform_xy, before_mi, after_mi, transform_label, overlap_pixels = optimize_affine_mi_single_pass(
+                fixed_img,
+                moving_img,
+                mi_inputs=mi_inputs,
+                histogram_bins=histogram_bins,
+                learning_rate=learning_rate,
+                min_step=min_step,
+                iterations=iterations,
+                max_translation=max_translation,
+                max_linear_delta=max_linear_delta,
+            )
+            if first_before_mi is None:
+                first_before_mi = before_mi
+            improvement = float(after_mi - before_mi)
+            if improvement < float(min_mi_improvement):
+                last_after_mi = before_mi if last_after_mi is None else last_after_mi
+                last_transform_label = f"{transform_label}; stopped at pass {pass_idx + 1}"
+                last_overlap_pixels = overlap_pixels
+                break
+            current_transform_xy = np.asarray(candidate_transform_xy, dtype=float)
+            last_after_mi = after_mi
+            accepted_passes += 1
+            last_transform_label = f"{transform_label}; {accepted_passes} accepted pass(es)"
+            last_overlap_pixels = overlap_pixels
+
+        return (
+            current_transform_xy,
+            float(first_before_mi),
+            float(last_after_mi),
+            last_transform_label,
+            int(last_overlap_pixels),
+            int(accepted_passes),
+            int(evaluated_passes),
+        )
+
+    def optimize_affine_mi_single_pass(
+        fixed_img: np.ndarray,
+        moving_img: np.ndarray,
+        *,
+        mi_inputs: dict[str, Any],
+        histogram_bins: int,
+        learning_rate: float,
+        min_step: float,
+        iterations: int,
+        max_translation: float,
+        max_linear_delta: float,
+    ) -> tuple[np.ndarray, float, float, str, int]:
+        import SimpleITK as sitk
+
+        fixed = mi_inputs["fixed_crop_sitk"]
+        moving = sitk.GetImageFromArray(normalize_image_for_registration(mi_inputs["moving_on_fixed_crop_arr"]))
+        moving.CopyInformation(fixed)
+        initial_transform = sitk.AffineTransform(2)
+
+        registration = sitk.ImageRegistrationMethod()
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=int(histogram_bins))
+        registration.SetMetricFixedMask(mi_inputs["fixed_crop_mask_sitk"])
+        registration.SetMetricSamplingStrategy(registration.NONE)
+        registration.SetOptimizerAsRegularStepGradientDescent(
+            float(learning_rate),
+            float(min_step),
+            int(iterations),
+            0.5,
+        )
+        registration.SetOptimizerScales([1000.0, 1000.0, 1000.0, 1000.0, 1.0, 1.0])
+        registration.SetInterpolator(sitk.sitkLinear)
+        registration.SetShrinkFactorsPerLevel([2, 1])
+        registration.SetSmoothingSigmasPerLevel([1, 0])
+        registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        registration.SetInitialTransform(initial_transform, inPlace=False)
+        before_mi = -float(registration.MetricEvaluate(fixed, moving))
+
+        try:
+            final_transform = registration.Execute(fixed, moving)
+        except Exception as exc:
+            raise RuntimeError(
+                "SimpleITK mutual-information optimization failed after initialization. "
+                f"Chosen initializer: {mi_inputs['transform_label']}; fixed-mask overlap: {mi_inputs['overlap_pixels']} pixels; SITK overlap sample count: {mi_inputs['sitk_overlap_pixels']}. "
+                f"Candidate overlaps: {', '.join(f'{label}={int(sitk_count)} SITK samples/{int(np.count_nonzero(mask))} mask pixels' for label, _matrix, _transform, mask, sitk_count in mi_inputs['candidate_masks'])}. "
+                f"Fixed shape: {np.asarray(fixed_img).shape}; fixed crop: {mi_inputs['fixed_crop_arr'].shape} at x={mi_inputs['crop_bounds'][0]}:{mi_inputs['crop_bounds'][1]}, y={mi_inputs['crop_bounds'][2]}:{mi_inputs['crop_bounds'][3]}; moving shape: {np.asarray(moving_img).shape}. "
+                f"Original error: {exc}"
+            ) from exc
+        delta_crop_fixed_to_prewarped_xy = sitk_transform_to_homogeneous_matrix(final_transform)
+        linear_delta = float(np.linalg.norm(delta_crop_fixed_to_prewarped_xy[:2, :2] - np.eye(2), ord="fro"))
+        translation_delta = float(np.linalg.norm(delta_crop_fixed_to_prewarped_xy[:2, 2]))
+        if translation_delta > float(max_translation) or linear_delta > float(max_linear_delta):
+            raise RuntimeError(
+                "Optimization produced a larger-than-allowed affine delta and was rejected. "
+                f"Translation delta: {translation_delta:.3g} px (limit {float(max_translation):.3g}); "
+                f"linear/shear delta: {linear_delta:.3g} (limit {float(max_linear_delta):.3g}). "
+                "Try a lower learning rate, fewer iterations, or a looser cap if the preview still looks reasonable."
+            )
+        initial_crop_fixed_to_moving_xy = sitk_transform_to_homogeneous_matrix(mi_inputs["initial_transform"])
+        crop_fixed_to_moving_xy = initial_crop_fixed_to_moving_xy @ delta_crop_fixed_to_prewarped_xy
+        fixed_to_moving_xy = crop_fixed_to_moving_xy @ np.linalg.inv(mi_inputs["crop_to_full_xy"])
+        moving_to_fixed_xy = np.linalg.inv(fixed_to_moving_xy)
+        after_mi = -float(registration.GetMetricValue())
+        return moving_to_fixed_xy, before_mi, after_mi, mi_inputs["transform_label"], mi_inputs["overlap_pixels"]
+
+    def show_affine_optimization_result_dialog(
+        state: dict[str, Any],
+        fixed_img: np.ndarray,
+        moving_img: np.ndarray,
+        candidate_transform_xy: np.ndarray,
+        before_mi: float,
+        after_mi: float,
+        transform_label: str,
+        overlap_pixels: int,
+        accepted_passes: int,
+        evaluated_passes: int,
+    ):
+        try:
+            before_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, state["current_transform_xy"])
+            fixed_crop = normalize_image_for_registration(before_inputs["fixed_crop_arr"])
+            before_overlay = normalize_image_for_registration(before_inputs["moving_on_fixed_crop_arr"])
+            after_overlay = normalize_image_for_registration(
+                resample_moving_on_fixed_crop(
+                    moving_img,
+                    before_inputs["fixed_crop_sitk"],
+                    before_inputs["crop_to_full_xy"],
+                    candidate_transform_xy,
+                )
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "Affine Optimization Preview", str(exc))
+            return
+
+        dialog = QDialog()
+        dialog.setWindowTitle("Review Optimized Affine")
+        dialog.setModal(False)
+        dialog.resize(980, 560)
+        layout = QVBoxLayout(dialog)
+        fig = Figure(figsize=(9.8, 4.8), constrained_layout=True)
+        canvas = FigureCanvas(fig)
+        axes = fig.subplots(1, 2)
+        for ax in np.ravel(axes):
+            ax.set_axis_off()
+            ax.imshow(fixed_crop, cmap="gray")
+        before_masked = np.ma.masked_where(before_overlay <= 0, before_overlay)
+        after_masked = np.ma.masked_where(after_overlay <= 0, after_overlay)
+        axes[0].imshow(before_masked, cmap="magma", alpha=0.55)
+        axes[0].set_title("Before optimization", loc="left")
+        axes[1].imshow(after_masked, cmap="magma", alpha=0.55)
+        axes[1].set_title("After optimization", loc="left")
+        min_x, max_x, min_y, max_y = before_inputs["crop_bounds"]
+        fig.suptitle(
+            f"Mutual information: before {before_mi:.6g}, after {after_mi:.6g}; "
+            f"passes accepted {accepted_passes}/{evaluated_passes}; crop x={min_x}:{max_x}, y={min_y}:{max_y}"
+        )
+        layout.addWidget(canvas)
+
+        button_row = QWidget()
+        button_layout = QGridLayout(button_row)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        reject_button = QPushButton("Reject")
+        accept_button = QPushButton("Accept")
+        button_layout.addWidget(reject_button, 0, 0)
+        button_layout.addWidget(accept_button, 0, 1)
+        layout.addWidget(button_row)
+
+        def accept_candidate():
+            state["current_transform_xy"][:] = np.asarray(candidate_transform_xy, dtype=float)
+            remove_optimization_preview(state, restore_visibility=False)
+            state["ion_layer"].visible = True
+            apply_transform_to_state(state)
+            sync_controls_to_active_dataset()
+            dialog.accept()
+
+        def reject_candidate():
+            remove_optimization_preview(state, restore_visibility=True)
+            apply_transform_to_state(state)
+            sync_controls_to_active_dataset()
+            dialog.reject()
+
+        accept_button.clicked.connect(accept_candidate)
+        reject_button.clicked.connect(reject_candidate)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if not hasattr(viewer, "_viu_chem_debug_dialogs"):
+            viewer._viu_chem_debug_dialogs = []
+        viewer._viu_chem_debug_dialogs.append(dialog)
+
+    @magicgui(
+        reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Preview MI Inputs",
+    )
+    def preview_affine_mi_inputs_widget(reference_channel: str = "(none)"):
+        state = get_active_state()
+        layer = _get_reference_layer_by_name(reference_channel)
+        if layer is None:
+            QMessageBox.warning(None, "Preview MI Inputs", "Select a fluorescence/reference channel first.")
+            return
+        def prepare_preview():
+            fixed_img = _reference_intensity_from_layer(layer)
+            moving_img = active_msi_registration_image(state)
+            mi_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, state["current_transform_xy"])
+            return fixed_img, moving_img, mi_inputs
+
+        try:
+            fixed_img, moving_img, mi_inputs = _run_with_busy_dialog(
+                "Preview MI Inputs",
+                "Preparing mutual-information input preview...",
+                prepare_preview,
+            )
+        except ModuleNotFoundError:
+            QMessageBox.warning(None, "Preview MI Inputs", "SimpleITK is not installed. Install the coregistration extra again to enable this tool.")
+            return
+        except Exception as exc:
+            QMessageBox.warning(None, "Preview MI Inputs", str(exc))
+            return
+
+        fixed_crop = normalize_image_for_registration(mi_inputs["fixed_crop_arr"])
+        moving_overlay = normalize_image_for_registration(mi_inputs["moving_on_fixed_crop_arr"])
+        dialog = QDialog()
+        dialog.setWindowTitle("MI Input Preview")
+        dialog.setModal(False)
+        dialog.resize(920, 460)
+        layout = QVBoxLayout(dialog)
+        fig = Figure(figsize=(9.2, 4.6), constrained_layout=True)
+        canvas = FigureCanvas(fig)
+        axes = fig.subplots(1, 2)
+        for ax in np.ravel(axes):
+            ax.set_axis_off()
+        axes[0].imshow(fixed_crop, cmap="gray")
+        axes[0].set_title("Fixed reference crop", loc="left")
+        axes[1].imshow(fixed_crop, cmap="gray")
+        overlay = np.ma.masked_where(moving_overlay <= 0, moving_overlay)
+        axes[1].imshow(overlay, cmap="magma", alpha=0.55)
+        min_x, max_x, min_y, max_y = mi_inputs["crop_bounds"]
+        axes[1].set_title(
+            f"MSI after current affine\n{mi_inputs['transform_label']}; overlap {mi_inputs['sitk_overlap_pixels']} samples",
+            loc="left",
+        )
+        fig.suptitle(f"Crop x={min_x}:{max_x}, y={min_y}:{max_y}; moving shape {np.asarray(moving_img).shape}")
+        layout.addWidget(canvas)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if not hasattr(viewer, "_viu_chem_debug_dialogs"):
+            viewer._viu_chem_debug_dialogs = []
+        viewer._viu_chem_debug_dialogs.append(dialog)
+
+    @magicgui(
+        reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        histogram_bins={"widget_type": "SpinBox", "min": 8, "max": 256, "step": 1},
+        learning_rate={"widget_type": "FloatSpinBox", "min": 0.0001, "max": 100.0, "step": 0.1},
+        min_step={"widget_type": "FloatSpinBox", "min": 1e-8, "max": 1.0, "step": 1e-4},
+        iterations={"widget_type": "SpinBox", "min": 1, "max": 5000, "step": 25},
+        sampling_percentage={"widget_type": "FloatSpinBox", "min": 0.001, "max": 1.0, "step": 0.05},
+        seed={"widget_type": "SpinBox", "min": 0, "max": 1000000, "step": 1},
+        max_translation={"widget_type": "FloatSpinBox", "min": 0.0, "max": 1000.0, "step": 1.0},
+        max_linear_delta={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.01},
+        max_passes={"widget_type": "SpinBox", "min": 1, "max": 100, "step": 1},
+        min_mi_improvement={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.0001},
+        call_button="Optimize Affine With MI",
+    )
+    def optimize_affine_registration_widget(
+        reference_channel: str = "(none)",
+        histogram_bins: int = 50,
+        learning_rate: float = 0.05,
+        min_step: float = 1e-4,
+        iterations: int = 150,
+        sampling_percentage: float = 0.2,
+        seed: int = 42,
+        max_translation: float = 25.0,
+        max_linear_delta: float = 0.15,
+        max_passes: int = 25,
+        min_mi_improvement: float = 0.001,
+    ):
+        state = get_active_state()
+        layer = _get_reference_layer_by_name(reference_channel)
+        if layer is None:
+            QMessageBox.warning(None, "Affine Optimization", "Select a fluorescence/reference channel first.")
+            return
+        def run_optimization():
+            fixed_img = _reference_intensity_from_layer(layer)
+            moving_img = active_msi_registration_image(state)
+            result = optimize_affine_with_mutual_information(
+                fixed_img,
+                moving_img,
+                state["current_transform_xy"],
+                histogram_bins=int(histogram_bins),
+                learning_rate=float(learning_rate),
+                min_step=float(min_step),
+                iterations=int(iterations),
+                sampling_percentage=float(sampling_percentage),
+                seed=int(seed),
+                max_translation=float(max_translation),
+                max_linear_delta=float(max_linear_delta),
+                max_passes=int(max_passes),
+                min_mi_improvement=float(min_mi_improvement),
+            )
+            return fixed_img, moving_img, result
+
+        try:
+            fixed_img, moving_img, optimization_result = _run_with_busy_dialog(
+                "Affine Optimization",
+                "Optimizing affine registration with mutual information...\nThis can take a minute.",
+                run_optimization,
+            )
+            (
+                candidate_transform_xy,
+                before_mi,
+                after_mi,
+                transform_label,
+                overlap_pixels,
+                accepted_passes,
+                evaluated_passes,
+            ) = optimization_result
+        except ModuleNotFoundError:
+            QMessageBox.warning(None, "Affine Optimization", "SimpleITK is not installed. Install the coregistration extra again to enable this tool.")
+            return
+        except Exception as exc:
+            QMessageBox.warning(None, "Affine Optimization", str(exc))
+            return
+
+        show_affine_optimization_result_dialog(
+            state,
+            fixed_img,
+            moving_img,
+            candidate_transform_xy,
+            before_mi,
+            after_mi,
+            transform_label,
+            overlap_pixels,
+            accepted_passes,
+            evaluated_passes,
+        )
+
     @magicgui(call_button="Rotate MSI 180°")
     def rotate_180():
         apply_linear_about_current_center(np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], dtype=float))
@@ -4117,6 +4814,12 @@ def launch_coregistration_gui(
         refresh_annotation_widget_choices()
         rebuild_msi_layer_controls()
         _refresh_if_toolbox_widgets()
+        preview_affine_mi_inputs_widget.reference_channel.choices = _reference_channel_choice_names()
+        if preview_affine_mi_inputs_widget.reference_channel.value not in preview_affine_mi_inputs_widget.reference_channel.choices:
+            preview_affine_mi_inputs_widget.reference_channel.value = preview_affine_mi_inputs_widget.reference_channel.choices[0]
+        optimize_affine_registration_widget.reference_channel.choices = _reference_channel_choice_names()
+        if optimize_affine_registration_widget.reference_channel.value not in optimize_affine_registration_widget.reference_channel.choices:
+            optimize_affine_registration_widget.reference_channel.value = optimize_affine_registration_widget.reference_channel.choices[0]
         try:
             alignment_active_dataset_label.setText(f"Active dataset: {state['label']}")
         except Exception:
@@ -4133,6 +4836,9 @@ def launch_coregistration_gui(
                 threshold_preview_layer = other_state.get("threshold_preview_layer")
                 if threshold_preview_layer is not None:
                     threshold_preview_layer.visible = False
+                optimization_preview_layer = other_state.get("optimization_preview_layer")
+                if optimization_preview_layer is not None:
+                    optimization_preview_layer.visible = False
         redraw_spectrum_for_active_dataset()
         try:
             roi_mask_controls()
@@ -4149,13 +4855,12 @@ def launch_coregistration_gui(
     @magicgui(call_button="Add MSI Dataset")
     def add_msi_dataset():
         picked_path = _pick_input_or_convert()
-        embedded = embed_msi_dataset(host_zarr_path, picked_path, registered_cs=registered_cs)
-        new_dataset = CoregistrationDataset(
-            host_zarr_path,
-            registered_cs=registered_cs,
-            table_key=embedded["table_key"],
-            tic_key=embedded["tic_key"],
+        embedded = _run_with_busy_dialog(
+            "Add MSI Dataset",
+            "Importing MSI dataset...\nThis can take a little while.",
+            lambda: embed_msi_dataset(host_zarr_path, picked_path, registered_cs=registered_cs),
         )
+        new_dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs, table_key=embedded["table_key"], tic_key=embedded["tic_key"])
         state = add_dataset_to_view(new_dataset, str(new_dataset.display_name))
         enforce_reference_layers_at_bottom()
         add_annotation_shape_layers(state)
@@ -4174,8 +4879,16 @@ def launch_coregistration_gui(
         path, _ = QFileDialog.getOpenFileName(None, "Select optical image", "", "Image files (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)")
         if not path:
             return
-        add_reference_image(coreg_dataset.zarr_path, path, key="optical", registered_cs=registered_cs)
-        coreg_dataset.sdata = sd.read_zarr(coreg_dataset.zarr_path)
+        _run_with_busy_dialog(
+            "Add Optical Image",
+            "Importing optical image...",
+            lambda: add_reference_image(coreg_dataset.zarr_path, path, key="optical", registered_cs=registered_cs),
+        )
+        coreg_dataset.sdata = _run_with_busy_dialog(
+            "Add Optical Image",
+            "Refreshing optical image layers...",
+            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+        )
         if "optical" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("optical")
         add_or_update_reference_layer(coreg_dataset, "optical")
@@ -4188,8 +4901,16 @@ def launch_coregistration_gui(
         path, _ = QFileDialog.getOpenFileName(None, "Select H&E image", "", "Image files (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)")
         if not path:
             return
-        add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs)
-        coreg_dataset.sdata = sd.read_zarr(coreg_dataset.zarr_path)
+        _run_with_busy_dialog(
+            "Add H&E Image",
+            "Importing H&E image...",
+            lambda: add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs),
+        )
+        coreg_dataset.sdata = _run_with_busy_dialog(
+            "Add H&E Image",
+            "Refreshing H&E image layers...",
+            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+        )
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
         add_or_update_reference_layer(coreg_dataset, "hne")
@@ -4205,8 +4926,16 @@ def launch_coregistration_gui(
         path, _ = QFileDialog.getOpenFileName(None, "Select H&E QPTIFF", "", "QPTIFF/OME-TIFF (*.qptiff *.ome.tif *.ome.tiff *.tif *.tiff);;All files (*)")
         if not path:
             return
-        add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs, qptiff_level=int(qptiff_level))
-        coreg_dataset.sdata = sd.read_zarr(coreg_dataset.zarr_path)
+        _run_with_busy_dialog(
+            "Add H&E QPTIFF",
+            "Importing H&E QPTIFF...\nLarge pyramid images can take a little while.",
+            lambda: add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs, qptiff_level=int(qptiff_level)),
+        )
+        coreg_dataset.sdata = _run_with_busy_dialog(
+            "Add H&E QPTIFF",
+            "Refreshing H&E image layers...",
+            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+        )
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
         add_or_update_reference_layer(coreg_dataset, "hne")
@@ -4234,19 +4963,25 @@ def launch_coregistration_gui(
         paths, _ = QFileDialog.getOpenFileNames(None, "Select GeoJSON annotation file(s)", "", "GeoJSON (*.geojson);;All files (*)")
         if not paths:
             return
-        keys = import_geojson_annotations(
-            coreg_dataset.zarr_path,
-            paths,
-            target_image=target_image,
-            name_prefix=name_prefix,
-            registered_cs=registered_cs,
-            object_mode=object_mode,
-            max_shapes=int(max_shapes),
-            simplify_tolerance=float(simplify_tolerance),
-            annotation_pyramid_level=(int(annotation_pyramid_level) if int(annotation_pyramid_level) >= 0 else None),
+        keys = _run_with_busy_dialog(
+            "Add GeoJSON",
+            "Importing GeoJSON annotations...",
+            lambda: import_geojson_annotations(
+                coreg_dataset.zarr_path,
+                paths,
+                target_image=target_image,
+                name_prefix=name_prefix,
+                registered_cs=registered_cs,
+                object_mode=object_mode,
+                max_shapes=int(max_shapes),
+                simplify_tolerance=float(simplify_tolerance),
+                annotation_pyramid_level=(int(annotation_pyramid_level) if int(annotation_pyramid_level) >= 0 else None),
+            ),
         )
-        coreg_dataset.sdata = sd.read_zarr(coreg_dataset.zarr_path)
-        add_annotation_shape_layers(state, keys)
+        def refresh_geojson_layers():
+            coreg_dataset.sdata = sd.read_zarr(coreg_dataset.zarr_path)
+            add_annotation_shape_layers(state, keys)
+        _run_with_busy_dialog("Add GeoJSON", "Refreshing annotation layers...", refresh_geojson_layers)
         sync_controls_to_active_dataset()
 
     @magicgui(
@@ -4289,13 +5024,17 @@ def launch_coregistration_gui(
         if np.isclose(sx, 1.0) and np.isclose(sy, 1.0) and np.isclose(tx, 0.0) and np.isclose(ty, 0.0):
             return
         state = get_active_state()
-        rewritten = transform_geojson_annotations(
-            state["dataset"].zarr_path,
-            [annotation_key],
-            annotation_scale_x=sx,
-            annotation_scale_y=sy,
-            annotation_translate_x=tx,
-            annotation_translate_y=ty,
+        rewritten = _run_with_busy_dialog(
+            "Adjust GeoJSON",
+            "Updating GeoJSON annotation geometry...",
+            lambda: transform_geojson_annotations(
+                state["dataset"].zarr_path,
+                [annotation_key],
+                annotation_scale_x=sx,
+                annotation_scale_y=sy,
+                annotation_translate_x=tx,
+                annotation_translate_y=ty,
+            ),
         )
         if not rewritten:
             return
@@ -4309,24 +5048,30 @@ def launch_coregistration_gui(
     @magicgui(call_button="Save Active Registration")
     def save_registration_widget():
         state = get_active_state()
-        save_coregistration(
-            state["dataset"].zarr_path,
-            state["current_transform_xy"],
-            table_key=state["dataset"].table_key,
-            tic_key=state["dataset"].tic_key,
-            registered_cs=registered_cs,
-        )
-
-    @magicgui(call_button="Save All Registrations")
-    def save_all_registrations_widget():
-        for state in datasets.values():
-            save_coregistration(
+        _run_with_busy_dialog(
+            "Save Registration",
+            "Saving active registration...",
+            lambda: save_coregistration(
                 state["dataset"].zarr_path,
                 state["current_transform_xy"],
                 table_key=state["dataset"].table_key,
                 tic_key=state["dataset"].tic_key,
                 registered_cs=registered_cs,
-            )
+            ),
+        )
+
+    @magicgui(call_button="Save All Registrations")
+    def save_all_registrations_widget():
+        def save_all():
+            for state in datasets.values():
+                save_coregistration(
+                    state["dataset"].zarr_path,
+                    state["current_transform_xy"],
+                    table_key=state["dataset"].table_key,
+                    tic_key=state["dataset"].tic_key,
+                    registered_cs=registered_cs,
+                )
+        _run_with_busy_dialog("Save Registrations", "Saving all registrations...", save_all)
 
     @magicgui(call_button="Export Current View TIFF")
     def export_current_view_widget():
@@ -4345,8 +5090,10 @@ def launch_coregistration_gui(
         path = Path(selected[0]).expanduser()
         if path.suffix.lower() not in {".tif", ".tiff"}:
             path = path.with_suffix(".tif")
-        screenshot = viewer.screenshot(canvas_only=True, flash=False)
-        iio.imwrite(path, np.asarray(screenshot))
+        def export_tiff():
+            screenshot = viewer.screenshot(canvas_only=True, flash=False)
+            iio.imwrite(path, np.asarray(screenshot))
+        _run_with_busy_dialog("Export TIFF", "Exporting current view TIFF...", export_tiff)
 
     @magicgui(call_button="Reset Canvas View")
     def reset_canvas_view_widget():
@@ -4487,30 +5234,47 @@ def launch_coregistration_gui(
     alignment_dialog = QDialog()
     alignment_dialog.setWindowTitle("Alignment Tools")
     alignment_dialog.setModal(False)
-    alignment_dialog.resize(420, 620)
+    alignment_dialog.resize(460, 620)
     alignment_dialog_layout = QVBoxLayout(alignment_dialog)
     alignment_dialog_layout.setContentsMargins(8, 8, 8, 8)
     alignment_dialog_layout.setSpacing(8)
+    alignment_dialog_scroll = QScrollArea()
+    alignment_dialog_scroll.setWidgetResizable(True)
+    alignment_dialog_container = QWidget()
+    alignment_dialog_container_layout = QVBoxLayout(alignment_dialog_container)
+    alignment_dialog_container_layout.setContentsMargins(4, 4, 4, 4)
+    alignment_dialog_container_layout.setSpacing(8)
     alignment_active_dataset_label = QLabel("")
-    alignment_dialog_layout.addWidget(alignment_active_dataset_label)
-    alignment_dialog_layout.addWidget(QLabel("Landmark picking"))
-    alignment_dialog_layout.addWidget(pick_msi_landmarks_widget.native)
-    alignment_dialog_layout.addWidget(pick_reference_landmarks_widget.native)
-    alignment_dialog_layout.addWidget(stop_landmark_picking_widget.native)
-    alignment_dialog_layout.addWidget(QLabel("Alignment actions"))
-    alignment_dialog_layout.addWidget(fit_affine_from_landmarks.native)
-    alignment_dialog_layout.addWidget(rotate_180.native)
-    alignment_dialog_layout.addWidget(rotate_90_cw.native)
-    alignment_dialog_layout.addWidget(rotate_90_ccw.native)
-    alignment_dialog_layout.addWidget(flip_horizontal.native)
-    alignment_dialog_layout.addWidget(flip_vertical.native)
-    alignment_dialog_layout.addWidget(clear_landmarks.native)
-    alignment_dialog_layout.addWidget(QLabel("Registration"))
-    alignment_dialog_layout.addWidget(save_registration_widget.native)
-    alignment_dialog_layout.addWidget(save_all_registrations_widget.native)
-    alignment_dialog_layout.addStretch(1)
+    alignment_dialog_container_layout.addWidget(alignment_active_dataset_label)
+    alignment_dialog_container_layout.addWidget(QLabel("Landmark picking"))
+    alignment_dialog_container_layout.addWidget(pick_msi_landmarks_widget.native)
+    alignment_dialog_container_layout.addWidget(pick_reference_landmarks_widget.native)
+    alignment_dialog_container_layout.addWidget(stop_landmark_picking_widget.native)
+    alignment_dialog_container_layout.addWidget(QLabel("Alignment actions"))
+    alignment_dialog_container_layout.addWidget(fit_affine_from_landmarks.native)
+    alignment_dialog_container_layout.addWidget(rotate_180.native)
+    alignment_dialog_container_layout.addWidget(rotate_90_cw.native)
+    alignment_dialog_container_layout.addWidget(rotate_90_ccw.native)
+    alignment_dialog_container_layout.addWidget(flip_horizontal.native)
+    alignment_dialog_container_layout.addWidget(flip_vertical.native)
+    alignment_dialog_container_layout.addWidget(clear_landmarks.native)
+    alignment_dialog_container_layout.addWidget(QLabel("Mutual-information refinement"))
+    alignment_dialog_container_layout.addWidget(preview_affine_mi_inputs_widget.native)
+    alignment_dialog_container_layout.addWidget(optimize_affine_registration_widget.native)
+    alignment_dialog_container_layout.addWidget(QLabel("Registration"))
+    alignment_dialog_container_layout.addWidget(save_registration_widget.native)
+    alignment_dialog_container_layout.addWidget(save_all_registrations_widget.native)
+    alignment_dialog_container_layout.addStretch(1)
+    alignment_dialog_scroll.setWidget(alignment_dialog_container)
+    alignment_dialog_layout.addWidget(alignment_dialog_scroll)
 
     def open_alignment_dialog():
+        preview_affine_mi_inputs_widget.reference_channel.choices = _reference_channel_choice_names()
+        if preview_affine_mi_inputs_widget.reference_channel.value not in preview_affine_mi_inputs_widget.reference_channel.choices:
+            preview_affine_mi_inputs_widget.reference_channel.value = preview_affine_mi_inputs_widget.reference_channel.choices[0]
+        optimize_affine_registration_widget.reference_channel.choices = _reference_channel_choice_names()
+        if optimize_affine_registration_widget.reference_channel.value not in optimize_affine_registration_widget.reference_channel.choices:
+            optimize_affine_registration_widget.reference_channel.value = optimize_affine_registration_widget.reference_channel.choices[0]
         alignment_dialog.show()
         alignment_dialog.raise_()
         alignment_dialog.activateWindow()
