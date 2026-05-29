@@ -2201,6 +2201,7 @@ def launch_coregistration_gui(
     def build_dataset_state(coreg_dataset: CoregistrationDataset, label: str) -> dict[str, Any]:
         initial_idx = int(np.abs(coreg_dataset.mz_values - 268.1040).argmin())
         initial_img = coreg_dataset.reconstruct_ion_image(initial_idx, normalize_to_tic=True)
+        initial_contrast_limits = auto_contrast_limits(initial_img)
 
         saved_xy_matrix, found_registration = coreg_dataset.load_saved_registration_if_available()
         if found_registration and np.allclose(saved_xy_matrix, np.eye(3, dtype=float), atol=1e-9):
@@ -2215,7 +2216,7 @@ def launch_coregistration_gui(
             name=f"{label} m/z {coreg_dataset.mz_values[initial_idx]:.4f}",
             opacity=0.6,
             colormap=get_overlay_colormap(overlay_name),
-            contrast_limits=auto_contrast_limits(initial_img),
+            contrast_limits=initial_contrast_limits,
             visible=False,
         )
         msi_landmarks = viewer.add_points(name=f"{label} MSI landmarks", ndim=2, face_color="#ff7f0e", size=8, visible=False)
@@ -2237,8 +2238,11 @@ def launch_coregistration_gui(
             "current_normalize_to_tic": True,
             "current_colormap_name": overlay_name,
             "current_opacity": 0.6,
+            "current_contrast_mode": "percentile",
             "current_contrast_low_pct": 1.0,
             "current_contrast_high_pct": 99.5,
+            "current_contrast_low": float(initial_contrast_limits[0]),
+            "current_contrast_high": float(initial_contrast_limits[1]),
             "current_transform_xy": np.asarray(saved_xy_matrix, dtype=float).copy(),
             "ion_layer": ion_layer,
             "roi_mask_layer": None,
@@ -2262,13 +2266,28 @@ def launch_coregistration_gui(
         }
         return state
 
-    def apply_percentile_contrast_to_active_layer(img: np.ndarray):
+    def apply_ion_contrast_to_active_layer(img: np.ndarray):
         state = get_active_state()
-        state["ion_layer"].contrast_limits = auto_contrast_limits(
+        if str(state.get("current_contrast_mode", "percentile")).lower() == "absolute":
+            low = float(state.get("current_contrast_low", 0.0))
+            high = float(state.get("current_contrast_high", 1.0))
+            if high <= low:
+                high = low + 1e-9
+            state["ion_layer"].contrast_limits = (low, high)
+            return
+        contrast_limits = auto_contrast_limits(
             img,
             low_pct=float(state["current_contrast_low_pct"]),
             high_pct=float(state["current_contrast_high_pct"]),
         )
+        state["ion_layer"].contrast_limits = contrast_limits
+        state["current_contrast_low"] = float(contrast_limits[0])
+        state["current_contrast_high"] = float(contrast_limits[1])
+        try:
+            ion_display_options.absolute_low.value = f"{float(contrast_limits[0]):g}"
+            ion_display_options.absolute_high.value = f"{float(contrast_limits[1]):g}"
+        except Exception:
+            pass
 
     def apply_transform_to_state(state: dict[str, Any]):
         aff_yx = xy_to_yx_matrix(state["current_transform_xy"])
@@ -3024,7 +3043,7 @@ def launch_coregistration_gui(
         )
         state["ion_layer"].data = prepare_ion_for_display(img)
         state["ion_layer"].name = f"{state['label']} m/z {coreg_dataset.mz_values[state['current_feature_idx']]:.4f}"
-        apply_percentile_contrast_to_active_layer(img)
+        apply_ion_contrast_to_active_layer(img)
         if current_mz_line is not None:
             current_mz_line.set_xdata(
                 [coreg_dataset.mz_values[state["current_feature_idx"]], coreg_dataset.mz_values[state["current_feature_idx"]]]
@@ -3054,7 +3073,7 @@ def launch_coregistration_gui(
             state["ion_layer"].name = f"{state['label']} m/z {float(target_mz):.4f} +/- {float(ppm_tolerance):.1f} ppm"
         else:
             state["ion_layer"].name = f"{state['label']} m/z {coreg_dataset.mz_values[state['current_feature_idx']]:.4f}"
-        apply_percentile_contrast_to_active_layer(img)
+        apply_ion_contrast_to_active_layer(img)
         if current_mz_line is not None:
             current_mz_line.set_xdata([float(target_mz), float(target_mz)])
             spectrum_canvas.draw_idle()
@@ -3191,6 +3210,11 @@ def launch_coregistration_gui(
 
     @magicgui(
         normalize_to_tic={"widget_type": "CheckBox", "text": "Normalize to TIC"},
+        contrast_mode={
+            "widget_type": "ComboBox",
+            "choices": ["percentile", "absolute"],
+            "label": "Contrast scale",
+        },
         contrast_percentiles={
             "widget_type": "FloatRangeSlider",
             "min": 0.0,
@@ -3198,14 +3222,29 @@ def launch_coregistration_gui(
             "step": 0.1,
             "label": "Contrast percentiles",
         },
+        absolute_low={
+            "widget_type": "LineEdit",
+            "label": "Absolute low",
+        },
+        absolute_high={
+            "widget_type": "LineEdit",
+            "label": "Absolute high",
+        },
         auto_call=True,
     )
     def ion_display_options(
         normalize_to_tic=True,
+        contrast_mode: str = "percentile",
         contrast_percentiles: tuple[float, float] = (1.0, 99.5),
+        absolute_low: str = "0.0",
+        absolute_high: str = "1.0",
     ):
         state = get_active_state()
         state["current_normalize_to_tic"] = bool(normalize_to_tic)
+        mode = str(contrast_mode).lower()
+        if mode not in {"percentile", "absolute"}:
+            mode = "percentile"
+        state["current_contrast_mode"] = mode
         low, high = contrast_percentiles
         low = float(low)
         high = float(high)
@@ -3214,6 +3253,19 @@ def launch_coregistration_gui(
             ion_display_options.contrast_percentiles.value = (low, high)
         state["current_contrast_low_pct"] = low
         state["current_contrast_high_pct"] = high
+        try:
+            absolute_low = float(str(absolute_low).strip())
+            absolute_high = float(str(absolute_high).strip())
+        except Exception:
+            if mode == "absolute":
+                return
+            absolute_low = float(state.get("current_contrast_low", 0.0))
+            absolute_high = float(state.get("current_contrast_high", 1.0))
+        if absolute_high <= absolute_low:
+            absolute_high = absolute_low + 1e-9
+            ion_display_options.absolute_high.value = f"{absolute_high:g}"
+        state["current_contrast_low"] = absolute_low
+        state["current_contrast_high"] = absolute_high
         update_ion_view_for_mz(state["current_target_mz"], state["current_ppm_tolerance"])
 
     @magicgui(
@@ -5400,10 +5452,13 @@ def launch_coregistration_gui(
         if copy_affine_to_target_widget.target_dataset.value not in copy_affine_to_target_widget.target_dataset.choices:
             copy_affine_to_target_widget.target_dataset.value = copy_affine_to_target_widget.target_dataset.choices[0]
         ion_display_options.normalize_to_tic.value = bool(state["current_normalize_to_tic"])
+        ion_display_options.contrast_mode.value = str(state.get("current_contrast_mode", "percentile"))
         ion_display_options.contrast_percentiles.value = (
             float(state["current_contrast_low_pct"]),
             float(state["current_contrast_high_pct"]),
         )
+        ion_display_options.absolute_low.value = f"{float(state.get('current_contrast_low', 0.0)):g}"
+        ion_display_options.absolute_high.value = f"{float(state.get('current_contrast_high', 1.0)):g}"
         mz_selector.target_mz.value = f"{float(state['current_target_mz']):.4f}"
         mz_selector.ppm_tolerance.value = float(state["current_ppm_tolerance"])
         threshold_map_to_dataset.choices = ordered_choices if ordered_choices else [dataset_choice_text(state)]
