@@ -674,7 +674,9 @@ def convert_input_to_zarr(
 
     ok = converter(input_path=src, output_path=str(dst))
     if ok is False:
-        raise RuntimeError(f"Failed to convert MSI input {src} -> {dst}")
+        ok = converter(input_path=src, output_path=str(dst),pixel_size_um=50)
+        if ok is False:
+            raise RuntimeError(f"Failed to convert MSI input {src} -> {dst}")
     return dst
 
 
