@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sys
 import tempfile
@@ -2379,6 +2380,13 @@ def launch_coregistration_gui(
                 return layer
         return None
 
+    def _get_reference_layer_by_key_channel(reference_key: str, channel_index: int):
+        for layer in _reference_channel_layers():
+            metadata = _layer_metadata(layer)
+            if str(metadata.get("reference_key", "")) == str(reference_key) and int(metadata.get("reference_channel_index", 0)) == int(channel_index):
+                return layer
+        return None
+
     def _layer_metadata(layer) -> dict[str, Any]:
         metadata = getattr(layer, "metadata", None)
         if not isinstance(metadata, dict):
@@ -3872,7 +3880,6 @@ def launch_coregistration_gui(
     except Exception:
         pass
     for widget in (
-        if_threshold_reference_channel,
         if_threshold_prefilter_annotation,
         if_threshold_prefilter_region,
         if_threshold_percentile,
@@ -3881,6 +3888,17 @@ def launch_coregistration_gui(
             widget.changed.connect(schedule_if_threshold_preview_update)
         except Exception:
             pass
+
+    def update_if_threshold_channel_defaults(*_args):
+        state = get_active_state()
+        selected_layer = str(if_threshold_reference_channel.value)
+        refresh_if_threshold_choices(state, preferred_layer=selected_layer)
+        schedule_if_threshold_preview_update()
+
+    try:
+        if_threshold_reference_channel.changed.connect(update_if_threshold_channel_defaults)
+    except Exception:
+        pass
 
     def refresh_threshold_prefilter_choices(
         state: dict[str, Any] | None = None,
@@ -3931,6 +3949,7 @@ def launch_coregistration_gui(
         preferred_annotation: str | None = None,
         preferred_region: str | None = None,
     ):
+        nonlocal suppress_if_threshold_absolute_update
         state = state or get_active_state()
         coreg_dataset = state["dataset"]
         channel_choices = _reference_channel_choice_names()
@@ -3939,20 +3958,45 @@ def launch_coregistration_gui(
         if current_layer not in channel_choices:
             current_layer = channel_choices[0]
         if_threshold_reference_channel.value = current_layer
+        layer = _get_reference_layer_by_name(current_layer)
+        layer_metadata = _layer_metadata(layer) if layer is not None else {}
 
         shape_keys = [key for key in coreg_dataset.sdata.shapes.keys() if "pixels" not in key.lower()]
         annotation_choices = ["(none)"] + shape_keys
         if_threshold_prefilter_annotation.choices = annotation_choices
-        current_annotation = str(preferred_annotation or if_threshold_prefilter_annotation.value or "(none)")
+        current_annotation = str(
+            preferred_annotation
+            or layer_metadata.get("if_threshold_prefilter_annotation")
+            or if_threshold_prefilter_annotation.value
+            or "(none)"
+        )
         if current_annotation not in annotation_choices:
             current_annotation = "(none)"
         if_threshold_prefilter_annotation.value = current_annotation
         region_choices = annotation_region_choices(coreg_dataset, current_annotation)
         if_threshold_prefilter_region.choices = region_choices
-        current_region = str(preferred_region or if_threshold_prefilter_region.value or "(all regions)")
+        current_region = str(
+            preferred_region
+            or layer_metadata.get("if_threshold_prefilter_region")
+            or if_threshold_prefilter_region.value
+            or "(all regions)"
+        )
         if current_region not in region_choices:
             current_region = region_choices[0]
         if_threshold_prefilter_region.value = current_region
+        if "if_threshold_percentile" in layer_metadata:
+            try:
+                if_threshold_percentile.value = float(layer_metadata["if_threshold_percentile"])
+            except Exception:
+                pass
+        if "if_threshold_value" in layer_metadata:
+            try:
+                suppress_if_threshold_absolute_update = True
+                if_threshold_absolute_value.value = float(layer_metadata["if_threshold_value"])
+            except Exception:
+                pass
+            finally:
+                suppress_if_threshold_absolute_update = False
 
     def update_if_threshold_prefilter_region_choices(*_args):
         state = get_active_state()
@@ -4980,8 +5024,16 @@ def launch_coregistration_gui(
         pass
     if_layer_table.setMinimumHeight(320)
     if_apply_table_button = QPushButton("Save IF Settings to Zarr")
+    if_export_csv_button = QPushButton("Export IF Settings CSV")
+    if_import_csv_button = QPushButton("Import IF Settings CSV")
+    if_button_row = QWidget()
+    if_button_row_layout = QGridLayout(if_button_row)
+    if_button_row_layout.setContentsMargins(0, 0, 0, 0)
+    if_button_row_layout.addWidget(if_apply_table_button, 0, 0)
+    if_button_row_layout.addWidget(if_export_csv_button, 0, 1)
+    if_button_row_layout.addWidget(if_import_csv_button, 1, 0, 1, 2)
     if_layer_controls_layout.addWidget(if_layer_table)
-    if_layer_controls_layout.addWidget(if_apply_table_button)
+    if_layer_controls_layout.addWidget(if_button_row)
     suppress_if_table_updates = False
 
     def _configure_if_contrast_spin(spin: QDoubleSpinBox, mode: str):
@@ -5116,6 +5168,13 @@ def launch_coregistration_gui(
     def save_if_table_settings():
         for row_idx in range(if_layer_table.rowCount()):
             apply_if_table_row(row_idx)
+        current_threshold_layer = _get_reference_layer_by_name(str(if_threshold_reference_channel.value))
+        if current_threshold_layer is not None:
+            metadata = _layer_metadata(current_threshold_layer)
+            metadata["if_threshold_percentile"] = float(if_threshold_percentile.value)
+            metadata["if_threshold_value"] = float(if_threshold_absolute_value.value)
+            metadata["if_threshold_prefilter_annotation"] = str(if_threshold_prefilter_annotation.value)
+            metadata["if_threshold_prefilter_region"] = str(if_threshold_prefilter_region.value)
         layers_by_key: dict[str, list[Any]] = {}
         for layer in _reference_channel_layers():
             reference_key = str(_layer_metadata(layer).get("reference_key", ""))
@@ -5136,6 +5195,10 @@ def launch_coregistration_gui(
                 "contrast_percentiles": [float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8))],
                 "contrast_limits": [float(v) for v in getattr(layer, "contrast_limits", metadata.get("reference_contrast_limits", (0.0, 1.0)))],
                 "gamma": float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))),
+                "if_threshold_percentile": metadata.get("if_threshold_percentile", ""),
+                "if_threshold_value": metadata.get("if_threshold_value", ""),
+                "if_threshold_prefilter_annotation": str(metadata.get("if_threshold_prefilter_annotation", "")),
+                "if_threshold_prefilter_region": str(metadata.get("if_threshold_prefilter_region", "")),
             }
         try:
             root = zarr.open_group(host_zarr_path, mode="r+", use_consolidated=False)
@@ -5151,7 +5214,173 @@ def launch_coregistration_gui(
         except Exception as exc:
             QMessageBox.warning(None, "IF Display Settings", f"Could not save IF display settings:\n{exc}")
 
+    if_settings_csv_columns = [
+        "reference_key",
+        "channel_index",
+        "display_name",
+        "visible",
+        "color_choice",
+        "contrast_mode",
+        "contrast_low",
+        "contrast_high",
+        "contrast_limit_low",
+        "contrast_limit_high",
+        "gamma",
+        "if_threshold_percentile",
+        "if_threshold_value",
+        "if_threshold_prefilter_annotation",
+        "if_threshold_prefilter_region",
+    ]
+
+    def _parse_csv_bool(value: Any, default: bool = True) -> bool:
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+
+    def _parse_csv_float(value: Any, default: float | None = None) -> float | None:
+        text = str(value).strip()
+        if text == "":
+            return default
+        try:
+            out = float(text)
+        except Exception:
+            return default
+        return out if np.isfinite(out) else default
+
+    def export_if_settings_csv():
+        for row_idx in range(if_layer_table.rowCount()):
+            apply_if_table_row(row_idx)
+        current_threshold_layer = _get_reference_layer_by_name(str(if_threshold_reference_channel.value))
+        if current_threshold_layer is not None:
+            metadata = _layer_metadata(current_threshold_layer)
+            metadata["if_threshold_percentile"] = float(if_threshold_percentile.value)
+            metadata["if_threshold_value"] = float(if_threshold_absolute_value.value)
+            metadata["if_threshold_prefilter_annotation"] = str(if_threshold_prefilter_annotation.value)
+            metadata["if_threshold_prefilter_region"] = str(if_threshold_prefilter_region.value)
+
+        dialog = QFileDialog(None, "Export IF settings CSV")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter("CSV (*.csv)")
+        dialog.setDirectory(str(host_zarr_path.parent))
+        dialog.selectFile("if_settings.csv")
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selectedFiles()
+        if not selected:
+            return
+        path = Path(selected[0]).expanduser()
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+
+        def write_csv():
+            rows = []
+            for layer in _reference_channel_layers():
+                metadata = _layer_metadata(layer)
+                reference_key = str(metadata.get("reference_key", ""))
+                if not reference_key:
+                    continue
+                channel_index = int(metadata.get("reference_channel_index", 0))
+                mode = str(metadata.get("reference_contrast_mode", "percentile"))
+                pct_low, pct_high = tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8)))
+                limit_low, limit_high = tuple(float(v) for v in getattr(layer, "contrast_limits", metadata.get("reference_contrast_limits", (0.0, 1.0))))
+                rows.append(
+                    {
+                        "reference_key": reference_key,
+                        "channel_index": channel_index,
+                        "display_name": str(layer.name),
+                        "visible": bool(layer.visible),
+                        "color_choice": str(metadata.get("reference_color_choice", "metadata")),
+                        "contrast_mode": mode,
+                        "contrast_low": pct_low,
+                        "contrast_high": pct_high,
+                        "contrast_limit_low": limit_low,
+                        "contrast_limit_high": limit_high,
+                        "gamma": float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))),
+                        "if_threshold_percentile": metadata.get("if_threshold_percentile", ""),
+                        "if_threshold_value": metadata.get("if_threshold_value", ""),
+                        "if_threshold_prefilter_annotation": str(metadata.get("if_threshold_prefilter_annotation", "")),
+                        "if_threshold_prefilter_region": str(metadata.get("if_threshold_prefilter_region", "")),
+                    }
+                )
+            with path.open("w", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=if_settings_csv_columns)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        try:
+            _run_with_busy_dialog("Export IF Settings CSV", "Exporting IF settings CSV...", write_csv)
+        except Exception as exc:
+            QMessageBox.warning(None, "Export IF Settings CSV", str(exc))
+
+    def import_if_settings_csv():
+        path, _ = QFileDialog.getOpenFileName(None, "Import IF settings CSV", str(host_zarr_path.parent), "CSV (*.csv);;All files (*)")
+        if not path:
+            return
+        csv_path = Path(path).expanduser()
+
+        def read_rows():
+            with csv_path.open("r", newline="") as fh:
+                return list(csv.DictReader(fh))
+
+        try:
+            rows = _run_with_busy_dialog("Import IF Settings CSV", "Importing IF settings CSV...", read_rows)
+        except Exception as exc:
+            QMessageBox.warning(None, "Import IF Settings CSV", str(exc))
+            return
+
+        matched = 0
+        for row in rows:
+            reference_key = str(row.get("reference_key", "")).strip()
+            channel_index = _parse_csv_float(row.get("channel_index", ""), None)
+            layer = _get_reference_layer_by_key_channel(reference_key, int(channel_index)) if channel_index is not None else None
+            if layer is None:
+                display_name = str(row.get("display_name", "")).strip()
+                layer = _get_reference_layer_by_name(display_name) if display_name else None
+            if layer is None:
+                continue
+            matched += 1
+            metadata = _layer_metadata(layer)
+            display_name = str(row.get("display_name", "")).strip()
+            if display_name:
+                layer.name = display_name
+            layer.visible = _parse_csv_bool(row.get("visible", layer.visible), bool(layer.visible))
+            color_choice = str(row.get("color_choice", metadata.get("reference_color_choice", "metadata"))).strip() or "metadata"
+            _set_reference_layer_color(layer, color_choice)
+            mode = str(row.get("contrast_mode", metadata.get("reference_contrast_mode", "percentile"))).strip().lower() or "percentile"
+            pct_low = _parse_csv_float(row.get("contrast_low", ""), 1.0)
+            pct_high = _parse_csv_float(row.get("contrast_high", ""), 99.8)
+            limit_low = _parse_csv_float(row.get("contrast_limit_low", ""), None)
+            limit_high = _parse_csv_float(row.get("contrast_limit_high", ""), None)
+            if mode == "intensity" and limit_low is not None and limit_high is not None:
+                _apply_reference_layer_contrast(layer, "intensity", intensity_limits=(float(limit_low), float(limit_high)))
+            else:
+                _apply_reference_layer_contrast(layer, "percentile", percentiles=(float(pct_low), float(pct_high)))
+            gamma = _parse_csv_float(row.get("gamma", ""), float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))))
+            _apply_reference_layer_gamma(layer, float(gamma if gamma is not None else 1.0))
+            threshold_percentile = _parse_csv_float(row.get("if_threshold_percentile", ""), None)
+            threshold_value = _parse_csv_float(row.get("if_threshold_value", ""), None)
+            if threshold_percentile is not None:
+                metadata["if_threshold_percentile"] = float(threshold_percentile)
+            if threshold_value is not None:
+                metadata["if_threshold_value"] = float(threshold_value)
+            threshold_annotation = str(row.get("if_threshold_prefilter_annotation", "")).strip()
+            threshold_region = str(row.get("if_threshold_prefilter_region", "")).strip()
+            if threshold_annotation:
+                metadata["if_threshold_prefilter_annotation"] = threshold_annotation
+            if threshold_region:
+                metadata["if_threshold_prefilter_region"] = threshold_region
+
+        rebuild_if_layer_controls()
+        refresh_if_threshold_choices(get_active_state())
+        QMessageBox.information(None, "Import IF Settings CSV", f"Imported settings for {matched} IF channel(s).")
+
     if_apply_table_button.clicked.connect(save_if_table_settings)
+    if_export_csv_button.clicked.connect(export_if_settings_csv)
+    if_import_csv_button.clicked.connect(import_if_settings_csv)
 
     def sync_controls_to_active_dataset():
         state = get_active_state()
