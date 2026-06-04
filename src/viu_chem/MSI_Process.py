@@ -19,7 +19,7 @@ def convert_from_RAW(dir:str,mode:str="Centroid",x_speed:float=40.0,y_step:float
     :param y_step: Y-axis step size used for imzML metadata processing
     :param filetype: File extension for the raw data files
     :param stop_at_mzML: Whether to stop after mzML conversion"""
-    iw_utils.RAW_to_mzML(dir,write_mode=mode,blocking=True)
+    iw_utils.RAW_to_mzML(dir,write_mode=mode)
 
     iw_utils.clean_raw_files(dir,filetype)
     if stop_at_mzML:
@@ -233,22 +233,6 @@ def find_matching_ROI(ROI_files:list,match_folder:str, ROI_folder:str):
         raise
         
             
-
-# def find_data_filt_string(path:str, search_pattern:str):
-#     bad_options = ["Initial RAW files", "Output mzML Files"]
-#     top_files = os.listdir(path)
-#     for candidate in top_files:
-#         if os.path.isdir(os.path.join(path, candidate)):
-#             if not candidate.startswith(".") and candidate not in bad_options:
-#                 if ".imzML" in any(os.listdir(candidate)):
-#                     working_folder = os.path.join(path, candidate)
-#                     break
-#         elif candidate.endswith(search_pattern):
-#             return os.path.join(path, candidate)
-        
-#     for file in os.listdir(working_folder):
-#         if search_pattern in file:
-#             return os.path.join(working_folder,file)
 def find_data_filt_string(path: str, search_pattern: str):
     """Finds the first file containing a search pattern while skipping known raw-data folders.
     
@@ -273,70 +257,362 @@ def find_data_filt_string(path: str, search_pattern: str):
 
 
 
-def drawGrid(images:list[np.array],dims:tuple[int,int]=None,cut_off:float=95, title:str=None, aspects:list[float]=None, names:list[str]=None,):
+def drawGrid(
+    images:list[np.array],
+    dims:tuple[int,int]=None,
+    cut_off:float=95,
+    title:str=None,
+    aspects:list[float]=None,
+    names:list[str]=None,
+    groups:list[str]=None,
+    group_axis:str="row",
+    secondary_groups:list[str]=None,
+    image_dimensions:list[tuple[float,float]]=None,
+    scale_bar:float=None,
+    scale_units:str="µm",
+    color_scale:str="global",
+):
     """Draws a grid of ion images with a shared intensity scale and colorbar.
     
     :param images: List of numpy image arrays
-    :param dims: Dimensions to draw the ion images in
+    :param dims: Dimensions to draw the ion images in (height, width)
     :param cut_off: Percentile cutoff to use for the global dataset
     :param title: Title to draw above the entire image
     :param aspects: Aspect values for each image
     :param names: List of names to draw above each image
+    :param groups: Group label for each image
+    :param group_axis: Axis on which to arrange groups, either row or column
+    :param secondary_groups: Labels for the sample positions perpendicular to group_axis
+    :param image_dimensions: Physical (width, height) of each image
+    :param scale_bar: Physical length of a global scale bar
+    :param scale_units: Units displayed on the global scale bar
+    :param color_scale: Shared color scaling scope: global, row, column, or image/none
     :return fig: Populated matplotlib figure"""
 
-    def add_cbar(ax:plt.Axes,fig:plt.figure,cbar_cutoffs:float=90):
+    def add_cbar(cbar_ax:plt.Axes,cbar_cutoffs:float=90):
         """Adds a percentile colorbar to an ion image grid.
         
-        :param ax: Axes used to position the colorbar
-        :param fig: Figure that receives the colorbar axes
+        :param cbar_ax: Reserved axes that receives the colorbar
         :param cbar_cutoffs: Upper percentile label for the colorbar"""
-        ax_pos = ax.get_position()
-        width = 0.2
-        height = 0.7
-        cbar_position = [ax_pos.x0 + 0.05, ax_pos.y0, ax_pos.width * width, ax_pos.height * height]
-        cbar_ax = fig.add_axes(cbar_position) 
-        norm = mcolors.Normalize(vmin=0, vmax=cbar_cutoffs)
-        cbar = fig.colorbar(
-            plt.cm.ScalarMappable(norm=norm, cmap='viridis'),
-            cax=cbar_ax,
-            orientation='vertical'
+        gradient = np.linspace(0, cbar_cutoffs, 256).reshape(-1, 1)
+        cbar_ax.imshow(
+            gradient,
+            aspect="auto",
+            origin="lower",
+            extent=(0, 1, 0, cbar_cutoffs),
+            cmap="viridis",
         )
-        cbar.set_label('Intensity', color='white', rotation=270, va='center') 
-        cbar.ax.yaxis.set_tick_params(color='white')
-        cbar.ax.yaxis.set_ticks_position('left')
-        cbar.set_ticks([0, cbar_cutoffs])
-        cbar.set_ticklabels(["0th", f"{cbar_cutoffs}th"])
-        cbar.ax.set_yticklabels(cbar.ax.get_yticklabels(), color='white')
+        cbar_ax.set_ylabel('Intensity', color='white', rotation=270, va='center')
+        cbar_ax.yaxis.set_label_position('right')
+        cbar_ax.yaxis.set_tick_params(color='white')
+        cbar_ax.yaxis.set_ticks_position('right')
+        cbar_ax.set_xticks([])
+        cbar_ax.set_yticks([0, cbar_cutoffs], labels=["0th", f"{cbar_cutoffs}th"], color="white")
 
-    if not dims:
-        dims = (4, int(np.ceil(len(images)/4)))
-    if not aspects:
-        aspects = [1 for _ in len(images)]
+    def add_scale_bar(scale_ax:plt.Axes, length:float, units:str):
+        """Adds the artists used for a dynamically calibrated scale bar."""
+        center_x = 0.5
+        y = 0.65
+        line = mpl.lines.Line2D(
+            [center_x, center_x],
+            [y, y],
+            transform=scale_ax.transAxes,
+            color="white",
+            linewidth=3,
+            clip_on=False,
+        )
+        scale_ax.add_line(line)
+        scale_ax.text(center_x, y - 0.15, f"{length:g} {units}", transform=scale_ax.transAxes,
+                      color="white", ha="center", va="top")
+        return line
 
+    def update_physical_layout(physical_axes:list[plt.Axes], scale_line:mpl.lines.Line2D=None):
+        """Fits physical image coordinates to the current axes sizes."""
+        changed = False
+        canvas_center_x = max_width / 2
+        canvas_center_y = max_height / 2
+        canvas_ratio = max_width / max_height
 
-    fig, ax = plt.subplots(dims[0], dims[1])
-    ax = ax.ravel()
-    fig.set_size_inches(dims[0]*1.5, dims[1]*1.5)
+        for image_ax in physical_axes:
+            axes_ratio = image_ax.bbox.width / image_ax.bbox.height
+            if axes_ratio > canvas_ratio:
+                visible_width = max_height * axes_ratio
+                visible_height = max_height
+            else:
+                visible_width = max_width
+                visible_height = max_width / axes_ratio
+            x_limits = (
+                canvas_center_x - visible_width / 2,
+                canvas_center_x + visible_width / 2,
+            )
+            y_limits = (
+                canvas_center_y + visible_height / 2,
+                canvas_center_y - visible_height / 2,
+            )
+            if not np.allclose(image_ax.get_xlim(), x_limits):
+                image_ax.set_xlim(x_limits)
+                changed = True
+            if not np.allclose(image_ax.get_ylim(), y_limits):
+                image_ax.set_ylim(y_limits)
+                changed = True
+
+        if scale_line is not None:
+            reference_ax = physical_axes[0]
+            start_px = reference_ax.transData.transform((0, 0))[0]
+            end_px = reference_ax.transData.transform((scale_bar, 0))[0]
+            bar_width = abs(end_px - start_px) / scale_ax.bbox.width
+            x_data = [0.5 - bar_width / 2, 0.5 + bar_width / 2]
+            if not np.allclose(scale_line.get_xdata(), x_data):
+                scale_line.set_xdata(x_data)
+                changed = True
+        return changed
+
+    images = list(images)
+    aspects = list(aspects) if aspects is not None else None
+    names = list(names) if names is not None else None
+    groups = list(groups) if groups is not None else None
+    secondary_groups = list(secondary_groups) if secondary_groups is not None else None
+    image_dimensions = list(image_dimensions) if image_dimensions is not None else None
+
+    if len(images) == 0:
+        raise ValueError("images must contain at least one image")
+
+    image_count = len(images)
+    for values, label in (
+        (aspects, "aspects"),
+        (names, "names"),
+        (groups, "groups"),
+        (secondary_groups, "secondary_groups"),
+        (image_dimensions, "image_dimensions"),
+    ):
+        if values is not None and len(values) != image_count:
+            raise ValueError(f"{label} must contain one value per image")
+
+    if not 0 <= cut_off <= 100:
+        raise ValueError("cut_off must be between 0 and 100")
+    if group_axis not in {"row", "column"}:
+        raise ValueError("group_axis must be either 'row' or 'column'")
+    if color_scale == "none":
+        color_scale = "image"
+    if color_scale not in {"global", "row", "column", "image"}:
+        raise ValueError("color_scale must be one of: global, row, column, image, none")
+    if scale_bar is not None and image_dimensions is None:
+        raise ValueError("image_dimensions must be supplied when using scale_bar")
+    if scale_bar is not None and scale_bar <= 0:
+        raise ValueError("scale_bar must be greater than zero")
+
+    placements = []
+    group_labels = []
+    if groups is not None:
+        group_labels = list(dict.fromkeys(groups))
+        if secondary_groups is not None:
+            secondary_label_order = list(dict.fromkeys(secondary_groups))
+            minimum_dims = (
+                (len(group_labels), len(secondary_label_order))
+                if group_axis == "row"
+                else (len(secondary_label_order), len(group_labels))
+            )
+        else:
+            grouped_indices = [[idx for idx, group in enumerate(groups) if group == label] for label in group_labels]
+            largest_group = max(len(indices) for indices in grouped_indices)
+            minimum_dims = (
+                (len(group_labels), largest_group)
+                if group_axis == "row"
+                else (largest_group, len(group_labels))
+            )
+        if dims is None:
+            dims = minimum_dims
+        elif dims[0] < minimum_dims[0] or dims[1] < minimum_dims[1]:
+            raise ValueError(f"dims must be at least {minimum_dims} for the requested grouping")
+
+        if secondary_groups is not None:
+            occupied_positions = set()
+            for image_idx, (group, secondary_group) in enumerate(zip(groups, secondary_groups)):
+                group_idx = group_labels.index(group)
+                secondary_idx = secondary_label_order.index(secondary_group)
+                row, column = (
+                    (group_idx, secondary_idx)
+                    if group_axis == "row"
+                    else (secondary_idx, group_idx)
+                )
+                if (row, column) in occupied_positions:
+                    raise ValueError("each groups and secondary_groups pair must be unique")
+                placements.append((image_idx, row, column))
+                occupied_positions.add((row, column))
+        else:
+            for group_idx, indices in enumerate(grouped_indices):
+                for sample_idx, image_idx in enumerate(indices):
+                    row, column = (
+                        (group_idx, sample_idx)
+                        if group_axis == "row"
+                        else (sample_idx, group_idx)
+                    )
+                    placements.append((image_idx, row, column))
+    else:
+        if dims is None:
+            dims = (4, int(np.ceil(image_count / 4)))
+        if dims[0] * dims[1] < image_count:
+            raise ValueError("dims does not contain enough cells for all images")
+        placements = [
+            (image_idx, image_idx // dims[1], image_idx % dims[1])
+            for image_idx in range(image_count)
+        ]
+
+    secondary_labels = {}
+    if secondary_groups is not None:
+        secondary_axis = 1 if group_axis == "row" else 0
+        for image_idx, row, column in placements:
+            position = (row, column)[secondary_axis]
+            label = secondary_groups[image_idx]
+            secondary_labels[position] = label
+
+    if image_dimensions is not None:
+        if any(width <= 0 or height <= 0 for width, height in image_dimensions):
+            raise ValueError("image_dimensions values must be greater than zero")
+        max_width = max(width for width, _ in image_dimensions)
+        max_height = max(height for _, height in image_dimensions)
+        if scale_bar is not None and scale_bar > max_width:
+            raise ValueError("scale_bar cannot be wider than the largest image")
+
+    if aspects is None:
+        aspects = [1 for _ in images]
+
+    fig = plt.figure()
+    has_column_headers = secondary_groups is not None and group_axis == "row"
+    header_rows = 1 if has_column_headers else 0
+    image_grid_rows = dims[0] * 5
+    grid_rows = image_grid_rows + header_rows
+    grid = fig.add_gridspec(
+        grid_rows,
+        dims[1] + 3,
+        width_ratios=[1] * dims[1] + [0.2, 0.18, 0.45],
+        height_ratios=([0.6] if has_column_headers else []) + [1] * image_grid_rows,
+    )
+    ax = np.array([
+        [
+            fig.add_subplot(grid[header_rows + row * 5:header_rows + (row + 1) * 5, column])
+            for column in range(dims[1])
+        ]
+        for row in range(dims[0])
+    ])
+    header_axes = {}
+    if has_column_headers:
+        for position, secondary_label in secondary_labels.items():
+            header_ax = fig.add_subplot(grid[0, position])
+            header_ax.text(
+                0.5, 0.5, secondary_label, transform=header_ax.transAxes,
+                color="white", weight="bold", ha="center", va="center",
+            )
+            header_ax.set_axis_off()
+            header_axes[position] = header_ax
+
+    cbar_start = header_rows + int(image_grid_rows * 0.1)
+    cbar_end = max(cbar_start + 1, header_rows + int(image_grid_rows * 0.65))
+    scale_start = max(cbar_end, header_rows + int(image_grid_rows * 0.75))
+    cbar_ax = fig.add_subplot(grid[cbar_start:cbar_end, dims[1] + 1])
+    scale_ax = fig.add_subplot(grid[scale_start:, dims[1]:])
+    scale_ax.set_axis_off()
+    panel_width = 2
+    panel_height = panel_width
+    if image_dimensions is not None:
+        panel_height = panel_width * max_height / max_width
+    legend_width = 1.2
+    title_height = 0.5 if title else 0
+    secondary_label_height = 0.4 if secondary_groups is not None and group_axis == "row" else 0
+    fig.set_size_inches(
+        dims[1] * panel_width + legend_width,
+        dims[0] * panel_height + title_height + secondary_label_height,
+    )
     fig.set_facecolor("#440154")
     if title:
         fig.suptitle(title,color='white')
     
-    scale_limit = 0
-    for image in images:
-        if np.percentile(image, cut_off) > scale_limit:
-            scale_limit = np.percentile(image, cut_off)
+    def get_image_cutoff(image:np.array):
+        """Returns the requested percentile, falling back to the image maximum."""
+        percentile_cutoff = np.percentile(image, cut_off)
+        return np.max(image) if percentile_cutoff == 0 else percentile_cutoff
+
+    image_cutoffs = [get_image_cutoff(image) for image in images]
+    global_cutoff = max(image_cutoffs)
+    row_cutoffs = {
+        row: max(image_cutoffs[idx] for idx, image_row, _ in placements if image_row == row)
+        for row in range(dims[0])
+        if any(image_row == row for _, image_row, _ in placements)
+    }
+    column_cutoffs = {
+        column: max(image_cutoffs[idx] for idx, _, image_column in placements if image_column == column)
+        for column in range(dims[1])
+        if any(image_column == column for _, _, image_column in placements)
+    }
     
-    for idx, (image, asp) in enumerate(zip(images,aspects)):
-        ax[idx].imshow(image, aspect=asp, vmax=scale_limit)
+    used_axes = set()
+    physical_axes = []
+    for idx, row, column in placements:
+        image_ax = ax[row, column]
+        image = images[idx]
+        scale_limit = {
+            "global": global_cutoff,
+            "row": row_cutoffs[row],
+            "column": column_cutoffs[column],
+            "image": image_cutoffs[idx],
+        }[color_scale]
+        if image_dimensions is None:
+            image_ax.imshow(image, aspect=aspects[idx], vmax=scale_limit)
+        else:
+            width, height = image_dimensions[idx]
+            x_offset = (max_width - width) / 2
+            y_offset = (max_height - height) / 2
+            image_ax.imshow(
+                image,
+                extent=(x_offset, x_offset + width, y_offset + height, y_offset),
+                aspect="auto",
+                vmax=scale_limit,
+            )
+            physical_axes.append(image_ax)
         if names:
-            ax[idx].set_title(names[idx],color='white')
-        ax[idx].set_axis_off()
+            image_ax.set_title(names[idx],color='white')
+        image_ax.set_axis_off()
+        used_axes.add((row, column))
     
-    for i in range(idx,len(ax)):
-        ax[i].set_axis_off()
-        ax[i].set_facecolor("#440154")
-    
-    add_cbar(ax[-1],fig,cut_off)
+    for row in range(dims[0]):
+        for column in range(dims[1]):
+            if (row, column) not in used_axes:
+                ax[row, column].set_axis_off()
+            ax[row, column].set_facecolor("#440154")
+
+    if groups is not None:
+        for group_idx, group_label in enumerate(group_labels):
+            if group_axis == "row":
+                ax[group_idx, 0].text(
+                    -0.08, 0.5, group_label, transform=ax[group_idx, 0].transAxes,
+                    color="white", weight="bold", rotation=90, ha="right", va="center",
+                )
+            else:
+                ax[0, group_idx].text(
+                    0.5, 1.18, group_label, transform=ax[0, group_idx].transAxes,
+                    color="white", weight="bold", ha="center", va="bottom",
+                )
+
+    if secondary_groups is not None:
+        for position, secondary_label in secondary_labels.items():
+            if group_axis == "column":
+                ax[position, 0].text(
+                    -0.18, 0.5, secondary_label, transform=ax[position, 0].transAxes,
+                    color="white", weight="bold", rotation=90, ha="right", va="center",
+                )
+
+    add_cbar(cbar_ax,cut_off)
+    scale_line = None
+    if scale_bar is not None:
+        scale_line = add_scale_bar(scale_ax, scale_bar, scale_units)
+
+    if image_dimensions is not None:
+        def on_draw(_event):
+            if update_physical_layout(physical_axes, scale_line):
+                fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect("draw_event", on_draw)
+        fig.canvas.draw()
 
     return fig
 

@@ -882,6 +882,41 @@ def rename_msi_dataset(
     return cleaned
 
 
+def delete_msi_dataset(
+    zarr_path: str | Path,
+    *,
+    table_key: str,
+) -> dict[str, list[str]]:
+    host_zarr_path = Path(zarr_path).expanduser()
+    sdata = sd.read_zarr(host_zarr_path)
+    specs = _infer_msi_dataset_specs(sdata)
+    selected = next((spec for spec in specs if str(spec["table_key"]) == str(table_key)), None)
+    if selected is None:
+        raise KeyError(f"MSI dataset table not found: {table_key}")
+
+    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
+    deleted: dict[str, list[str]] = {"tables": [], "images": [], "shapes": []}
+    element_keys = {
+        "tables": [str(selected["table_key"])],
+        "images": [str(selected["tic_key"])],
+        "shapes": [str(key) for key in selected.get("pixel_shape_keys", [])],
+    }
+
+    for element_type, keys in element_keys.items():
+        if element_type not in root:
+            continue
+        group = root[element_type]
+        for key in keys:
+            if key not in group:
+                continue
+            del group[key]
+            deleted[element_type].append(key)
+
+    if any(deleted.values()):
+        zarr.consolidate_metadata(str(host_zarr_path))
+    return deleted
+
+
 @dataclass
 class CoregistrationDataset:
     zarr_path: Path
@@ -2782,7 +2817,7 @@ def launch_coregistration_gui(
         keys: list[str] = []
         for state in datasets.values():
             for key in state["dataset"].sdata.shapes.keys():
-                if "pixels" in key.lower() or not key.startswith("anno_"):
+                if "pixels" in key.lower():
                     continue
                 if key not in keys:
                     keys.append(key)
@@ -2921,6 +2956,10 @@ def launch_coregistration_gui(
             rescale_geojson_annotations_widget.annotation_key.choices = choices
             if rescale_geojson_annotations_widget.annotation_key.value not in choices:
                 rescale_geojson_annotations_widget.annotation_key.value = choices[0]
+        if "remove_annotation_from_zarr_widget" in locals():
+            remove_annotation_from_zarr_widget.annotation_key.choices = choices
+            if remove_annotation_from_zarr_widget.annotation_key.value not in choices:
+                remove_annotation_from_zarr_widget.annotation_key.value = choices[0]
 
     def add_annotation_shape_layers(state: dict[str, Any], shape_keys: Iterable[str] | None = None):
         source_dataset = state["dataset"]
@@ -3023,6 +3062,22 @@ def launch_coregistration_gui(
                 pass
         refresh_annotation_widget_choices()
 
+    def remove_annotation_shape_layers_for_dataset(dataset_id: str):
+        remove_dataset_id = str(dataset_id)
+        for layer_name in list(annotation_shape_layers.keys()):
+            layer = annotation_shape_layers.get(layer_name)
+            if layer is None:
+                continue
+            metadata = _layer_metadata(layer)
+            if str(metadata.get("annotation_dataset_id", "")) != remove_dataset_id:
+                continue
+            annotation_shape_layers.pop(layer_name, None)
+            try:
+                viewer.layers.remove(layer)
+            except Exception:
+                pass
+        refresh_annotation_widget_choices()
+
     initial_state = next(iter(datasets.values()))
     active_dataset_label = str(initial_state["id"])
     initial_state["ion_layer"].visible = True
@@ -3054,13 +3109,9 @@ def launch_coregistration_gui(
         state = get_active_state()
         coreg_dataset = state["dataset"]
         indices = coreg_dataset.find_feature_indices_from_mz(float(target_mz), float(ppm_tolerance))
-        if indices.size == 0:
-            idx, _ = coreg_dataset.find_feature_idx_from_mz(float(target_mz), float("inf"))
-            if idx is None:
-                return
-            indices = np.array([idx], dtype=int)
-        nearest_local = int(np.argmin(np.abs(coreg_dataset.mz_values[indices] - float(target_mz))))
-        state["current_feature_idx"] = int(indices[nearest_local])
+        if indices.size:
+            nearest_local = int(np.argmin(np.abs(coreg_dataset.mz_values[indices] - float(target_mz))))
+            state["current_feature_idx"] = int(indices[nearest_local])
         state["current_feature_indices"] = np.asarray(indices, dtype=int)
         state["current_target_mz"] = float(target_mz)
         state["current_ppm_tolerance"] = float(ppm_tolerance)
@@ -3069,10 +3120,15 @@ def launch_coregistration_gui(
             normalize_to_tic=state["current_normalize_to_tic"],
         )
         state["ion_layer"].data = prepare_ion_for_display(img)
-        if len(state["current_feature_indices"]) > 1:
+        if len(state["current_feature_indices"]) == 0:
+            state["ion_layer"].name = (
+                f"{state['label']} m/z {float(target_mz):.4f} "
+                f"+/- {float(ppm_tolerance):.1f} ppm (no features)"
+            )
+        elif len(state["current_feature_indices"]) > 1:
             state["ion_layer"].name = f"{state['label']} m/z {float(target_mz):.4f} +/- {float(ppm_tolerance):.1f} ppm"
         else:
-            state["ion_layer"].name = f"{state['label']} m/z {coreg_dataset.mz_values[state['current_feature_idx']]:.4f}"
+            state["ion_layer"].name = f"{state['label']} m/z {float(target_mz):.4f}"
         apply_ion_contrast_to_active_layer(img)
         if current_mz_line is not None:
             current_mz_line.set_xdata([float(target_mz), float(target_mz)])
@@ -5436,6 +5492,98 @@ def launch_coregistration_gui(
     if_export_csv_button.clicked.connect(export_if_settings_csv)
     if_import_csv_button.clicked.connect(import_if_settings_csv)
 
+    def _confirm_data_delete(title: str, message: str) -> bool:
+        result = QMessageBox.question(
+            None,
+            title,
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return result == QMessageBox.Yes
+
+    def _remove_viewer_layer(layer):
+        if layer is None:
+            return
+        try:
+            viewer.layers.remove(layer)
+        except Exception:
+            pass
+
+    @magicgui(
+        dataset={"widget_type": "ComboBox", "choices": current_dataset_choices()},
+        call_button="Remove MSI Dataset From Zarr",
+    )
+    def remove_msi_dataset_from_zarr_widget(dataset: str = initial_active_choice):
+        nonlocal active_dataset_label
+        dataset_key = dataset_key_from_choice(str(dataset))
+        if dataset_key is None or dataset_key not in datasets:
+            return
+        if len(datasets) <= 1:
+            QMessageBox.warning(None, "Remove MSI Dataset", "At least one MSI dataset must remain open in the viewer.")
+            return
+        state = datasets[dataset_key]
+        if not _confirm_data_delete(
+            "Remove MSI Dataset",
+            (
+                f"Remove MSI dataset '{state['label']}' from the zarr?\n\n"
+                "This deletes its table, TIC image, and MSI pixel shapes. Annotation shapes are not deleted."
+            ),
+        ):
+            return
+
+        deleted = _run_with_busy_dialog(
+            "Remove MSI Dataset",
+            "Deleting MSI dataset from zarr...",
+            lambda: delete_msi_dataset(state["dataset"].zarr_path, table_key=state["dataset"].table_key),
+        )
+        if not any(deleted.values()):
+            QMessageBox.warning(None, "Remove MSI Dataset", "No matching MSI dataset components were deleted.")
+            return
+
+        remove_annotation_shape_layers_for_dataset(dataset_key)
+        for layer_key in (
+            "ion_layer",
+            "msi_landmarks",
+            "roi_mask_layer",
+            "selected_annotation_mask_layer",
+            "threshold_preview_layer",
+            "optimization_preview_layer",
+        ):
+            _remove_viewer_layer(state.get(layer_key))
+        datasets.pop(dataset_key, None)
+        for other_state in datasets.values():
+            other_state["dataset"].sdata = sd.read_zarr(other_state["dataset"].zarr_path)
+        if str(active_dataset_label) == str(dataset_key):
+            active_dataset_label = str(next(iter(datasets.keys())))
+            datasets[active_dataset_label]["ion_layer"].visible = True
+        sync_controls_to_active_dataset()
+
+    @magicgui(
+        annotation_key={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Remove Annotation From Zarr",
+    )
+    def remove_annotation_from_zarr_widget(annotation_key: str = "(none)"):
+        if annotation_key == "(none)":
+            return
+        if not _confirm_data_delete(
+            "Remove Annotation",
+            f"Remove annotation '{annotation_key}' from the zarr?",
+        ):
+            return
+        deleted = _run_with_busy_dialog(
+            "Remove Annotation",
+            "Deleting annotation from zarr...",
+            lambda: delete_geojson_annotations(host_zarr_path, [annotation_key]),
+        )
+        if not deleted:
+            QMessageBox.warning(None, "Remove Annotation", "No matching annotation was deleted.")
+            return
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+        remove_annotation_shape_layers(deleted)
+        sync_controls_to_active_dataset()
+
     def sync_controls_to_active_dataset():
         state = get_active_state()
         coreg_dataset = state["dataset"]
@@ -5445,6 +5593,9 @@ def launch_coregistration_gui(
             choice = dataset_choice_text(item)
             dataset_choice_to_key[choice] = str(item["id"])
             ordered_choices.append(choice)
+        remove_msi_dataset_from_zarr_widget.dataset.choices = ordered_choices if ordered_choices else [""]
+        if remove_msi_dataset_from_zarr_widget.dataset.value not in remove_msi_dataset_from_zarr_widget.dataset.choices:
+            remove_msi_dataset_from_zarr_widget.dataset.value = dataset_choice_text(state)
         copy_affine_to_target_widget.target_dataset.choices = ordered_choices
         rename_dataset_widget.display_name.value = str(state["label"])
         target_choices = [choice for choice in ordered_choices if dataset_choice_to_key.get(choice) != str(state["id"])]
@@ -5777,13 +5928,13 @@ def launch_coregistration_gui(
     controls_layout.setContentsMargins(6, 6, 6, 6)
     controls_layout.setSpacing(8)
     controls_layout.addWidget(spectrum_widget)
+    controls_layout.addWidget(mz_selector.native)
+    controls_layout.addWidget(ion_display_options.native)
     controls_layout.addWidget(reset_canvas_view_widget.native)
     controls_layout.addWidget(export_current_view_widget.native)
     controls_layout.addWidget(rename_dataset_widget.native)
     controls_layout.addWidget(copy_affine_to_target_widget.native)
     controls_layout.addWidget(msi_layer_controls)
-    controls_layout.addWidget(ion_display_options.native)
-    controls_layout.addWidget(mz_selector.native)
     controls_layout.addWidget(roi_mask_controls.native)
     controls_layout.addWidget(export_msi_from_roi_widget.native)
     controls_layout.addWidget(annotation_display_controls.native)
@@ -6010,8 +6161,37 @@ def launch_coregistration_gui(
 
     add_data_button.clicked.connect(open_add_data_dialog)
 
+    data_management_launcher = QWidget()
+    data_management_launcher_layout = QVBoxLayout(data_management_launcher)
+    data_management_launcher_layout.setContentsMargins(6, 6, 6, 6)
+    data_management_launcher_layout.setSpacing(6)
+    data_management_button = QPushButton("Open Data Management")
+    data_management_launcher_layout.addWidget(data_management_button)
+    data_management_launcher_layout.addWidget(QLabel("Remove MSI datasets or annotations from the zarr"))
+    data_management_launcher_layout.addStretch(1)
+
+    data_management_dialog = QDialog()
+    data_management_dialog.setWindowTitle("Data Management")
+    data_management_dialog.setModal(False)
+    data_management_dialog.resize(500, 260)
+    data_management_dialog_layout = QVBoxLayout(data_management_dialog)
+    data_management_dialog_layout.setContentsMargins(8, 8, 8, 8)
+    data_management_dialog_layout.setSpacing(8)
+    data_management_dialog_layout.addWidget(remove_msi_dataset_from_zarr_widget.native)
+    data_management_dialog_layout.addWidget(remove_annotation_from_zarr_widget.native)
+    data_management_dialog_layout.addStretch(1)
+
+    def open_data_management_dialog():
+        sync_controls_to_active_dataset()
+        data_management_dialog.show()
+        data_management_dialog.raise_()
+        data_management_dialog.activateWindow()
+
+    data_management_button.clicked.connect(open_data_management_dialog)
+
     viewer.window.add_dock_widget(controls_scroll, area="right", name="Controls")
     viewer.window.add_dock_widget(add_data_launcher, area="left", name="Add Data")
+    viewer.window.add_dock_widget(data_management_launcher, area="left", name="Data Management")
     viewer.window.add_dock_widget(if_launcher, area="right", name="IF Display")
     viewer.window.add_dock_widget(threshold_launcher, area="right", name="MSI Threshold")
     viewer.window.add_dock_widget(if_threshold_launcher, area="right", name="IF Threshold")
