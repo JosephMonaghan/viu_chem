@@ -41,8 +41,11 @@ def test_draw_grid_groups_samples_by_row():
     )
 
     image_axes = fig.axes[:4]
-    assert [axis.get_title() for axis in image_axes] == ["A1", "A2", "B1", "B2"]
-    assert [text.get_text() for axis in image_axes for text in axis.texts] == ["A", "B"]
+    title_axes = fig.axes[4:8]
+    row_label_axes = fig.axes[8:10]
+    assert [text.get_text() for axis in title_axes for text in axis.texts] == ["A1", "A2", "B1", "B2"]
+    assert [text.get_text() for axis in row_label_axes for text in axis.texts] == ["A", "B"]
+    assert all(title_ax.get_position().y0 >= image_ax.get_position().y1 for title_ax, image_ax in zip(title_axes, image_axes))
     plt.close(fig)
 
 
@@ -57,8 +60,10 @@ def test_draw_grid_groups_samples_by_column():
     )
 
     image_axes = fig.axes[:4]
-    assert [axis.get_title() for axis in image_axes] == ["A1", "B1", "A2", "B2"]
-    assert [text.get_text() for axis in image_axes for text in axis.texts] == ["A", "B"]
+    title_axes = fig.axes[4:8]
+    header_axes = fig.axes[8:10]
+    assert [text.get_text() for axis in title_axes for text in axis.texts] == ["A1", "B1", "A2", "B2"]
+    assert [text.get_text() for axis in header_axes for text in axis.texts] == ["A", "B"]
     plt.close(fig)
 
 
@@ -74,13 +79,62 @@ def test_draw_grid_adds_secondary_group_labels():
     )
 
     image_axes = fig.axes[:4]
-    header_axes = fig.axes[4:6]
-    assert [text.get_text() for axis in image_axes for text in axis.texts] == ["Day 1", "Day 3"]
+    title_axes = fig.axes[4:8]
+    header_axes = fig.axes[8:10]
+    row_label_axes = fig.axes[10:12]
+    assert [text.get_text() for axis in row_label_axes for text in axis.texts] == ["Day 1", "Day 3"]
     assert [text.get_text() for axis in header_axes for text in axis.texts] == ["A", "B"]
-    assert [axis.get_title() for axis in image_axes] == ["Day1_A", "Day1_B", "Day3_A", "Day3_B"]
+    assert [text.get_text() for axis in title_axes for text in axis.texts] == [
+        "Day1_A", "Day1_B", "Day3_A", "Day3_B",
+    ]
     fig.canvas.draw()
     assert all(axis.get_position().y0 > image_axes[0].get_position().y1 for axis in header_axes)
     plt.close(fig)
+
+
+def test_draw_grid_wraps_long_row_labels_into_balanced_lines():
+    fig = msi.drawGrid(
+        [np.ones((2, 2)) for _ in range(3)],
+        groups=["Dual Treatment CD73i", "Vehicle Control", "CAIXi"],
+        group_axis="row",
+    )
+
+    row_labels = [text.get_text() for axis in fig.axes for text in axis.texts]
+    assert "Dual Treatment\nCD73i" in row_labels
+    assert "Vehicle\nControl" in row_labels
+    assert "CAIXi" in row_labels
+    plt.close(fig)
+
+
+def test_draw_grid_respects_primary_and_secondary_group_order():
+    fig = msi.drawGrid(
+        [np.ones((2, 2)) * value for value in range(1, 5)],
+        names=["Day1_A", "Day3_B", "Day1_B", "Day3_A"],
+        groups=["Day 1", "Day 3", "Day 1", "Day 3"],
+        group_axis="row",
+        secondary_groups=["A", "B", "B", "A"],
+        group_order=["Day 3", "Day 1"],
+        secondary_group_order=["B", "A"],
+    )
+
+    title_axes = fig.axes[4:8]
+    header_axes = fig.axes[8:10]
+    row_label_axes = fig.axes[10:12]
+    assert [text.get_text() for axis in title_axes for text in axis.texts] == [
+        "Day3_B", "Day3_A", "Day1_B", "Day1_A",
+    ]
+    assert [text.get_text() for axis in header_axes for text in axis.texts] == ["B", "A"]
+    assert [text.get_text() for axis in row_label_axes for text in axis.texts] == ["Day 3", "Day 1"]
+    plt.close(fig)
+
+
+def test_draw_grid_rejects_unknown_group_order_labels():
+    with pytest.raises(ValueError, match="unknown labels"):
+        msi.drawGrid(
+            [np.ones((2, 2))],
+            groups=["Control"],
+            group_order=["Treatment"],
+        )
 
 
 def test_draw_grid_rejects_inconsistent_secondary_group_labels():
@@ -225,7 +279,9 @@ def test_draw_grid_accepts_pandas_series_with_nondefault_indexes():
         names=names,
     )
 
-    assert [axis.get_title() for axis in fig.axes[:4]] == ["Day1_A", "Day1_B", "Day3_A", "Day3_B"]
+    assert [text.get_text() for axis in fig.axes[4:8] for text in axis.texts] == [
+        "Day1_A", "Day1_B", "Day3_A", "Day3_B",
+    ]
     plt.close(fig)
 
 

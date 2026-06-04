@@ -267,6 +267,8 @@ def drawGrid(
     groups:list[str]=None,
     group_axis:str="row",
     secondary_groups:list[str]=None,
+    group_order:list[str]=None,
+    secondary_group_order:list[str]=None,
     image_dimensions:list[tuple[float,float]]=None,
     scale_bar:float=None,
     scale_units:str="µm",
@@ -283,6 +285,8 @@ def drawGrid(
     :param groups: Group label for each image
     :param group_axis: Axis on which to arrange groups, either row or column
     :param secondary_groups: Labels for the sample positions perpendicular to group_axis
+    :param group_order: Optional preferred ordering for primary group labels
+    :param secondary_group_order: Optional preferred ordering for secondary group labels
     :param image_dimensions: Physical (width, height) of each image
     :param scale_bar: Physical length of a global scale bar
     :param scale_units: Units displayed on the global scale bar
@@ -372,6 +376,8 @@ def drawGrid(
     names = list(names) if names is not None else None
     groups = list(groups) if groups is not None else None
     secondary_groups = list(secondary_groups) if secondary_groups is not None else None
+    group_order = list(group_order) if group_order is not None else None
+    secondary_group_order = list(secondary_group_order) if secondary_group_order is not None else None
     image_dimensions = list(image_dimensions) if image_dimensions is not None else None
 
     if len(images) == 0:
@@ -400,13 +406,46 @@ def drawGrid(
         raise ValueError("image_dimensions must be supplied when using scale_bar")
     if scale_bar is not None and scale_bar <= 0:
         raise ValueError("scale_bar must be greater than zero")
+    if group_order is not None and groups is None:
+        raise ValueError("groups must be supplied when using group_order")
+    if secondary_group_order is not None and secondary_groups is None:
+        raise ValueError("secondary_groups must be supplied when using secondary_group_order")
+
+    def ordered_labels(values:list[str], preferred_order:list[str]=None):
+        """Returns unique labels with an optional preferred prefix ordering."""
+        encountered = list(dict.fromkeys(values))
+        if preferred_order is None:
+            return encountered
+        preferred = list(dict.fromkeys(preferred_order))
+        unknown = [label for label in preferred if label not in encountered]
+        if unknown:
+            raise ValueError(f"group order contains unknown labels: {unknown}")
+        return preferred + [label for label in encountered if label not in preferred]
+
+    def wrap_row_label(label:str, max_line_length:int=13):
+        """Wraps long row labels into two balanced lines."""
+        label = str(label)
+        if "\n" in label or len(label) <= max_line_length:
+            return label
+        words = label.split()
+        if len(words) < 2:
+            return label
+        candidates = [
+            (" ".join(words[:split_idx]), " ".join(words[split_idx:]))
+            for split_idx in range(1, len(words))
+        ]
+        first, second = min(
+            candidates,
+            key=lambda lines: (max(map(len, lines)), abs(len(lines[0]) - len(lines[1]))),
+        )
+        return f"{first}\n{second}"
 
     placements = []
     group_labels = []
     if groups is not None:
-        group_labels = list(dict.fromkeys(groups))
+        group_labels = ordered_labels(groups, group_order)
         if secondary_groups is not None:
-            secondary_label_order = list(dict.fromkeys(secondary_groups))
+            secondary_label_order = ordered_labels(secondary_groups, secondary_group_order)
             minimum_dims = (
                 (len(group_labels), len(secondary_label_order))
                 if group_axis == "row"
@@ -478,50 +517,122 @@ def drawGrid(
         aspects = [1 for _ in images]
 
     fig = plt.figure()
-    has_column_headers = secondary_groups is not None and group_axis == "row"
+    has_column_headers = (
+        (groups is not None and group_axis == "column")
+        or (secondary_groups is not None and group_axis == "row")
+    )
+    has_row_labels = (
+        (groups is not None and group_axis == "row")
+        or (secondary_groups is not None and group_axis == "column")
+    )
     header_rows = 1 if has_column_headers else 0
-    image_grid_rows = dims[0] * 5
+    title_rows = 1 if names is not None else 0
+    row_block = title_rows + 5
+    image_grid_rows = dims[0] * row_block
     grid_rows = image_grid_rows + header_rows
+    data_start_column = 1 if has_row_labels else 0
+    legend_start_column = data_start_column + dims[1]
+    height_ratios = [0.4] if has_column_headers else []
+    for _ in range(dims[0]):
+        if names is not None:
+            height_ratios.append(0.35)
+        height_ratios.extend([1] * 5)
     grid = fig.add_gridspec(
         grid_rows,
-        dims[1] + 3,
-        width_ratios=[1] * dims[1] + [0.2, 0.18, 0.45],
-        height_ratios=([0.6] if has_column_headers else []) + [1] * image_grid_rows,
+        data_start_column + dims[1] + 3,
+        width_ratios=([0.5] if has_row_labels else []) + [1] * dims[1] + [0.2, 0.18, 0.45],
+        height_ratios=height_ratios,
     )
     ax = np.array([
         [
-            fig.add_subplot(grid[header_rows + row * 5:header_rows + (row + 1) * 5, column])
+            fig.add_subplot(
+                grid[
+                    header_rows + row * row_block + title_rows:
+                    header_rows + (row + 1) * row_block,
+                    data_start_column + column,
+                ]
+            )
             for column in range(dims[1])
         ]
         for row in range(dims[0])
     ])
+
+    title_axes = {}
+    if names is not None:
+        image_idx_by_position = {(row, column): image_idx for image_idx, row, column in placements}
+        for row in range(dims[0]):
+            for column in range(dims[1]):
+                image_idx = image_idx_by_position.get((row, column))
+                if image_idx is None:
+                    continue
+                title_ax = fig.add_subplot(
+                    grid[header_rows + row * row_block, data_start_column + column]
+                )
+                title_ax.text(
+                    0.5, 0.5, str(names[image_idx]), transform=title_ax.transAxes,
+                    color="white", ha="center", va="center",
+                )
+                title_ax.set_axis_off()
+                title_axes[(row, column)] = title_ax
+
     header_axes = {}
     if has_column_headers:
-        for position, secondary_label in secondary_labels.items():
-            header_ax = fig.add_subplot(grid[0, position])
+        column_labels = group_labels if group_axis == "column" else secondary_labels
+        column_label_items = (
+            enumerate(column_labels)
+            if isinstance(column_labels, list)
+            else sorted(column_labels.items())
+        )
+        for position, column_label in column_label_items:
+            header_ax = fig.add_subplot(grid[0, data_start_column + position])
             header_ax.text(
-                0.5, 0.5, secondary_label, transform=header_ax.transAxes,
+                0.5, 0.5, str(column_label), transform=header_ax.transAxes,
                 color="white", weight="bold", ha="center", va="center",
             )
             header_ax.set_axis_off()
             header_axes[position] = header_ax
 
+    row_label_axes = {}
+    if has_row_labels:
+        row_labels = group_labels if group_axis == "row" else secondary_labels
+        row_label_items = (
+            enumerate(row_labels)
+            if isinstance(row_labels, list)
+            else sorted(row_labels.items())
+        )
+        for position, row_label in row_label_items:
+            label_ax = fig.add_subplot(
+                grid[
+                    header_rows + position * row_block:
+                    header_rows + (position + 1) * row_block,
+                    0,
+                ]
+            )
+            wrapped_label = wrap_row_label(row_label)
+            label_ax.text(
+                0.5, 0.5, wrapped_label, transform=label_ax.transAxes,
+                color="white", weight="bold", rotation=90, ha="center", va="center",
+            )
+            label_ax.set_axis_off()
+            row_label_axes[position] = label_ax
+
     cbar_start = header_rows + int(image_grid_rows * 0.1)
     cbar_end = max(cbar_start + 1, header_rows + int(image_grid_rows * 0.65))
     scale_start = max(cbar_end, header_rows + int(image_grid_rows * 0.75))
-    cbar_ax = fig.add_subplot(grid[cbar_start:cbar_end, dims[1] + 1])
-    scale_ax = fig.add_subplot(grid[scale_start:, dims[1]:])
+    cbar_ax = fig.add_subplot(grid[cbar_start:cbar_end, legend_start_column + 1])
+    scale_ax = fig.add_subplot(grid[scale_start:, legend_start_column:])
     scale_ax.set_axis_off()
     panel_width = 2
     panel_height = panel_width
     if image_dimensions is not None:
         panel_height = panel_width * max_height / max_width
     legend_width = 1.2
+    row_label_width = 0.8 if has_row_labels else 0
     title_height = 0.5 if title else 0
-    secondary_label_height = 0.4 if secondary_groups is not None and group_axis == "row" else 0
+    column_label_height = 0.4 if has_column_headers else 0
     fig.set_size_inches(
-        dims[1] * panel_width + legend_width,
-        dims[0] * panel_height + title_height + secondary_label_height,
+        dims[1] * panel_width + legend_width + row_label_width,
+        dims[0] * panel_height + title_height + column_label_height,
     )
     fig.set_facecolor("#440154")
     if title:
@@ -569,8 +680,6 @@ def drawGrid(
                 vmax=scale_limit,
             )
             physical_axes.append(image_ax)
-        if names:
-            image_ax.set_title(names[idx],color='white')
         image_ax.set_axis_off()
         used_axes.add((row, column))
     
@@ -579,27 +688,6 @@ def drawGrid(
             if (row, column) not in used_axes:
                 ax[row, column].set_axis_off()
             ax[row, column].set_facecolor("#440154")
-
-    if groups is not None:
-        for group_idx, group_label in enumerate(group_labels):
-            if group_axis == "row":
-                ax[group_idx, 0].text(
-                    -0.08, 0.5, group_label, transform=ax[group_idx, 0].transAxes,
-                    color="white", weight="bold", rotation=90, ha="right", va="center",
-                )
-            else:
-                ax[0, group_idx].text(
-                    0.5, 1.18, group_label, transform=ax[0, group_idx].transAxes,
-                    color="white", weight="bold", ha="center", va="bottom",
-                )
-
-    if secondary_groups is not None:
-        for position, secondary_label in secondary_labels.items():
-            if group_axis == "column":
-                ax[position, 0].text(
-                    -0.18, 0.5, secondary_label, transform=ax[position, 0].transAxes,
-                    color="white", weight="bold", rotation=90, ha="right", va="center",
-                )
 
     add_cbar(cbar_ax,cut_off)
     scale_line = None
