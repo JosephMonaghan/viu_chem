@@ -276,6 +276,7 @@ def drawGrid(
     color_scale:str="global",
     ignore_zeros:bool=True,
     cmap:str | mcolors.Colormap="viridis",
+    show_overflow_ratio:bool=True,
 ):
     """Draws a grid of ion images with a shared intensity scale and colorbar.
     
@@ -297,6 +298,7 @@ def drawGrid(
     :param color_scale: Shared color scaling scope: global, row, column, or image/none
     :param ignore_zeros: Whether to exclude zero-valued pixels from percentile scaling
     :param cmap: Matplotlib colormap name or colormap object
+    :param show_overflow_ratio: Whether to label overflow above the colorbar
     :return fig: Populated matplotlib figure"""
 
     def format_cbar_value(value:float, overflow:bool=False):
@@ -306,7 +308,14 @@ def drawGrid(
             mantissa = value / 10 ** exponent
             suffix = "+" if overflow else ""
             return rf"${mantissa:.2f} \times 10^{{{exponent}}}{suffix}$"
-        return f"{value:.2g}{'+' if overflow else ''}"
+        formatted = np.format_float_positional(
+            value,
+            precision=2,
+            unique=False,
+            fractional=False,
+            trim="-",
+        )
+        return f"{formatted}{'+' if overflow else ''}"
 
     def add_cbar(
         cbar_ax:plt.Axes,
@@ -314,6 +323,7 @@ def drawGrid(
         upper_cbar_cutoff:float=95,
         actual_limits:tuple[float,float]=None,
         has_overflow:bool=False,
+        overflow_label:str=None,
     ):
         """Adds an intensity or percentile colorbar to an ion image grid.
         
@@ -321,8 +331,11 @@ def drawGrid(
         :param lower_cbar_cutoff: Lower percentile label for the colorbar
         :param upper_cbar_cutoff: Upper percentile label for the colorbar
         :param actual_limits: Shared intensity limits to label instead of percentiles
-        :param has_overflow: Whether to show a cap for values above the displayed range"""
-        bar_top = 0.92 if has_overflow else 1
+        :param has_overflow: Whether to show a cap for values above the displayed range
+        :param overflow_label: Maximum or relative overflow label to show above the cap"""
+        has_overflow_label = overflow_label is not None
+        triangle_top = 0.9 if has_overflow_label else 1
+        bar_top = triangle_top - 0.08 if has_overflow else 1
         cbar_ax.set_facecolor(background_color)
         gradient = np.linspace(0, 1, 256).reshape(-1, 1)
         cbar_ax.imshow(
@@ -334,10 +347,20 @@ def drawGrid(
         )
         if has_overflow:
             cbar_ax.add_patch(mpl.patches.Polygon(
-                [(0, bar_top), (0.5, 1), (1, bar_top)],
+                [(0, bar_top), (0.5, triangle_top), (1, bar_top)],
                 facecolor=cmap_obj(1.0),
                 edgecolor="none",
             ))
+            if has_overflow_label:
+                cbar_ax.text(
+                    0.5,
+                    0.97,
+                    overflow_label,
+                    color=foreground_color,
+                    fontsize=max(mpl.rcParams["font.size"] - 4, 1),
+                    ha="center",
+                    va="center",
+                )
         for spine in cbar_ax.spines.values():
             spine.set_visible(False)
         label_font_size = mpl.font_manager.FontProperties(
@@ -370,8 +393,6 @@ def drawGrid(
                 format_cbar_value(midpoint),
                 format_cbar_value(upper_limit, overflow=has_overflow),
             ]
-        if has_overflow and actual_limits is None:
-            labels[-1] += "+"
         cbar_ax.set_yticks(
             [0, bar_top / 2, bar_top],
             labels=labels,
@@ -752,11 +773,26 @@ def drawGrid(
             lower_limit = float(upper_limit) - 1e-9
         return lower_limit, upper_limit
 
+    def get_scope_overflow_ratio(image_indices:list[int], limits:tuple[float,float]):
+        """Returns the maximum value as a ratio of a scope's displayed upper limit."""
+        upper_limit = limits[1]
+        finite_values = np.concatenate([
+            values[np.isfinite(values)]
+            for idx in image_indices
+            for values in [np.asarray(images[idx]).ravel()]
+        ])
+        if finite_values.size == 0 or upper_limit <= 0:
+            return 1
+        return max(float(np.max(finite_values) / upper_limit), 1)
+
     image_limits = [get_scope_limits([idx]) for idx in range(image_count)]
     global_limits = get_scope_limits(list(range(image_count)))
-    global_has_overflow = any(
-        np.any(np.asarray(image)[np.isfinite(image)] > global_limits[1])
+    global_overflow_ratio = get_scope_overflow_ratio(list(range(image_count)), global_limits)
+    global_maximum = max(
+        float(np.max(values[np.isfinite(values)]))
         for image in images
+        for values in [np.asarray(image).ravel()]
+        if np.any(np.isfinite(values))
     )
     row_limits = {
         row: get_scope_limits([idx for idx, image_row, _ in placements if image_row == row])
@@ -768,6 +804,39 @@ def drawGrid(
         for column in range(dims[1])
         if any(image_column == column for _, _, image_column in placements)
     }
+    row_overflow_ratios = {
+        row: get_scope_overflow_ratio(
+            [idx for idx, image_row, _ in placements if image_row == row],
+            limits,
+        )
+        for row, limits in row_limits.items()
+    }
+    column_overflow_ratios = {
+        column: get_scope_overflow_ratio(
+            [idx for idx, _, image_column in placements if image_column == column],
+            limits,
+        )
+        for column, limits in column_limits.items()
+    }
+    image_overflow_ratios = [
+        get_scope_overflow_ratio([idx], limits)
+        for idx, limits in enumerate(image_limits)
+    ]
+    relative_overflow_ratio = max({
+        "row": row_overflow_ratios.values(),
+        "column": column_overflow_ratios.values(),
+        "image": image_overflow_ratios,
+    }.get(color_scale, [1]))
+    cbar_overflow_ratio = (
+        global_overflow_ratio if color_scale == "global" else relative_overflow_ratio
+    )
+    overflow_label = None
+    if show_overflow_ratio and cbar_overflow_ratio > 1:
+        overflow_label = (
+            format_cbar_value(global_maximum)
+            if color_scale == "global"
+            else f"{relative_overflow_ratio:.0%}"
+        )
     
     used_axes = set()
     physical_axes = []
@@ -815,7 +884,8 @@ def drawGrid(
         lower_cut_off,
         cut_off,
         actual_limits=global_limits if color_scale == "global" else None,
-        has_overflow=global_has_overflow if color_scale == "global" else False,
+        has_overflow=cbar_overflow_ratio > 1,
+        overflow_label=overflow_label,
     )
     scale_line = None
     if scale_bar is not None:

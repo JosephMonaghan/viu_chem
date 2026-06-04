@@ -278,6 +278,7 @@ def test_draw_grid_lower_cutoff_can_be_configured():
     cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
     assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["21", "50", "80+"]
     assert len(cbar_ax.patches) == 1
+    assert cbar_ax.texts[0].get_text() == "100"
     plt.close(fig)
 
 
@@ -288,7 +289,64 @@ def test_draw_grid_non_global_colorbar_uses_percentile_labels():
 
     cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
     assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["0%", "50%", "100%"]
-    assert len(cbar_ax.patches) == 0
+    assert len(cbar_ax.patches) == 1
+    assert cbar_ax.texts[0].get_text() == "125%"
+    plt.close(fig)
+
+
+def test_draw_grid_relative_colorbar_reports_largest_scope_overflow():
+    images = [
+        np.arange(1, 101).reshape(10, 10),
+        np.arange(1, 201, 2).reshape(10, 10),
+    ]
+
+    fig = msi.drawGrid(images, dims=(1, 2), cut_off=50, color_scale="image")
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    expected_ratio = max(
+        np.max(image) / np.percentile(image, 50)
+        for image in images
+    )
+    assert cbar_ax.texts[0].get_text() == f"{expected_ratio:.0%}"
+    assert cbar_ax.texts[0].get_color() == "white"
+    assert cbar_ax.texts[0].get_position()[1] > max(
+        point[1] for point in cbar_ax.patches[0].get_xy()
+    )
+    plt.close(fig)
+
+
+def test_draw_grid_can_suppress_relative_overflow_ratio_label():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image], cut_off=50, color_scale="image", show_overflow_ratio=False)
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert len(cbar_ax.patches) == 1
+    assert len(cbar_ax.texts) == 0
+    plt.close(fig)
+
+
+def test_draw_grid_global_colorbar_reports_absolute_maximum_above_cap():
+    image = np.linspace(0, 2_000_000, 100).reshape(10, 10)
+
+    fig = msi.drawGrid([image], cut_off=80)
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert cbar_ax.texts[0].get_text() == r"$2.00 \times 10^{6}$"
+    assert cbar_ax.texts[0].get_position()[1] > max(
+        point[1] for point in cbar_ax.patches[0].get_xy()
+    )
+    plt.close(fig)
+
+
+def test_draw_grid_can_suppress_global_maximum_label():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image], show_overflow_ratio=False)
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert len(cbar_ax.patches) == 1
+    assert len(cbar_ax.texts) == 0
     plt.close(fig)
 
 
