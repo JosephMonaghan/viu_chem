@@ -243,6 +243,37 @@ def test_draw_grid_color_scaling_scope(color_scale, expected_limits):
     plt.close(fig)
 
 
+def test_draw_grid_global_color_scale_shares_lower_and_upper_limits():
+    images = [
+        np.arange(1, 101).reshape(10, 10),
+        np.arange(101, 201).reshape(10, 10),
+    ]
+
+    fig = msi.drawGrid(images, dims=(1, 2), lower_cut_off=5, cut_off=95)
+
+    pooled = np.concatenate([image.ravel() for image in images])
+    expected_limits = (np.percentile(pooled, 5), np.percentile(pooled, 95))
+    assert [axis.images[0].get_clim() for axis in fig.axes[:2]] == [
+        expected_limits,
+        expected_limits,
+    ]
+    plt.close(fig)
+
+
+def test_draw_grid_lower_cutoff_can_be_configured():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image], lower_cut_off=20, cut_off=80)
+
+    assert fig.axes[0].images[0].get_clim() == (
+        pytest.approx(np.percentile(image, 20)),
+        pytest.approx(np.percentile(image, 80)),
+    )
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["20th", "80th"]
+    plt.close(fig)
+
+
 def test_draw_grid_zero_percentile_cutoff_falls_back_to_image_maximum():
     sparse_image = np.zeros((10, 10))
     sparse_image[0, 0] = 25
@@ -250,6 +281,48 @@ def test_draw_grid_zero_percentile_cutoff_falls_back_to_image_maximum():
     fig = msi.drawGrid([sparse_image], cut_off=90, color_scale="image")
 
     assert fig.axes[0].images[0].get_clim()[1] == 25
+    plt.close(fig)
+
+
+def test_draw_grid_global_cutoff_uses_pooled_dataset_percentile():
+    sparse_outlier = np.zeros((10, 10))
+    sparse_outlier[0, 0] = 100
+    dense_image = np.ones((10, 10)) * 10
+
+    fig = msi.drawGrid([sparse_outlier, dense_image], dims=(1, 2), cut_off=80)
+
+    expected_cutoff = np.percentile(np.concatenate(([100], np.full(100, 10))), 80)
+    assert [axis.images[0].get_clim()[1] for axis in fig.axes[:2]] == [expected_cutoff, expected_cutoff]
+    plt.close(fig)
+
+
+def test_draw_grid_global_zero_percentile_falls_back_to_pooled_maximum():
+    images = [np.zeros((10, 10)), np.zeros((10, 10))]
+    images[1][0, 0] = 25
+
+    fig = msi.drawGrid(images, dims=(1, 2), cut_off=80)
+
+    assert [axis.images[0].get_clim()[1] for axis in fig.axes[:2]] == [25, 25]
+    plt.close(fig)
+
+
+def test_draw_grid_percentile_cutoff_ignores_zero_background():
+    image = np.zeros((10, 10))
+    image.ravel()[:20] = np.arange(1, 21)
+
+    fig = msi.drawGrid([image], cut_off=80, color_scale="image")
+
+    assert fig.axes[0].images[0].get_clim()[1] == pytest.approx(np.percentile(np.arange(1, 21), 80))
+    plt.close(fig)
+
+
+def test_draw_grid_can_include_zeros_in_percentile_cutoff():
+    image = np.zeros((10, 10))
+    image.ravel()[:20] = np.arange(1, 21)
+
+    fig = msi.drawGrid([image], cut_off=80, color_scale="image", ignore_zeros=False)
+
+    assert fig.axes[0].images[0].get_clim()[1] == pytest.approx(np.percentile(image, 80))
     plt.close(fig)
 
 

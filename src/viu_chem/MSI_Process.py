@@ -261,6 +261,7 @@ def drawGrid(
     images:list[np.array],
     dims:tuple[int,int]=None,
     cut_off:float=95,
+    lower_cut_off:float=5,
     title:str=None,
     aspects:list[float]=None,
     names:list[str]=None,
@@ -273,12 +274,14 @@ def drawGrid(
     scale_bar:float=None,
     scale_units:str="µm",
     color_scale:str="global",
+    ignore_zeros:bool=True,
 ):
     """Draws a grid of ion images with a shared intensity scale and colorbar.
     
     :param images: List of numpy image arrays
     :param dims: Dimensions to draw the ion images in (height, width)
     :param cut_off: Percentile cutoff to use for the global dataset
+    :param lower_cut_off: Lower percentile cutoff used for the color scale
     :param title: Title to draw above the entire image
     :param aspects: Aspect values for each image
     :param names: List of names to draw above each image
@@ -291,19 +294,21 @@ def drawGrid(
     :param scale_bar: Physical length of a global scale bar
     :param scale_units: Units displayed on the global scale bar
     :param color_scale: Shared color scaling scope: global, row, column, or image/none
+    :param ignore_zeros: Whether to exclude zero-valued pixels from percentile scaling
     :return fig: Populated matplotlib figure"""
 
-    def add_cbar(cbar_ax:plt.Axes,cbar_cutoffs:float=90):
+    def add_cbar(cbar_ax:plt.Axes,lower_cbar_cutoff:float=5,upper_cbar_cutoff:float=95):
         """Adds a percentile colorbar to an ion image grid.
         
         :param cbar_ax: Reserved axes that receives the colorbar
-        :param cbar_cutoffs: Upper percentile label for the colorbar"""
-        gradient = np.linspace(0, cbar_cutoffs, 256).reshape(-1, 1)
+        :param lower_cbar_cutoff: Lower percentile label for the colorbar
+        :param upper_cbar_cutoff: Upper percentile label for the colorbar"""
+        gradient = np.linspace(lower_cbar_cutoff, upper_cbar_cutoff, 256).reshape(-1, 1)
         cbar_ax.imshow(
             gradient,
             aspect="auto",
             origin="lower",
-            extent=(0, 1, 0, cbar_cutoffs),
+            extent=(0, 1, lower_cbar_cutoff, upper_cbar_cutoff),
             cmap="viridis",
         )
         cbar_ax.set_ylabel('Intensity', color='white', rotation=270, va='center')
@@ -311,7 +316,11 @@ def drawGrid(
         cbar_ax.yaxis.set_tick_params(color='white')
         cbar_ax.yaxis.set_ticks_position('right')
         cbar_ax.set_xticks([])
-        cbar_ax.set_yticks([0, cbar_cutoffs], labels=["0th", f"{cbar_cutoffs}th"], color="white")
+        cbar_ax.set_yticks(
+            [lower_cbar_cutoff, upper_cbar_cutoff],
+            labels=[f"{lower_cbar_cutoff:g}th", f"{upper_cbar_cutoff:g}th"],
+            color="white",
+        )
 
     def add_scale_bar(scale_ax:plt.Axes, length:float, units:str):
         """Adds the artists used for a dynamically calibrated scale bar."""
@@ -396,6 +405,8 @@ def drawGrid(
 
     if not 0 <= cut_off <= 100:
         raise ValueError("cut_off must be between 0 and 100")
+    if not 0 <= lower_cut_off < cut_off:
+        raise ValueError("lower_cut_off must be between 0 and cut_off")
     if group_axis not in {"row", "column"}:
         raise ValueError("group_axis must be either 'row' or 'column'")
     if color_scale == "none":
@@ -638,20 +649,33 @@ def drawGrid(
     if title:
         fig.suptitle(title,color='white')
     
-    def get_image_cutoff(image:np.array):
-        """Returns the requested percentile, falling back to the image maximum."""
-        percentile_cutoff = np.percentile(image, cut_off)
-        return np.max(image) if percentile_cutoff == 0 else percentile_cutoff
+    def get_scope_limits(image_indices:list[int]):
+        """Returns pooled lower and upper percentile limits for a scope."""
+        scope_values = np.concatenate([np.asarray(images[idx]).ravel() for idx in image_indices])
+        finite_values = scope_values[np.isfinite(scope_values)]
+        nonzero_values = finite_values[finite_values != 0]
+        percentile_values = nonzero_values if ignore_zeros and nonzero_values.size else finite_values
+        if percentile_values.size == 0:
+            return 0, 1
+        lower_limit = np.percentile(percentile_values, lower_cut_off)
+        upper_limit = np.percentile(percentile_values, cut_off)
+        if upper_limit == 0:
+            upper_limit = np.max(percentile_values)
+        if lower_limit >= upper_limit:
+            lower_limit = min(float(np.min(percentile_values)), 0.0)
+        if lower_limit >= upper_limit:
+            lower_limit = float(upper_limit) - 1e-9
+        return lower_limit, upper_limit
 
-    image_cutoffs = [get_image_cutoff(image) for image in images]
-    global_cutoff = max(image_cutoffs)
-    row_cutoffs = {
-        row: max(image_cutoffs[idx] for idx, image_row, _ in placements if image_row == row)
+    image_limits = [get_scope_limits([idx]) for idx in range(image_count)]
+    global_limits = get_scope_limits(list(range(image_count)))
+    row_limits = {
+        row: get_scope_limits([idx for idx, image_row, _ in placements if image_row == row])
         for row in range(dims[0])
         if any(image_row == row for _, image_row, _ in placements)
     }
-    column_cutoffs = {
-        column: max(image_cutoffs[idx] for idx, _, image_column in placements if image_column == column)
+    column_limits = {
+        column: get_scope_limits([idx for idx, _, image_column in placements if image_column == column])
         for column in range(dims[1])
         if any(image_column == column for _, _, image_column in placements)
     }
@@ -661,14 +685,14 @@ def drawGrid(
     for idx, row, column in placements:
         image_ax = ax[row, column]
         image = images[idx]
-        scale_limit = {
-            "global": global_cutoff,
-            "row": row_cutoffs[row],
-            "column": column_cutoffs[column],
-            "image": image_cutoffs[idx],
+        lower_limit, upper_limit = {
+            "global": global_limits,
+            "row": row_limits[row],
+            "column": column_limits[column],
+            "image": image_limits[idx],
         }[color_scale]
         if image_dimensions is None:
-            image_ax.imshow(image, aspect=aspects[idx], vmax=scale_limit)
+            image_ax.imshow(image, aspect=aspects[idx], vmin=lower_limit, vmax=upper_limit)
         else:
             width, height = image_dimensions[idx]
             x_offset = (max_width - width) / 2
@@ -677,7 +701,8 @@ def drawGrid(
                 image,
                 extent=(x_offset, x_offset + width, y_offset + height, y_offset),
                 aspect="auto",
-                vmax=scale_limit,
+                vmin=lower_limit,
+                vmax=upper_limit,
             )
             physical_axes.append(image_ax)
         image_ax.set_axis_off()
@@ -689,7 +714,7 @@ def drawGrid(
                 ax[row, column].set_axis_off()
             ax[row, column].set_facecolor("#440154")
 
-    add_cbar(cbar_ax,cut_off)
+    add_cbar(cbar_ax,lower_cut_off,cut_off)
     scale_line = None
     if scale_bar is not None:
         scale_line = add_scale_bar(scale_ax, scale_bar, scale_units)

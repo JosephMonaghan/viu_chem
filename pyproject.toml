@@ -1,6 +1,6 @@
 [project]
 name = "viu-chem"
-version = "0.1.52"
+version = "0.1.54"
 description = "Collection of commonly used functions by VIU chemistry"
 authors = [
     {name = "Joseph Monaghan",email = "Joseph_Monaghan@outlook.com"}
