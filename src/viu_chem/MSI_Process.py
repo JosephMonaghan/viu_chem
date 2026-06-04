@@ -261,7 +261,7 @@ def drawGrid(
     images:list[np.array],
     dims:tuple[int,int]=None,
     cut_off:float=95,
-    lower_cut_off:float=5,
+    lower_cut_off:float=None,
     title:str=None,
     aspects:list[float]=None,
     names:list[str]=None,
@@ -275,13 +275,14 @@ def drawGrid(
     scale_units:str="µm",
     color_scale:str="global",
     ignore_zeros:bool=True,
+    cmap:str | mcolors.Colormap="viridis",
 ):
     """Draws a grid of ion images with a shared intensity scale and colorbar.
     
     :param images: List of numpy image arrays
     :param dims: Dimensions to draw the ion images in (height, width)
     :param cut_off: Percentile cutoff to use for the global dataset
-    :param lower_cut_off: Lower percentile cutoff used for the color scale
+    :param lower_cut_off: Optional lower percentile cutoff; defaults to zero intensity
     :param title: Title to draw above the entire image
     :param aspects: Aspect values for each image
     :param names: List of names to draw above each image
@@ -295,32 +296,88 @@ def drawGrid(
     :param scale_units: Units displayed on the global scale bar
     :param color_scale: Shared color scaling scope: global, row, column, or image/none
     :param ignore_zeros: Whether to exclude zero-valued pixels from percentile scaling
+    :param cmap: Matplotlib colormap name or colormap object
     :return fig: Populated matplotlib figure"""
 
-    def add_cbar(cbar_ax:plt.Axes,lower_cbar_cutoff:float=5,upper_cbar_cutoff:float=95):
-        """Adds a percentile colorbar to an ion image grid.
+    def format_cbar_value(value:float, overflow:bool=False):
+        """Formats colorbar values with readable scientific notation when needed."""
+        if value != 0 and (abs(value) >= 1e4 or abs(value) < 1e-3):
+            exponent = int(np.floor(np.log10(abs(value))))
+            mantissa = value / 10 ** exponent
+            suffix = "+" if overflow else ""
+            return rf"${mantissa:.2f} \times 10^{{{exponent}}}{suffix}$"
+        return f"{value:.2g}{'+' if overflow else ''}"
+
+    def add_cbar(
+        cbar_ax:plt.Axes,
+        lower_cbar_cutoff:float=None,
+        upper_cbar_cutoff:float=95,
+        actual_limits:tuple[float,float]=None,
+        has_overflow:bool=False,
+    ):
+        """Adds an intensity or percentile colorbar to an ion image grid.
         
         :param cbar_ax: Reserved axes that receives the colorbar
         :param lower_cbar_cutoff: Lower percentile label for the colorbar
-        :param upper_cbar_cutoff: Upper percentile label for the colorbar"""
-        gradient = np.linspace(lower_cbar_cutoff, upper_cbar_cutoff, 256).reshape(-1, 1)
+        :param upper_cbar_cutoff: Upper percentile label for the colorbar
+        :param actual_limits: Shared intensity limits to label instead of percentiles
+        :param has_overflow: Whether to show a cap for values above the displayed range"""
+        bar_top = 0.92 if has_overflow else 1
+        cbar_ax.set_facecolor(background_color)
+        gradient = np.linspace(0, 1, 256).reshape(-1, 1)
         cbar_ax.imshow(
             gradient,
             aspect="auto",
             origin="lower",
-            extent=(0, 1, lower_cbar_cutoff, upper_cbar_cutoff),
-            cmap="viridis",
+            extent=(0, 1, 0, bar_top),
+            cmap=cmap_obj,
         )
-        cbar_ax.set_ylabel('Intensity', color='white', rotation=270, va='center')
+        if has_overflow:
+            cbar_ax.add_patch(mpl.patches.Polygon(
+                [(0, bar_top), (0.5, 1), (1, bar_top)],
+                facecolor=cmap_obj(1.0),
+                edgecolor="none",
+            ))
+        for spine in cbar_ax.spines.values():
+            spine.set_visible(False)
+        label_font_size = mpl.font_manager.FontProperties(
+            size=mpl.rcParams["axes.labelsize"]
+        ).get_size_in_points()
+        cbar_ax.set_ylabel(
+            'Intensity',
+            color=foreground_color,
+            rotation=270,
+            va='center',
+            labelpad=24,
+            fontsize=label_font_size,
+        )
         cbar_ax.yaxis.set_label_position('right')
-        cbar_ax.yaxis.set_tick_params(color='white')
+        cbar_ax.yaxis.set_tick_params(
+            color=foreground_color,
+            pad=7,
+            labelsize=max(label_font_size - 2, 1),
+        )
         cbar_ax.yaxis.set_ticks_position('right')
         cbar_ax.set_xticks([])
+
+        if actual_limits is None:
+            labels = ["0%", "50%", "100%"]
+        else:
+            lower_limit, upper_limit = actual_limits
+            midpoint = (lower_limit + upper_limit) / 2
+            labels = [
+                format_cbar_value(lower_limit),
+                format_cbar_value(midpoint),
+                format_cbar_value(upper_limit, overflow=has_overflow),
+            ]
+        if has_overflow and actual_limits is None:
+            labels[-1] += "+"
         cbar_ax.set_yticks(
-            [lower_cbar_cutoff, upper_cbar_cutoff],
-            labels=[f"{lower_cbar_cutoff:g}th", f"{upper_cbar_cutoff:g}th"],
-            color="white",
+            [0, bar_top / 2, bar_top],
+            labels=labels,
+            color=foreground_color,
         )
+        cbar_ax.set_ylim(0, 1)
 
     def add_scale_bar(scale_ax:plt.Axes, length:float, units:str):
         """Adds the artists used for a dynamically calibrated scale bar."""
@@ -330,13 +387,13 @@ def drawGrid(
             [center_x, center_x],
             [y, y],
             transform=scale_ax.transAxes,
-            color="white",
+            color=foreground_color,
             linewidth=3,
             clip_on=False,
         )
         scale_ax.add_line(line)
         scale_ax.text(center_x, y - 0.15, f"{length:g} {units}", transform=scale_ax.transAxes,
-                      color="white", ha="center", va="top")
+                      color=foreground_color, ha="center", va="top")
         return line
 
     def update_physical_layout(physical_axes:list[plt.Axes], scale_line:mpl.lines.Line2D=None):
@@ -388,6 +445,16 @@ def drawGrid(
     group_order = list(group_order) if group_order is not None else None
     secondary_group_order = list(secondary_group_order) if secondary_group_order is not None else None
     image_dimensions = list(image_dimensions) if image_dimensions is not None else None
+    cmap_obj = mpl.colormaps.get_cmap(cmap)
+    background_color = cmap_obj(0.0)
+    background_rgb = np.asarray(background_color[:3])
+    linear_rgb = np.where(
+        background_rgb <= 0.04045,
+        background_rgb / 12.92,
+        ((background_rgb + 0.055) / 1.055) ** 2.4,
+    )
+    background_luminance = np.dot(linear_rgb, [0.2126, 0.7152, 0.0722])
+    foreground_color = "black" if background_luminance > 0.45 else "white"
 
     if len(images) == 0:
         raise ValueError("images must contain at least one image")
@@ -405,7 +472,7 @@ def drawGrid(
 
     if not 0 <= cut_off <= 100:
         raise ValueError("cut_off must be between 0 and 100")
-    if not 0 <= lower_cut_off < cut_off:
+    if lower_cut_off is not None and not 0 <= lower_cut_off < cut_off:
         raise ValueError("lower_cut_off must be between 0 and cut_off")
     if group_axis not in {"row", "column"}:
         raise ValueError("group_axis must be either 'row' or 'column'")
@@ -543,16 +610,22 @@ def drawGrid(
     grid_rows = image_grid_rows + header_rows
     data_start_column = 1 if has_row_labels else 0
     legend_start_column = data_start_column + dims[1]
-    height_ratios = [0.4] if has_column_headers else []
+    column_header_ratio = 0.8
+    sample_title_ratio = 0.65
+    height_ratios = [column_header_ratio] if has_column_headers else []
     for _ in range(dims[0]):
         if names is not None:
-            height_ratios.append(0.35)
+            height_ratios.append(sample_title_ratio)
         height_ratios.extend([1] * 5)
+    outer_left = 0.03
+    outer_right = 0.94
     grid = fig.add_gridspec(
         grid_rows,
         data_start_column + dims[1] + 3,
         width_ratios=([0.5] if has_row_labels else []) + [1] * dims[1] + [0.2, 0.18, 0.45],
         height_ratios=height_ratios,
+        left=outer_left,
+        right=outer_right,
     )
     ax = np.array([
         [
@@ -581,7 +654,7 @@ def drawGrid(
                 )
                 title_ax.text(
                     0.5, 0.5, str(names[image_idx]), transform=title_ax.transAxes,
-                    color="white", ha="center", va="center",
+                    color=foreground_color, ha="center", va="center",
                 )
                 title_ax.set_axis_off()
                 title_axes[(row, column)] = title_ax
@@ -597,8 +670,8 @@ def drawGrid(
         for position, column_label in column_label_items:
             header_ax = fig.add_subplot(grid[0, data_start_column + position])
             header_ax.text(
-                0.5, 0.5, str(column_label), transform=header_ax.transAxes,
-                color="white", weight="bold", ha="center", va="center",
+                0.5, 0.8, str(column_label), transform=header_ax.transAxes,
+                color=foreground_color, weight="bold", ha="center", va="center",
             )
             header_ax.set_axis_off()
             header_axes[position] = header_ax
@@ -622,7 +695,7 @@ def drawGrid(
             wrapped_label = wrap_row_label(row_label)
             label_ax.text(
                 0.5, 0.5, wrapped_label, transform=label_ax.transAxes,
-                color="white", weight="bold", rotation=90, ha="center", va="center",
+                color=foreground_color, weight="bold", rotation=90, ha="center", va="center",
             )
             label_ax.set_axis_off()
             row_label_axes[position] = label_ax
@@ -637,17 +710,29 @@ def drawGrid(
     panel_height = panel_width
     if image_dimensions is not None:
         panel_height = panel_width * max_height / max_width
-    legend_width = 1.2
+    legend_width = 1.8
     row_label_width = 0.8 if has_row_labels else 0
     title_height = 0.5 if title else 0
-    column_label_height = 0.4 if has_column_headers else 0
-    fig.set_size_inches(
-        dims[1] * panel_width + legend_width + row_label_width,
-        dims[0] * panel_height + title_height + column_label_height,
+    image_row_height = panel_height
+    sample_title_height = (
+        dims[0] * image_row_height * sample_title_ratio / 5
+        if names is not None else 0
     )
-    fig.set_facecolor("#440154")
+    column_label_height = (
+        image_row_height * column_header_ratio / 5
+        if has_column_headers else 0
+    )
+    default_horizontal_span = (
+        mpl.rcParams["figure.subplot.right"] - mpl.rcParams["figure.subplot.left"]
+    )
+    horizontal_size_factor = default_horizontal_span / (outer_right - outer_left)
+    fig.set_size_inches(
+        (dims[1] * panel_width + legend_width + row_label_width) * horizontal_size_factor,
+        dims[0] * panel_height + sample_title_height + title_height + column_label_height,
+    )
+    fig.set_facecolor(background_color)
     if title:
-        fig.suptitle(title,color='white')
+        fig.suptitle(title,color=foreground_color)
     
     def get_scope_limits(image_indices:list[int]):
         """Returns pooled lower and upper percentile limits for a scope."""
@@ -657,7 +742,7 @@ def drawGrid(
         percentile_values = nonzero_values if ignore_zeros and nonzero_values.size else finite_values
         if percentile_values.size == 0:
             return 0, 1
-        lower_limit = np.percentile(percentile_values, lower_cut_off)
+        lower_limit = 0 if lower_cut_off is None else np.percentile(percentile_values, lower_cut_off)
         upper_limit = np.percentile(percentile_values, cut_off)
         if upper_limit == 0:
             upper_limit = np.max(percentile_values)
@@ -669,6 +754,10 @@ def drawGrid(
 
     image_limits = [get_scope_limits([idx]) for idx in range(image_count)]
     global_limits = get_scope_limits(list(range(image_count)))
+    global_has_overflow = any(
+        np.any(np.asarray(image)[np.isfinite(image)] > global_limits[1])
+        for image in images
+    )
     row_limits = {
         row: get_scope_limits([idx for idx, image_row, _ in placements if image_row == row])
         for row in range(dims[0])
@@ -692,7 +781,13 @@ def drawGrid(
             "image": image_limits[idx],
         }[color_scale]
         if image_dimensions is None:
-            image_ax.imshow(image, aspect=aspects[idx], vmin=lower_limit, vmax=upper_limit)
+            image_ax.imshow(
+                image,
+                aspect=aspects[idx],
+                vmin=lower_limit,
+                vmax=upper_limit,
+                cmap=cmap_obj,
+            )
         else:
             width, height = image_dimensions[idx]
             x_offset = (max_width - width) / 2
@@ -703,6 +798,7 @@ def drawGrid(
                 aspect="auto",
                 vmin=lower_limit,
                 vmax=upper_limit,
+                cmap=cmap_obj,
             )
             physical_axes.append(image_ax)
         image_ax.set_axis_off()
@@ -712,9 +808,15 @@ def drawGrid(
         for column in range(dims[1]):
             if (row, column) not in used_axes:
                 ax[row, column].set_axis_off()
-            ax[row, column].set_facecolor("#440154")
+            ax[row, column].set_facecolor(background_color)
 
-    add_cbar(cbar_ax,lower_cut_off,cut_off)
+    add_cbar(
+        cbar_ax,
+        lower_cut_off,
+        cut_off,
+        actual_limits=global_limits if color_scale == "global" else None,
+        has_overflow=global_has_overflow if color_scale == "global" else False,
+    )
     scale_line = None
     if scale_bar is not None:
         scale_line = add_scale_bar(scale_ax, scale_bar, scale_units)

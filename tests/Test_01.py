@@ -1,5 +1,6 @@
 from viu_chem import MSI_Process as msi
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 import pandas as pd
 import pytest
@@ -64,6 +65,11 @@ def test_draw_grid_groups_samples_by_column():
     header_axes = fig.axes[8:10]
     assert [text.get_text() for axis in title_axes for text in axis.texts] == ["A1", "B1", "A2", "B2"]
     assert [text.get_text() for axis in header_axes for text in axis.texts] == ["A", "B"]
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    first_title_top = title_axes[0].texts[0].get_window_extent(renderer).y1
+    first_header_bottom = header_axes[0].texts[0].get_window_extent(renderer).y0
+    assert first_header_bottom - first_title_top > 15
     plt.close(fig)
 
 
@@ -270,7 +276,98 @@ def test_draw_grid_lower_cutoff_can_be_configured():
         pytest.approx(np.percentile(image, 80)),
     )
     cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
-    assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["20th", "80th"]
+    assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["21", "50", "80+"]
+    assert len(cbar_ax.patches) == 1
+    plt.close(fig)
+
+
+def test_draw_grid_non_global_colorbar_uses_percentile_labels():
+    images = [np.arange(1, 101).reshape(10, 10), np.arange(101, 201).reshape(10, 10)]
+
+    fig = msi.drawGrid(images, dims=(1, 2), lower_cut_off=20, cut_off=80, color_scale="image")
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == ["0%", "50%", "100%"]
+    assert len(cbar_ax.patches) == 0
+    plt.close(fig)
+
+
+def test_draw_grid_global_colorbar_has_no_overflow_cap_at_maximum_cutoff():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image], lower_cut_off=0, cut_off=100)
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert len(cbar_ax.patches) == 0
+    plt.close(fig)
+
+
+def test_draw_grid_defaults_to_zero_lower_limit():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image])
+
+    assert fig.axes[0].images[0].get_clim()[0] == 0
+    plt.close(fig)
+
+
+def test_draw_grid_applies_colormap_to_images_colorbar_and_overflow_cap():
+    image = np.arange(1, 101).reshape(10, 10)
+
+    fig = msi.drawGrid([image], cmap="jet")
+
+    image_ax = fig.axes[0]
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert image_ax.images[0].get_cmap().name == "jet"
+    assert cbar_ax.images[0].get_cmap().name == "jet"
+    assert cbar_ax.patches[0].get_facecolor() == pytest.approx(mpl.colormaps["jet"](1.0))
+    assert cbar_ax.patches[0].get_edgecolor()[3] == 0
+    assert all(not spine.get_visible() for spine in cbar_ax.spines.values())
+    assert cbar_ax.get_facecolor() == pytest.approx(mpl.colormaps["jet"](0.0))
+    assert fig.get_facecolor() == pytest.approx(mpl.colormaps["jet"](0.0))
+    assert image_ax.get_facecolor() == pytest.approx(mpl.colormaps["jet"](0.0))
+    plt.close(fig)
+
+
+def test_draw_grid_colorbar_uses_readable_scientific_notation():
+    image = np.linspace(0, 2_000_000, 100).reshape(10, 10)
+
+    fig = msi.drawGrid([image], cut_off=80)
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert [tick.get_text() for tick in cbar_ax.get_yticklabels()] == [
+        "0",
+        r"$8.02 \times 10^{5}$",
+        r"$1.60 \times 10^{6}+$",
+    ]
+    plt.close(fig)
+
+
+def test_draw_grid_colorbar_ticks_are_smaller_than_label_and_outer_margins_are_tight():
+    fig = msi.drawGrid([np.arange(1, 101).reshape(10, 10)])
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    label_size = cbar_ax.yaxis.label.get_fontsize()
+    assert all(tick.get_fontsize() == label_size - 2 for tick in cbar_ax.get_yticklabels())
+    grid = cbar_ax.get_subplotspec().get_gridspec()
+    assert grid.left == pytest.approx(0.03)
+    assert grid.right == pytest.approx(0.94)
+    plt.close(fig)
+
+
+def test_draw_grid_uses_contrasting_text_for_bright_colormap_background():
+    fig = msi.drawGrid(
+        [np.arange(1, 101).reshape(10, 10)],
+        title="Bright background",
+        names=["Sample"],
+        cmap="twilight",
+    )
+
+    cbar_ax = next(axis for axis in fig.axes if axis.get_ylabel() == "Intensity")
+    assert fig._suptitle.get_color() == "black"
+    assert cbar_ax.yaxis.label.get_color() == "black"
+    assert all(tick.get_color() == "black" for tick in cbar_ax.get_yticklabels())
+    assert all(text.get_color() == "black" for axis in fig.axes for text in axis.texts)
     plt.close(fig)
 
 
