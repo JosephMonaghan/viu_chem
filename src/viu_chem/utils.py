@@ -9,7 +9,7 @@ import pymzml
 import re
 from sklearn.decomposition import PCA
 
-def cv_to_csv(directory:str,mz_list:list,tolerance:float=10):
+def extract_cv(directory:str,mz_list:list,tolerance:float=10):
     """Converts a directory of .raw files for a FAIMS CV Scan to mzML (if needed), then outputs a dataframe with each mz intensity
     against the CV value (from scan filter) as a CSV (one for each raw file in the directory)
     

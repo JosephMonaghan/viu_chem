@@ -465,9 +465,63 @@ def add_confidence_ellipse(ax, x, y, confidence=0.95, **kwargs):
 
     ax.add_patch(ellipse)
 
-def boxplot(data:dict,ax:plt.Axes | None = None, colors:str | list[str] | None = None, autonormalize:bool=False):
+
+def unpack_dataframe(
+        data:pd.DataFrame,
+        value:str,
+        primary_group:str,
+        secondary_group:str | None = None,
+        dropna:bool=True) -> dict:
+    """Converts a DataFrame into the dictionary layout used by boxplot and barchart.
+
+    :param data: Source DataFrame
+    :param value: Column containing the values to plot
+    :param primary_group: Column used for the x-axis groups
+    :param secondary_group: Optional column used for grouped series within each x-axis group
+    :param dropna: Whether to remove NaN values from each plotted series
+    :return plot_data: Dictionary suitable for boxplot or barchart
+    """
+    required_columns = [value, primary_group]
+    if secondary_group is not None:
+        required_columns.append(secondary_group)
+
+    missing_columns = [column for column in required_columns if column not in data.columns]
+    if missing_columns:
+        raise KeyError(f"DataFrame is missing required columns: {missing_columns}")
+
+    plot_data = {}
+    for primary_value, primary_data in data.groupby(primary_group, sort=False):
+        if secondary_group is None:
+            values = primary_data[value]
+            if dropna:
+                values = values.dropna()
+            plot_data[primary_value] = values.to_list()
+        else:
+            plot_data[primary_value] = {}
+            for secondary_value, secondary_data in primary_data.groupby(secondary_group, sort=False):
+                values = secondary_data[value]
+                if dropna:
+                    values = values.dropna()
+                plot_data[primary_value][secondary_value] = values.to_list()
+
+    return plot_data
+
+
+def boxplot(
+        data:dict | pd.DataFrame,
+        ax:plt.Axes | None = None,
+        colors:str | list[str] | None = None,
+        autonormalize:bool=False,
+        value:str | None = None,
+        primary_group:str | None = None,
+        secondary_group:str | None = None):
     if not ax:
         fig, ax = plt.subplots()
+
+    if isinstance(data, pd.DataFrame):
+        if value is None or primary_group is None:
+            raise ValueError("value and primary_group must be supplied when data is a DataFrame")
+        data = unpack_dataframe(data, value, primary_group, secondary_group)
     
     top_keys = list(data.keys())
     subkeys_present = isinstance(data[top_keys[0]],dict)
@@ -519,6 +573,173 @@ def boxplot(data:dict,ax:plt.Axes | None = None, colors:str | list[str] | None =
                    medianprops={'color':'k'})
     
     ax.set_xticks([x+1 for x in range(len(top_keys))],top_keys, rotation=45,ha='right')
+
+
+def barchart(
+        data:dict | pd.DataFrame,
+        ax:plt.Axes | None = None,
+        colors:str | list[str] | None = None,
+        autonormalize:bool=False,
+        error:str | None = "sd",
+        point_color:str="k",
+        point_size:float=20,
+        point_alpha:float=0.8,
+        value:str | None = None,
+        primary_group:str | None = None,
+        secondary_group:str | None = None):
+    """Plots grouped bar charts with error bars and individual data points.
+
+    Accepts the same data layouts as :func:`boxplot`: either ``{group: values}``
+    or ``{group: {series: values}}``. DataFrames can be supplied by naming the
+    value, primary_group, and optional secondary_group columns.
+
+    :param data: Data to plot
+    :param ax: Target axes
+    :param colors: Single color or list of colors for grouped series
+    :param autonormalize: Whether to normalize nested groups by their largest value
+    :param error: Error bars to draw: "sd", "sem", or None
+    :param point_color: Color for individual data points
+    :param point_size: Marker size for individual data points
+    :param point_alpha: Alpha for individual data points
+    :param value: DataFrame column containing the values to plot
+    :param primary_group: DataFrame column used for the x-axis groups
+    :param secondary_group: Optional DataFrame column used for grouped series
+    :return ax: Returns the populated axes object
+    """
+    if not ax:
+        fig, ax = plt.subplots()
+
+    if isinstance(data, pd.DataFrame):
+        if value is None or primary_group is None:
+            raise ValueError("value and primary_group must be supplied when data is a DataFrame")
+        data = unpack_dataframe(data, value, primary_group, secondary_group)
+
+    top_keys = list(data.keys())
+    subkeys_present = isinstance(data[top_keys[0]], dict)
+
+    def prep_values(values):
+        return np.asarray(values, dtype=float)
+
+    def get_error(values):
+        values = values[~np.isnan(values)]
+        if error is None or len(values) <= 1:
+            return 0
+        if error.lower() == "sem":
+            return np.std(values, ddof=1) / np.sqrt(len(values))
+        if error.lower() == "sd":
+            return np.std(values, ddof=1)
+        raise ValueError('error must be "sem", "sd", or None')
+
+    def point_positions(center, width, count):
+        if count <= 1:
+            return np.asarray([center])
+        point_width = min(width * 0.55, 0.18)
+        return center + np.linspace(-point_width / 2, point_width / 2, count)
+
+    def get_color(idx=0):
+        default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        if colors is None:
+            return default_colors[idx % len(default_colors)]
+        if isinstance(colors, str):
+            return colors
+        return colors[idx]
+
+    if subkeys_present:
+        subkeys = [key for key in data[top_keys[0]].keys()]
+        plot_data = {}
+
+        for top_key in top_keys:
+            plot_data[top_key] = {}
+            norm_limit = 1
+            if autonormalize:
+                all_values = [
+                    prep_values(data[top_key][subkey])
+                    for subkey in subkeys
+                ]
+                norm_limit = np.nanmax(np.concatenate(all_values))
+
+            for subkey in subkeys:
+                values = prep_values(data[top_key][subkey])
+                if autonormalize and norm_limit != 0:
+                    values = values / norm_limit
+                plot_data[top_key][subkey] = values
+
+        num_subkeys = len(subkeys)
+        group_span = min(0.8, 0.4 + 0.1 * max(num_subkeys - 2, 0))
+        positions = np.linspace(1 - group_span / 2.5, 1 + group_span / 2.5, num_subkeys)
+        if num_subkeys > 1:
+            width = (positions[1] - positions[0]) * 1
+        else:
+            width = 0.55
+
+        for idx, (subkey, pos) in enumerate(zip(subkeys, positions)):
+            centers = [pos + x for x in range(len(top_keys))]
+            bar_values = [
+                np.nanmean(plot_data[top_key][subkey])
+                for top_key in top_keys
+            ]
+            errors = [
+                get_error(plot_data[top_key][subkey])
+                for top_key in top_keys
+            ]
+            color = get_color(idx)
+
+            ax.bar(
+                centers,
+                bar_values,
+                yerr=errors,
+                width=width,
+                label=subkey,
+                color=color,
+                edgecolor='k',
+                capsize=4,
+                zorder=2)
+
+            for center, top_key in zip(centers, top_keys):
+                values = plot_data[top_key][subkey]
+                ax.scatter(
+                    point_positions(center, width, len(values)),
+                    values,
+                    color=point_color,
+                    s=point_size,
+                    alpha=point_alpha,
+                    edgecolors='k',
+                    linewidths=0.4,
+                    zorder=3)
+
+        ax.legend()
+
+    else:
+        bar_data = [prep_values(data[top_key]) for top_key in top_keys]
+        centers = [x + 1 for x in range(len(top_keys))]
+        bar_values = [np.nanmean(values) for values in bar_data]
+        errors = [get_error(values) for values in bar_data]
+        width = 0.55
+        color = get_color()
+
+        ax.bar(
+            centers,
+            bar_values,
+            yerr=errors,
+            width=width,
+            color=color,
+            edgecolor='k',
+            capsize=4,
+            zorder=2)
+
+        for center, values in zip(centers, bar_data):
+            ax.scatter(
+                point_positions(center, width, len(values)),
+                values,
+                color=point_color,
+                s=point_size,
+                alpha=point_alpha,
+                edgecolors='k',
+                linewidths=0.4,
+                zorder=3)
+
+    ax.set_xticks([x + 1 for x in range(len(top_keys))], top_keys, rotation=45, ha='right')
+    return ax
         
 
 
