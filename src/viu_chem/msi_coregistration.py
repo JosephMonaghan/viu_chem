@@ -1785,6 +1785,56 @@ def _resample_to_output_grid(
     )
 
 
+def get_coregistered_msi_mask_image(
+    zarr_path: str | Path | CoregistrationDataset,
+    pixel_mask: np.ndarray,
+    *,
+    msi_dataset: str | None = None,
+    reference_key: str | None = "hne",
+    registered_cs: str = "registered",
+    table_key: str | None = None,
+    tic_key: str | None = None,
+) -> CoregisteredImage:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    mask = np.asarray(pixel_mask, dtype=bool)
+    if mask.shape == (dataset.ny, dataset.nx):
+        raw_img = mask.astype(float)
+    else:
+        mask = mask.ravel()
+        if mask.shape[0] != dataset.x_coords.shape[0]:
+            raise ValueError("pixel_mask must match either the MSI raster shape or the number of MSI spectra.")
+        raw_img = np.zeros((dataset.ny, dataset.nx), dtype=float)
+        raw_img[dataset.y_coords[mask], dataset.x_coords[mask]] = 1.0
+
+    _, output_shape, output_transform_xy = _reference_grid_for_coregistered_arrays(dataset, reference_key)
+    source_transform_xy, _found = dataset.load_saved_registration_if_available()
+    resampled = _resample_to_output_grid(
+        raw_img,
+        source_transform_xy=source_transform_xy,
+        output_transform_xy=output_transform_xy,
+        output_shape=output_shape,
+        order=0,
+        cval=0.0,
+    )
+    data = np.ma.masked_where(~np.isfinite(resampled) | (resampled < 0.5), resampled >= 0.5)
+    return CoregisteredImage(
+        data=data,
+        label="MSI mask",
+        contrast_limits=(0.0, 1.0),
+    )
+
+
 def get_coregistered_reference_image(
     zarr_path: str | Path | CoregistrationDataset,
     *,
@@ -2008,6 +2058,160 @@ def _sample_reference_values_at_msi_pixels(
             values[idx] = float(img[ref_y, ref_x])
 
     return values
+
+
+@dataclass
+class ReferenceThresholdMask:
+    reference_key: str
+    channel_index: int
+    threshold: float
+    mode: str
+    values: np.ndarray
+    allowed_mask: np.ndarray
+    below_mask: np.ndarray
+    above_mask: np.ndarray
+    below_image: np.ndarray
+    above_image: np.ndarray
+
+
+@dataclass
+class ReferenceThresholdSpectra:
+    mask: ReferenceThresholdMask
+    below_summary: dict[str, np.ndarray | int] | None
+    above_summary: dict[str, np.ndarray | int] | None
+
+
+def create_reference_threshold_mask(
+    zarr_path: str | Path | CoregistrationDataset,
+    *,
+    reference_key: str = "hne",
+    channel_index: int = 0,
+    threshold: float | None = None,
+    percentile: float | None = None,
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    transform_xy: np.ndarray | None = None,
+    prefilter_mask: np.ndarray | None = None,
+    registered_cs: str = "registered",
+) -> ReferenceThresholdMask:
+    if (threshold is None) == (percentile is None):
+        raise ValueError("Supply exactly one of `threshold` or `percentile`.")
+
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    reference_img = _reference_channel_image(dataset.sdata, reference_key, int(channel_index))
+    if transform_xy is None:
+        transform_xy, _found = dataset.load_saved_registration_if_available()
+    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, np.asarray(transform_xy, dtype=float))
+
+    allowed = np.isfinite(values)
+    if prefilter_mask is not None:
+        prefilter = np.asarray(prefilter_mask, dtype=bool).ravel()
+        if prefilter.shape[0] != values.shape[0]:
+            raise ValueError("prefilter_mask must match the number of MSI spectra.")
+        allowed &= prefilter
+    if not np.any(allowed):
+        raise ValueError("No MSI pixels have finite fluorescence values after filtering.")
+
+    if percentile is not None:
+        pct = float(percentile)
+        if not 0 <= pct <= 100:
+            raise ValueError("percentile must be between 0 and 100.")
+        threshold_value = float(np.percentile(values[allowed], pct))
+        mode = "percentile"
+    else:
+        threshold_value = float(threshold)
+        if not np.isfinite(threshold_value):
+            raise ValueError("threshold must be finite.")
+        mode = "absolute"
+
+    below = (values < threshold_value) & allowed
+    above = (values >= threshold_value) & allowed
+    if not np.any(below) and not np.any(above):
+        raise ValueError("Threshold selected no MSI pixels.")
+
+    below_image = np.zeros((dataset.ny, dataset.nx), dtype=np.uint8)
+    above_image = np.zeros((dataset.ny, dataset.nx), dtype=np.uint8)
+    below_image[dataset.y_coords[below], dataset.x_coords[below]] = 1
+    above_image[dataset.y_coords[above], dataset.x_coords[above]] = 1
+
+    return ReferenceThresholdMask(
+        reference_key=str(reference_key),
+        channel_index=int(channel_index),
+        threshold=threshold_value,
+        mode=mode,
+        values=values,
+        allowed_mask=allowed,
+        below_mask=below,
+        above_mask=above,
+        below_image=below_image,
+        above_image=above_image,
+    )
+
+
+def summarize_reference_threshold_spectra(
+    zarr_path: str | Path | CoregistrationDataset,
+    *,
+    reference_key: str = "hne",
+    channel_index: int = 0,
+    threshold: float | None = None,
+    percentile: float | None = None,
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    transform_xy: np.ndarray | None = None,
+    prefilter_mask: np.ndarray | None = None,
+    normalize_to_tic: bool = True,
+    registered_cs: str = "registered",
+) -> ReferenceThresholdSpectra:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    mask = create_reference_threshold_mask(
+        dataset,
+        reference_key=reference_key,
+        channel_index=channel_index,
+        threshold=threshold,
+        percentile=percentile,
+        transform_xy=transform_xy,
+        prefilter_mask=prefilter_mask,
+    )
+
+    below_summary = (
+        dataset.summarize_region_spectra(mask.below_mask, normalize_to_tic=bool(normalize_to_tic))
+        if np.any(mask.below_mask)
+        else None
+    )
+    above_summary = (
+        dataset.summarize_region_spectra(mask.above_mask, normalize_to_tic=bool(normalize_to_tic))
+        if np.any(mask.above_mask)
+        else None
+    )
+    return ReferenceThresholdSpectra(
+        mask=mask,
+        below_summary=below_summary,
+        above_summary=above_summary,
+    )
 
 
 def _sample_msi_values_at_msi_pixels(
