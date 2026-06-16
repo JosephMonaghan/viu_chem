@@ -21,6 +21,7 @@ import imageio.v3 as iio
 import geopandas as gpd
 import napari
 import tifffile
+from scipy import ndimage
 from magicgui import magicgui
 from matplotlib import colormaps as mpl_colormaps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -733,6 +734,69 @@ def _infer_msi_dataset_specs(sdata) -> list[dict[str, Any]]:
         )
 
     return specs
+
+
+def list_coregistration_msi_datasets(zarr_path: str | Path) -> list[dict[str, Any]]:
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    return [dict(spec) for spec in _infer_msi_dataset_specs(sdata)]
+
+
+def _resolve_msi_dataset_keys(
+    zarr_path: str | Path,
+    *,
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+) -> tuple[str | None, str | None]:
+    if not msi_dataset:
+        return table_key, tic_key
+
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    specs = _infer_msi_dataset_specs(sdata)
+    query = str(msi_dataset).strip()
+    query_folded = query.casefold()
+    query_sanitized = sanitize_name(query)
+
+    def selector_values(spec: Mapping[str, Any]) -> list[str]:
+        return [
+            str(spec.get("display_name", "")),
+            str(spec.get("label", "")),
+            str(spec.get("table_key", "")),
+            str(spec.get("tic_key", "")),
+        ]
+
+    def matches_at_rank(rank: int) -> list[dict[str, Any]]:
+        matches = []
+        for spec in specs:
+            raw_values = selector_values(spec)
+            folded_values = [value.casefold() for value in raw_values]
+            safe_values = [sanitize_name(value) for value in raw_values]
+            if rank == 0 and query in raw_values:
+                matches.append(spec)
+            elif rank == 1 and query_folded in folded_values:
+                matches.append(spec)
+            elif rank == 2 and query_sanitized in safe_values:
+                matches.append(spec)
+            elif rank == 3 and query_folded and any(query_folded in value for value in folded_values):
+                matches.append(spec)
+            elif rank == 4 and query_sanitized and any(query_sanitized in value for value in safe_values):
+                matches.append(spec)
+        return matches
+
+    matches: list[dict[str, Any]] = []
+    for rank in range(5):
+        matches = matches_at_rank(rank)
+        if matches:
+            break
+
+    if not matches:
+        available = ", ".join(str(spec.get("display_name") or spec.get("table_key")) for spec in specs)
+        raise ValueError(f"No MSI dataset matched {msi_dataset!r}. Available datasets: {available}")
+    if len(matches) > 1:
+        labels = ", ".join(str(spec.get("display_name") or spec.get("table_key")) for spec in matches)
+        raise ValueError(f"MSI dataset selector {msi_dataset!r} matched multiple datasets: {labels}")
+    selected = matches[0]
+    return str(selected["table_key"]), str(selected["tic_key"])
 
 
 def _choose_unique_element_key(existing: set[str], base: str) -> str:
@@ -1584,6 +1648,306 @@ def _reference_channel_image(
     if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
         raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
     return np.asarray(raw_arr[..., channel_index], dtype=float)
+
+
+@dataclass
+class CoregisteredImage:
+    data: np.ndarray
+    label: str
+    image_key: str | None = None
+    channel_index: int | None = None
+    mz: float | None = None
+    actual_mz: float | None = None
+    feature_indices: np.ndarray | None = None
+    contrast_limits: tuple[float, float] | None = None
+
+
+def _display_limits_for_coregistered_image(
+    img: np.ndarray,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    *,
+    positive_only: bool = True,
+) -> tuple[float, float]:
+    if np.ma.isMaskedArray(img):
+        finite = np.asarray(img.compressed(), dtype=float)
+    else:
+        vals = np.asarray(img, dtype=float)
+        finite = vals[np.isfinite(vals)]
+    if positive_only:
+        finite = finite[finite > 0]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    lo = float(np.percentile(finite, low_pct))
+    hi = float(np.percentile(finite, high_pct))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.nanmin(finite))
+        hi = float(np.nanmax(finite))
+    if hi <= lo:
+        hi = lo + 1e-9
+    return lo, hi
+
+
+def mask_low_intensity_pixels(
+    img: np.ndarray,
+    *,
+    low: float | None = None,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    positive_only: bool = True,
+) -> tuple[np.ma.MaskedArray, tuple[float, float]]:
+    limits = _display_limits_for_coregistered_image(
+        img,
+        low_pct=low_pct,
+        high_pct=high_pct,
+        positive_only=positive_only,
+    )
+    low_value = limits[0] if low is None else float(low)
+    arr = np.asarray(img, dtype=float)
+    return np.ma.masked_where(~np.isfinite(arr) | (arr <= low_value), arr), limits
+
+
+def _image_transform_xy_or_identity(sdata, image_key: str, registered_cs: str) -> np.ndarray:
+    try:
+        transform = get_transformation(sdata.images[image_key], to_coordinate_system=registered_cs)
+        return _xy_matrix_from_transform(transform)
+    except Exception:
+        return np.eye(3, dtype=float)
+
+
+def _reference_grid_for_coregistered_arrays(
+    dataset: CoregistrationDataset,
+    reference_key: str | None,
+) -> tuple[str | None, tuple[int, int], np.ndarray]:
+    if reference_key is None:
+        if dataset.reference_image_keys:
+            reference_key = dataset.reference_image_keys[0]
+    elif reference_key not in dataset.sdata.images:
+        raise KeyError(f"Reference image {reference_key!r} was not found.")
+
+    if reference_key is None:
+        return None, (dataset.ny, dataset.nx), np.eye(3, dtype=float)
+
+    reference_img = np.asarray(dataset.sdata.images[reference_key])
+    reference_attrs = getattr(dataset.sdata.images[reference_key], "attrs", {})
+    reference_dims = tuple(getattr(dataset.sdata.images[reference_key], "dims", ()))
+    source_channels = int(reference_attrs.get("source_channels", 0)) if isinstance(reference_attrs, Mapping) else 0
+    if reference_img.ndim == 2:
+        output_shape = reference_img.shape
+    elif reference_img.ndim == 3:
+        if reference_dims == ("c", "y", "x"):
+            output_shape = tuple(reference_img.shape[-2:])
+        elif reference_dims == ("y", "x", "c"):
+            output_shape = tuple(reference_img.shape[:2])
+        elif source_channels > 4 and reference_img.shape[0] == source_channels:
+            output_shape = tuple(reference_img.shape[-2:])
+        elif source_channels > 4 and reference_img.shape[-1] == source_channels:
+            output_shape = tuple(reference_img.shape[:2])
+        elif reference_img.shape[0] <= 4 and reference_img.shape[-1] > 4:
+            output_shape = tuple(reference_img.shape[-2:])
+        elif reference_img.shape[-1] <= 4:
+            output_shape = tuple(reference_img.shape[:2])
+        else:
+            output_shape = tuple(reference_img.shape[-2:])
+    else:
+        raise ValueError(f"Reference image {reference_key!r} has unsupported shape {reference_img.shape}.")
+
+    output_transform_xy = _image_transform_xy_or_identity(dataset.sdata, reference_key, dataset.registered_cs)
+    return reference_key, (int(output_shape[0]), int(output_shape[1])), output_transform_xy
+
+
+def _resample_to_output_grid(
+    img: np.ndarray,
+    *,
+    source_transform_xy: np.ndarray,
+    output_transform_xy: np.ndarray,
+    output_shape: tuple[int, int],
+    order: int = 1,
+    cval: float = np.nan,
+) -> np.ndarray:
+    source_to_output_xy = np.linalg.inv(np.asarray(source_transform_xy, dtype=float)) @ np.asarray(output_transform_xy, dtype=float)
+    matrix_yx = np.array(
+        [
+            [source_to_output_xy[1, 1], source_to_output_xy[1, 0]],
+            [source_to_output_xy[0, 1], source_to_output_xy[0, 0]],
+        ],
+        dtype=float,
+    )
+    offset_yx = np.array([source_to_output_xy[1, 2], source_to_output_xy[0, 2]], dtype=float)
+    return ndimage.affine_transform(
+        np.asarray(img, dtype=float),
+        matrix=matrix_yx,
+        offset=offset_yx,
+        output_shape=tuple(int(v) for v in output_shape),
+        order=int(order),
+        mode="constant",
+        cval=float(cval),
+    )
+
+
+def get_coregistered_reference_image(
+    zarr_path: str | Path | CoregistrationDataset,
+    *,
+    reference_key: str | None = "hne",
+    channel_index: int = 0,
+    output_reference_key: str | None = None,
+    mask_low: bool = True,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    registered_cs: str = "registered",
+) -> CoregisteredImage:
+    dataset = zarr_path if isinstance(zarr_path, CoregistrationDataset) else CoregistrationDataset(zarr_path, registered_cs=registered_cs)
+    if reference_key is None:
+        if not dataset.reference_image_keys:
+            raise ValueError("No reference images are available.")
+        reference_key = dataset.reference_image_keys[0]
+    if reference_key not in dataset.sdata.images:
+        raise KeyError(f"Reference image {reference_key!r} was not found.")
+
+    _, output_shape, output_transform_xy = _reference_grid_for_coregistered_arrays(dataset, output_reference_key or reference_key)
+    img = _reference_channel_image(dataset.sdata, reference_key, int(channel_index))
+    source_transform_xy = _image_transform_xy_or_identity(dataset.sdata, reference_key, dataset.registered_cs)
+    resampled = _resample_to_output_grid(
+        img,
+        source_transform_xy=source_transform_xy,
+        output_transform_xy=output_transform_xy,
+        output_shape=output_shape,
+        order=1,
+    )
+    if mask_low:
+        data, limits = mask_low_intensity_pixels(resampled, low_pct=low_pct, high_pct=high_pct)
+    else:
+        data = resampled
+        limits = _display_limits_for_coregistered_image(resampled, low_pct=low_pct, high_pct=high_pct)
+    return CoregisteredImage(
+        data=data,
+        label=f"{reference_key} ch {int(channel_index) + 1}",
+        image_key=reference_key,
+        channel_index=int(channel_index),
+        contrast_limits=limits,
+    )
+
+
+def get_coregistered_ion_image(
+    zarr_path: str | Path | CoregistrationDataset,
+    target_mz: float,
+    *,
+    msi_dataset: str | None = None,
+    ppm_tolerance: float = 5.0,
+    reference_key: str | None = "hne",
+    normalize_to_tic: bool = True,
+    mask_low: bool = True,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    registered_cs: str = "registered",
+    table_key: str | None = None,
+    tic_key: str | None = None,
+) -> CoregisteredImage:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    _, output_shape, output_transform_xy = _reference_grid_for_coregistered_arrays(dataset, reference_key)
+    indices = dataset.find_feature_indices_from_mz(float(target_mz), float(ppm_tolerance))
+    if indices.size == 0:
+        idx, _ppm_error = dataset.find_feature_idx_from_mz(float(target_mz), float("inf"))
+        if idx is None:
+            raise ValueError(f"No m/z feature found near {target_mz:g}.")
+        indices = np.array([idx], dtype=int)
+    raw_img = dataset.reconstruct_ion_image(indices, normalize_to_tic=bool(normalize_to_tic))
+    source_transform_xy, _found = dataset.load_saved_registration_if_available()
+    resampled = _resample_to_output_grid(
+        raw_img,
+        source_transform_xy=source_transform_xy,
+        output_transform_xy=output_transform_xy,
+        output_shape=output_shape,
+        order=1,
+    )
+    if mask_low:
+        data, limits = mask_low_intensity_pixels(resampled, low_pct=low_pct, high_pct=high_pct)
+    else:
+        data = resampled
+        limits = _display_limits_for_coregistered_image(resampled, low_pct=low_pct, high_pct=high_pct)
+    nearest_idx = int(indices[np.argmin(np.abs(dataset.mz_values[indices] - float(target_mz)))])
+    return CoregisteredImage(
+        data=data,
+        label=f"m/z {float(target_mz):.4f}",
+        mz=float(target_mz),
+        actual_mz=float(dataset.mz_values[nearest_idx]),
+        feature_indices=indices.astype(int),
+        contrast_limits=limits,
+    )
+
+
+def get_coregistered_image_layers(
+    zarr_path: str | Path,
+    *,
+    mzs: Iterable[float],
+    msi_dataset: str | None = None,
+    reference_key: str | None = "hne",
+    reference_channel_index: int = 0,
+    ppm_tolerance: float = 5.0,
+    normalize_to_tic: bool = True,
+    mask_low: bool = True,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    registered_cs: str = "registered",
+    table_key: str | None = None,
+    tic_key: str | None = None,
+) -> dict[str, Any]:
+    table_key, tic_key = _resolve_msi_dataset_keys(
+        zarr_path,
+        msi_dataset=msi_dataset,
+        table_key=table_key,
+        tic_key=tic_key,
+    )
+    dataset = CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    chosen_reference_key = reference_key
+    if chosen_reference_key is not None and chosen_reference_key not in dataset.sdata.images:
+        if dataset.reference_image_keys:
+            chosen_reference_key = dataset.reference_image_keys[0]
+        else:
+            chosen_reference_key = None
+    reference = (
+        get_coregistered_reference_image(
+            dataset,
+            reference_key=chosen_reference_key,
+            channel_index=reference_channel_index,
+            output_reference_key=chosen_reference_key,
+            mask_low=mask_low,
+            low_pct=low_pct,
+            high_pct=high_pct,
+        )
+        if chosen_reference_key is not None
+        else None
+    )
+    ions = [
+        get_coregistered_ion_image(
+            dataset,
+            float(mz),
+            ppm_tolerance=ppm_tolerance,
+            reference_key=chosen_reference_key,
+            normalize_to_tic=normalize_to_tic,
+            mask_low=mask_low,
+            low_pct=low_pct,
+            high_pct=high_pct,
+        )
+        for mz in mzs
+    ]
+    return {
+        "dataset": dataset,
+        "reference": reference,
+        "ions": ions,
+        "reference_key": chosen_reference_key,
+    }
 
 
 def _sample_reference_values_at_msi_pixels(
