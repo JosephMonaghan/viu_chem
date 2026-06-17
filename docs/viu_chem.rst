@@ -6,14 +6,14 @@ Submodules
 
 viu\_chem.Figures
 -----------------------------
-.. automodule:: Figures
+.. automodule:: viu_chem.Figures
    :members:
    :undoc-members:
    :show-inheritance:
 
 viu\_chem.chem412
 -----------------------------
-.. automodule:: chem412
+.. automodule:: viu_chem.chem412
    :members:
    :undoc-members:
    :show-inheritance:
@@ -21,14 +21,14 @@ viu\_chem.chem412
 viu\_chem.annotation
 -----------------------------
 
-.. automodule:: annotation
+.. automodule:: viu_chem.annotation
    :members:
    :undoc-members:
    :show-inheritance:
 
 viu\_chem.utils
 -----------------------------
-.. automodule:: utils
+.. automodule:: viu_chem.utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -36,7 +36,7 @@ viu\_chem.utils
 viu\_chem.MSI\_Process module
 -----------------------------
 
-.. automodule:: MSI_Process
+.. automodule:: viu_chem.MSI_Process
    :members:
    :undoc-members:
    :show-inheritance:
@@ -44,7 +44,7 @@ viu\_chem.MSI\_Process module
 viu\_chem.PeakAlign
 -----------------------------
 
-.. automodule:: peakAlign
+.. automodule:: viu_chem.peakAlign
    :members:
    :undoc-members:
    :show-inheritance:
@@ -52,11 +52,10 @@ viu\_chem.PeakAlign
 viu\_chem.msi_stats
 -----------------------------
 
-.. automodule:: msi_stats
+.. automodule:: viu_chem.msi_stats
    :members:
    :undoc-members:
    :show-inheritance:
-
 
 
 
