@@ -2730,7 +2730,7 @@ def launch_coregistration_gui(
         )
         return Colormap(colors=colors, name="threshold_blue_red")
 
-    viewer = napari.Viewer()
+    viewer = napari.Viewer(title=host_zarr_path.name)
     overlay_colormap_order = [
         "viridis",
         "magma",
