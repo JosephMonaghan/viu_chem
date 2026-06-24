@@ -2060,6 +2060,127 @@ def _sample_reference_values_at_msi_pixels(
     return values
 
 
+def create_annotation_region_mask(
+    zarr_path: str | Path | CoregistrationDataset,
+    annotation_key: str,
+    *,
+    region_label: str = "(all regions)",
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    transform_xy: np.ndarray | None = None,
+    registered_cs: str = "registered",
+) -> np.ndarray:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    if annotation_key not in dataset.sdata.shapes:
+        raise KeyError(f"Annotation shapes {annotation_key!r} were not found.")
+
+    try:
+        rois = dataset.sdata.transform_element_to_coordinate_system(annotation_key, registered_cs)
+    except Exception:
+        rois = dataset.sdata.shapes[annotation_key]
+
+    if region_label != "(all regions)" and "_annotation_label" in rois.columns:
+        wanted = str(region_label).strip()
+        rois = rois[rois["_annotation_label"].astype(str).str.strip() == wanted]
+    if len(rois) == 0:
+        return np.zeros(len(dataset.x_coords), dtype=bool)
+
+    if transform_xy is None:
+        transform_xy, _found = dataset.load_saved_registration_if_available()
+    transform = np.asarray(transform_xy, dtype=float)
+    if transform.shape != (3, 3) or not np.all(np.isfinite(transform)):
+        raise ValueError("transform_xy must be a finite 3x3 affine matrix.")
+
+    xy1 = np.column_stack(
+        [dataset.x_coords.astype(float), dataset.y_coords.astype(float), np.ones_like(dataset.x_coords, dtype=float)]
+    )
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        xy_t = (transform @ xy1.T).T[:, :2]
+    finite = np.all(np.isfinite(xy_t), axis=1)
+    if not np.any(finite):
+        return np.zeros(len(dataset.x_coords), dtype=bool)
+
+    points = np.array([Point(px, py) for px, py in xy_t[finite]], dtype=object)
+    selected_finite = np.zeros(len(points), dtype=bool)
+    for geom in rois.geometry:
+        selected_finite |= np.fromiter((point.within(geom) for point in points), dtype=bool, count=len(points))
+
+    selected = np.zeros(len(dataset.x_coords), dtype=bool)
+    selected[finite] = selected_finite
+    return selected
+
+
+def summarize_annotation_region_spectra(
+    zarr_path: str | Path | CoregistrationDataset,
+    annotation_key: str,
+    *,
+    region_label: str = "(all regions)",
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    transform_xy: np.ndarray | None = None,
+    normalize_to_tic: bool = True,
+    registered_cs: str = "registered",
+) -> dict[str, np.ndarray | int]:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    selected = create_annotation_region_mask(
+        dataset,
+        annotation_key,
+        region_label=region_label,
+        transform_xy=transform_xy,
+        registered_cs=registered_cs,
+    )
+    return dataset.summarize_region_spectra(selected, normalize_to_tic=bool(normalize_to_tic))
+
+
+def summarize_msi_pixel_mask_spectra(
+    zarr_path: str | Path | CoregistrationDataset,
+    pixel_mask: np.ndarray,
+    *,
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+    normalize_to_tic: bool = True,
+    registered_cs: str = "registered",
+) -> dict[str, np.ndarray | int]:
+    if not isinstance(zarr_path, CoregistrationDataset):
+        table_key, tic_key = _resolve_msi_dataset_keys(
+            zarr_path,
+            msi_dataset=msi_dataset,
+            table_key=table_key,
+            tic_key=tic_key,
+        )
+    dataset = (
+        zarr_path
+        if isinstance(zarr_path, CoregistrationDataset)
+        else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
+    )
+    return dataset.summarize_region_spectra(pixel_mask, normalize_to_tic=bool(normalize_to_tic))
+
+
 @dataclass
 class ReferenceThresholdMask:
     reference_key: str
@@ -3509,6 +3630,39 @@ def launch_coregistration_gui(
         selected_mask[finite] = selected_finite
         return source_state, shape_key, selected_mask, default_label
 
+    def selected_annotation_rows(active_layer, *, include_same_label: bool = False) -> tuple[dict[str, Any] | None, str | None, list[int], str]:
+        if active_layer is None or active_layer not in annotation_shape_layers.values():
+            return None, None, [], ""
+        selected_data = sorted(int(idx) for idx in getattr(active_layer, "selected_data", set()))
+        if not selected_data:
+            return None, None, [], ""
+        metadata = _layer_metadata(active_layer)
+        dataset_id = str(metadata.get("annotation_dataset_id", ""))
+        shape_key = str(metadata.get("annotation_shape_key", ""))
+        row_lookup = list(metadata.get("annotation_source_row_indices", []))
+        if not dataset_id or not shape_key or not row_lookup:
+            return None, None, [], ""
+        source_state = datasets.get(dataset_id)
+        if source_state is None or shape_key not in source_state["dataset"].sdata.shapes:
+            return None, None, [], ""
+
+        source_gdf = source_state["dataset"].sdata.shapes[shape_key]
+        row_indices = sorted({int(row_lookup[idx]) for idx in selected_data if 0 <= int(idx) < len(row_lookup)})
+        current_label = ""
+        if "_annotation_label" in source_gdf.columns:
+            labels = [
+                str(source_gdf.iloc[idx]["_annotation_label"]).strip()
+                for idx in row_indices
+                if 0 <= idx < len(source_gdf) and str(source_gdf.iloc[idx]["_annotation_label"]).strip()
+            ]
+            current_label = labels[0] if labels else ""
+            if include_same_label and current_label:
+                row_indices = [
+                    idx for idx, value in enumerate(source_gdf["_annotation_label"])
+                    if str(value).strip() == current_label
+                ]
+        return source_state, shape_key, row_indices, current_label
+
     def refresh_annotation_widget_choices():
         keys = current_annotation_shape_keys()
         choices = ["(none)"] + keys if keys else ["(none)"]
@@ -4748,6 +4902,79 @@ def launch_coregistration_gui(
         annotation_show_labels = bool(show_labels)
         annotation_label_size = int(label_size)
         apply_annotation_visuals()
+
+    @magicgui(
+        new_label={"widget_type": "LineEdit", "label": "New ROI label"},
+        include_same_label={"widget_type": "CheckBox", "text": "Rename all ROIs with the same current label"},
+        call_button="Rename Selected ROI(s)",
+    )
+    def rename_selected_annotation_widget(new_label: str = "", include_same_label: bool = False):
+        active_layer = getattr(viewer.layers.selection, "active", None)
+        source_state, shape_key, row_indices, current_label = selected_annotation_rows(
+            active_layer,
+            include_same_label=bool(include_same_label),
+        )
+        if source_state is None or shape_key is None or not row_indices:
+            QMessageBox.warning(
+                None,
+                "Rename Selected ROI(s)",
+                "Select an annotation shapes layer and click one or more shapes first.",
+            )
+            return
+        cleaned_label = str(new_label).strip()
+        if not cleaned_label:
+            QMessageBox.warning(None, "Rename Selected ROI(s)", "Enter a non-empty ROI label.")
+            return
+
+        def rename_rows():
+            coreg_dataset = source_state["dataset"]
+            source_gdf = coreg_dataset.sdata.shapes[shape_key].copy()
+            if "_annotation_label" not in source_gdf.columns:
+                source_gdf["_annotation_label"] = ""
+            valid_rows = [idx for idx in row_indices if 0 <= int(idx) < len(source_gdf)]
+            if not valid_rows:
+                raise ValueError("The selected annotation rows are no longer available.")
+            source_gdf.loc[source_gdf.index[valid_rows], "_annotation_label"] = cleaned_label
+            transforms = get_transformation(coreg_dataset.sdata.shapes[shape_key], get_all=True)
+            shape_element = ShapesModel.parse(source_gdf)
+            set_transformation(shape_element, transforms, set_all=True)
+            _write_element_to_existing_store(
+                coreg_dataset.zarr_path,
+                element=shape_element,
+                element_type="shapes",
+                element_name=shape_key,
+                overwrite=True,
+                consolidate_metadata=True,
+            )
+            return len(valid_rows)
+
+        try:
+            renamed_count = _run_with_busy_dialog(
+                "Rename Selected ROI(s)",
+                "Updating annotation labels...",
+                rename_rows,
+            )
+        except Exception as exc:
+            QMessageBox.warning(None, "Rename Selected ROI(s)", str(exc))
+            return
+
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].sdata = sd.read_zarr(dataset_state["dataset"].zarr_path)
+            add_annotation_shape_layers(dataset_state, [shape_key])
+        apply_annotation_visuals()
+        refresh_annotation_widget_choices()
+        try:
+            refresh_threshold_prefilter_choices(get_active_state())
+            refresh_if_threshold_choices(get_active_state())
+            roi_mask_controls()
+        except Exception:
+            pass
+        old_label = f" from '{current_label}'" if current_label else ""
+        QMessageBox.information(
+            None,
+            "Rename Selected ROI(s)",
+            f"Renamed {renamed_count} ROI geometry/geometries{old_label} to '{cleaned_label}'.",
+        )
 
     @magicgui(
         normalize_to_tic={"widget_type": "CheckBox", "text": "Normalize to TIC"},
@@ -6506,6 +6733,7 @@ def launch_coregistration_gui(
     controls_layout.addWidget(roi_mask_controls.native)
     controls_layout.addWidget(export_msi_from_roi_widget.native)
     controls_layout.addWidget(annotation_display_controls.native)
+    controls_layout.addWidget(rename_selected_annotation_widget.native)
     controls_layout.addWidget(view_selected_annotation_pixels_widget.native)
     controls_layout.addWidget(export_selected_annotations_widget.native)
     controls_layout.addStretch(1)
