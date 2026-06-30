@@ -581,6 +581,8 @@ def barchart(
         colors:str | list[str] | None = None,
         autonormalize:bool=False,
         error:str | None = "sd",
+        draw_points: bool = True,
+        draw_error:bool = True,
         point_color:str="k",
         point_size:float=20,
         point_alpha:float=0.8,
@@ -684,6 +686,8 @@ def barchart(
             ]
             color = get_color(idx)
 
+            if not draw_error:
+                errors = None
             ax.bar(
                 centers,
                 bar_values,
@@ -695,17 +699,18 @@ def barchart(
                 capsize=4,
                 zorder=2)
 
-            for center, top_key in zip(centers, top_keys):
-                values = plot_data[top_key][subkey]
-                ax.scatter(
-                    point_positions(center, width, len(values)),
-                    values,
-                    color=point_color,
-                    s=point_size,
-                    alpha=point_alpha,
-                    edgecolors='k',
-                    linewidths=0.4,
-                    zorder=3)
+            if draw_points:
+                for center, top_key in zip(centers, top_keys):
+                    values = plot_data[top_key][subkey]
+                    ax.scatter(
+                        point_positions(center, width, len(values)),
+                        values,
+                        color=point_color,
+                        s=point_size,
+                        alpha=point_alpha,
+                        edgecolors='k',
+                        linewidths=0.4,
+                        zorder=3)
 
         ax.legend()
 
@@ -717,6 +722,9 @@ def barchart(
         width = 0.55
         color = get_color()
 
+        if not draw_error:
+            draw_error = None
+
         ax.bar(
             centers,
             bar_values,
@@ -727,20 +735,17 @@ def barchart(
             capsize=4,
             zorder=2)
 
-        for center, values in zip(centers, bar_data):
-            ax.scatter(
-                point_positions(center, width, len(values)),
-                values,
-                color=point_color,
-                s=point_size,
-                alpha=point_alpha,
-                edgecolors='k',
-                linewidths=0.4,
-                zorder=3)
+        if draw_points:
+            for center, values in zip(centers, bar_data):
+                ax.scatter(
+                    point_positions(center, width, len(values)),
+                    values,
+                    color=point_color,
+                    s=point_size,
+                    alpha=point_alpha,
+                    edgecolors='k',
+                    linewidths=0.4,
+                    zorder=3)
 
     ax.set_xticks([x + 1 for x in range(len(top_keys))], top_keys, rotation=45, ha='right')
     return ax
-        
-
-
-    
