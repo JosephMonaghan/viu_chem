@@ -691,7 +691,7 @@ def barchart(
             ax.bar(
                 centers,
                 bar_values,
-                yerr=errors,
+                yerr=[np.zeros_like(errors), errors],
                 width=width,
                 label=subkey,
                 color=color,
@@ -728,7 +728,7 @@ def barchart(
         ax.bar(
             centers,
             bar_values,
-            yerr=errors,
+            yerr=[np.zeros_like(errors), errors],
             width=width,
             color=color,
             edgecolor='k',

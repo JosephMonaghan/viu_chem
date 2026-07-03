@@ -126,6 +126,151 @@ def _extract_qptiff_channel_metadata(tf: tifffile.TiffFile, channel_count: int) 
     return names, colors
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            denom = float(value[1])
+            return float(value[0]) / denom if denom else np.nan
+    except Exception:
+        pass
+    try:
+        numerator = getattr(value, "numerator")
+        denominator = getattr(value, "denominator")
+        denominator = float(denominator)
+        return float(numerator) / denominator if denominator else np.nan
+    except Exception:
+        return np.nan
+
+
+def _unit_to_um(unit: Any) -> float:
+    if unit == 2:
+        return 25400.0
+    if unit == 3:
+        return 10000.0
+    text = str(unit or "").strip().lower().replace("µ", "u").replace("μ", "u")
+    if text in {"um", "micron", "microns", "micrometer", "micrometers", "micrometre", "micrometres"}:
+        return 1.0
+    if text in {"nm", "nanometer", "nanometers", "nanometre", "nanometres"}:
+        return 0.001
+    if text in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
+        return 1000.0
+    if text in {"cm", "centimeter", "centimeters", "centimetre", "centimetres"}:
+        return 10000.0
+    if text in {"inch", "inches", "in"}:
+        return 25400.0
+    return np.nan
+
+
+def _pixel_size_from_description(description: str | None) -> tuple[float, float] | None:
+    if not description:
+        return None
+
+    def from_mapping(attrs: Mapping[str, Any]) -> tuple[float, float] | None:
+        lower = {str(key).lower(): value for key, value in attrs.items()}
+        x = _as_float(
+            lower.get("physicalsizex")
+            or lower.get("pixelsizex")
+            or lower.get("pixel_size_x")
+            or lower.get("pixelsizemicrons")
+            or lower.get("micronsperpixel")
+        )
+        y = _as_float(
+            lower.get("physicalsizey")
+            or lower.get("pixelsizey")
+            or lower.get("pixel_size_y")
+            or lower.get("pixelsizemicrons")
+            or lower.get("micronsperpixel")
+        )
+        x_unit = lower.get("physicalsizexunit") or lower.get("pixelsizexunit") or lower.get("unit") or "um"
+        y_unit = lower.get("physicalsizeyunit") or lower.get("pixelsizeyunit") or lower.get("unit") or x_unit
+        x_factor = _unit_to_um(x_unit)
+        y_factor = _unit_to_um(y_unit)
+        if np.isfinite(x) and x > 0 and np.isfinite(y) and y > 0:
+            if not np.isfinite(x_factor):
+                x_factor = 1.0
+            if not np.isfinite(y_factor):
+                y_factor = x_factor
+            return float(x * x_factor), float(y * y_factor)
+        return None
+
+    try:
+        root = ET.fromstring(description)
+        for elem in root.iter():
+            result = from_mapping(elem.attrib)
+            if result is not None:
+                return result
+            text = (elem.text or "").strip()
+            tag = str(elem.tag).split("}")[-1].lower()
+            if text and tag in {"pixelsizemicrons", "micronsperpixel"}:
+                value = _as_float(text)
+                if np.isfinite(value) and value > 0:
+                    return float(value), float(value)
+    except Exception:
+        pass
+    return None
+
+
+def _pixel_size_from_tiff_page(page) -> tuple[float, float] | None:
+    tags = getattr(page, "tags", {})
+    description = None
+    try:
+        description = page.description
+    except Exception:
+        pass
+    result = _pixel_size_from_description(description)
+    if result is not None:
+        return result
+
+    try:
+        x_res = _as_float(tags["XResolution"].value)
+        y_res = _as_float(tags["YResolution"].value)
+    except Exception:
+        return None
+    if not np.isfinite(x_res) or x_res <= 0 or not np.isfinite(y_res) or y_res <= 0:
+        return None
+    try:
+        resolution_unit = tags["ResolutionUnit"].value
+    except Exception:
+        resolution_unit = ""
+    unit_um = _unit_to_um(resolution_unit)
+    if not np.isfinite(unit_um):
+        try:
+            resolution_unit = tags["ResolutionUnit"].value.name
+            unit_um = _unit_to_um(resolution_unit)
+        except Exception:
+            pass
+    if not np.isfinite(unit_um):
+        return None
+    return float(unit_um / x_res), float(unit_um / y_res)
+
+
+def _read_tiff_fullres_pixel_size_um(path: Path) -> tuple[float, float] | None:
+    try:
+        with tifffile.TiffFile(path) as tf:
+            pages = []
+            try:
+                series = tf.series[0]
+                levels = list(getattr(series, "levels", []) or [series])
+                pages.append(levels[0].pages[0])
+            except Exception:
+                pass
+            try:
+                pages.append(tf.pages[0])
+            except Exception:
+                pass
+            for page in pages:
+                result = _pixel_size_from_tiff_page(page)
+                if result is not None:
+                    return result
+    except Exception:
+        return None
+    return None
+
+
 def _annotation_scale_from_pyramid_level(
     target_attrs: Mapping[str, Any] | dict[str, Any] | Any,
     annotation_pyramid_level: int | None,
@@ -1093,7 +1238,23 @@ class CoregistrationDataset:
                     return np.eye(3, dtype=float), None
 
         if not self.reference_image_keys:
-            return np.eye(3, dtype=float), None
+            # No reference pixel size is available yet, but the MSI pixel
+            # dimensions still tell us the aspect ratio. Normalize by the
+            # smaller dimension so square MSI pixels remain identity and a
+            # later reference image can still provide the absolute scale.
+            base_um = min(msi_um_x, msi_um_y)
+            if not np.isfinite(base_um) or base_um <= 0:
+                return np.eye(3, dtype=float), None
+            sx = msi_um_x / base_um
+            sy = msi_um_y / base_um
+            return np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], dtype=float), (
+                None,
+                msi_um_x,
+                msi_um_y,
+                base_um,
+                base_um,
+                source,
+            )
 
         preferred = [key for key in ("hne", "optical") if key in self.reference_image_keys]
         ref_key = preferred[0] if preferred else self.reference_image_keys[0]
@@ -1152,20 +1313,28 @@ def add_reference_image(
 
     px_um_x = 2.54
     px_um_y = 2.54
-    try:
-        meta = iio.immeta(source_path)
-        dpi = meta.get("dpi")
-        if dpi is not None:
-            if isinstance(dpi, (tuple, list)) and len(dpi) >= 2:
-                dx, dy = float(dpi[0]), float(dpi[1])
-            else:
-                dx = dy = float(dpi)
-            if dx > 0:
-                px_um_x = 25400.0 / dx
-            if dy > 0:
-                px_um_y = 25400.0 / dy
-    except Exception:
-        pass
+    pixel_size_source = "fallback_10000dpi"
+    tiff_pixel_size = _read_tiff_fullres_pixel_size_um(source_path)
+    if tiff_pixel_size is not None:
+        px_um_x, px_um_y = tiff_pixel_size
+        pixel_size_source = "tifffile_metadata"
+    else:
+        try:
+            meta = iio.immeta(source_path)
+            dpi = meta.get("dpi")
+            if dpi is not None:
+                if isinstance(dpi, (tuple, list)) and len(dpi) >= 2:
+                    dx, dy = float(dpi[0]), float(dpi[1])
+                else:
+                    dx = dy = float(dpi)
+                if dx > 0:
+                    px_um_x = 25400.0 / dx
+                    pixel_size_source = "imageio_dpi"
+                if dy > 0:
+                    px_um_y = 25400.0 / dy
+                    pixel_size_source = "imageio_dpi"
+        except Exception:
+            pass
 
     if qptiff_meta:
         px_um_x *= float(qptiff_meta["image_to_fullres_scale_x"])
@@ -1173,7 +1342,7 @@ def add_reference_image(
 
     element.attrs["pixel_size_x_um"] = float(px_um_x)
     element.attrs["pixel_size_y_um"] = float(px_um_y)
-    element.attrs["pixel_size_source"] = "image_metadata_or_default_10000dpi"
+    element.attrs["pixel_size_source"] = pixel_size_source
     element.attrs["source_path"] = str(source_path)
     if saved_display_settings:
         element.attrs["if_display_settings"] = saved_display_settings

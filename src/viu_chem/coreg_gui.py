@@ -218,6 +218,21 @@ def launch_coregistration_gui(
         return Colormap(colors=colors, name="threshold_blue_red")
 
     viewer = napari.Viewer(title=host_zarr_path.name)
+    retained_dialogs: list[QDialog] = []
+
+    def retain_dialog(dialog: QDialog):
+        retained_dialogs.append(dialog)
+
+        def forget_dialog(*_args, dialog=dialog):
+            try:
+                retained_dialogs.remove(dialog)
+            except ValueError:
+                pass
+
+        try:
+            dialog.destroyed.connect(forget_dialog)
+        except Exception:
+            pass
     overlay_colormap_order = [
         "viridis",
         "magma",
@@ -361,6 +376,7 @@ def launch_coregistration_gui(
         if not found_registration:
             scale_guess, _ = coreg_dataset.estimate_initial_scale_from_pixel_sizes()
             saved_xy_matrix = scale_guess
+        initial_transform_xy = np.asarray(saved_xy_matrix, dtype=float).copy()
 
         overlay_name = "viridis"
         ion_layer = viewer.add_image(
@@ -400,7 +416,9 @@ def launch_coregistration_gui(
             "current_contrast_high_pct": 99.5,
             "current_contrast_low": float(initial_contrast_limits[0]),
             "current_contrast_high": float(initial_contrast_limits[1]),
-            "current_transform_xy": np.asarray(saved_xy_matrix, dtype=float).copy(),
+            "current_transform_xy": initial_transform_xy.copy(),
+            "initial_transform_xy": initial_transform_xy.copy(),
+            "current_transform_is_initial_guess": not bool(found_registration),
             "ion_layer": ion_layer,
             "active_ion_viewer_index": 0,
             "ion_viewers": [],
@@ -863,6 +881,33 @@ def launch_coregistration_gui(
             add_or_update_reference_layer(coreg_dataset, key, visible=(idx == 0 and _reference_layer_count() == 0))
         return state
 
+    def refresh_datasets_after_reference_update():
+        refreshed_sdata = sd.read_zarr(host_zarr_path)
+        specs = _infer_msi_dataset_specs(refreshed_sdata)
+        all_tic_keys = {str(spec["tic_key"]) for spec in specs}
+        reference_keys = [key for key in refreshed_sdata.images.keys() if key not in all_tic_keys]
+        for state in datasets.values():
+            coreg_dataset = state["dataset"]
+            coreg_dataset.sdata = refreshed_sdata
+            coreg_dataset.reference_image_keys = list(reference_keys)
+            current_transform = np.asarray(state["current_transform_xy"], dtype=float)
+            initial_transform = np.asarray(state.get("initial_transform_xy", np.eye(3, dtype=float)), dtype=float)
+            if not bool(state.get("current_transform_is_initial_guess", False)):
+                continue
+            if current_transform.shape != (3, 3) or not np.allclose(current_transform, initial_transform, rtol=1e-6, atol=1e-6):
+                continue
+            scale_guess, info = coreg_dataset.estimate_initial_scale_from_pixel_sizes()
+            if info is None:
+                continue
+            scale_guess = np.asarray(scale_guess, dtype=float)
+            if scale_guess.shape != (3, 3) or not np.all(np.isfinite(scale_guess)):
+                continue
+            if np.allclose(scale_guess, current_transform, rtol=1e-6, atol=1e-6):
+                continue
+            state["current_transform_xy"][:] = scale_guess
+            state["initial_transform_xy"] = scale_guess.copy()
+            apply_transform_to_state(state)
+
     for spec in _infer_msi_dataset_specs(dataset.sdata):
         embedded_dataset = CoregistrationDataset(
             host_zarr_path,
@@ -1321,19 +1366,6 @@ def launch_coregistration_gui(
         scale_bar_update_timer.start(40)
 
     scale_bar_update_timer.timeout.connect(update_scale_bar_overlay)
-
-    @magicgui(
-        visible={"widget_type": "CheckBox"},
-        location={"widget_type": "ComboBox", "choices": ["lower right", "lower left", "upper right", "upper left"]},
-        call_button="Update Scale Bar",
-    )
-    def scale_bar_controls(
-        visible: bool = True,
-        location: str = "lower right",
-    ):
-        scale_bar_settings["visible"] = bool(visible)
-        scale_bar_settings["location"] = str(location)
-        update_scale_bar_overlay()
 
     def normalize_ion_display_mode(mode: str) -> str:
         value = getattr(mode, "value", mode)
@@ -3323,9 +3355,7 @@ def launch_coregistration_gui(
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
-        if not hasattr(viewer, "_viu_chem_debug_dialogs"):
-            viewer._viu_chem_debug_dialogs = []
-        viewer._viu_chem_debug_dialogs.append(dialog)
+        retain_dialog(dialog)
 
     @magicgui(
         reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
@@ -3383,9 +3413,7 @@ def launch_coregistration_gui(
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
-        if not hasattr(viewer, "_viu_chem_debug_dialogs"):
-            viewer._viu_chem_debug_dialogs = []
-        viewer._viu_chem_debug_dialogs.append(dialog)
+        retain_dialog(dialog)
 
     @magicgui(
         reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
@@ -4244,10 +4272,10 @@ def launch_coregistration_gui(
             "Importing optical image...",
             lambda: add_reference_image(coreg_dataset.zarr_path, path, key="optical", registered_cs=registered_cs),
         )
-        coreg_dataset.sdata = _run_with_busy_dialog(
+        _run_with_busy_dialog(
             "Add Optical Image",
             "Refreshing optical image layers...",
-            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+            refresh_datasets_after_reference_update,
         )
         if "optical" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("optical")
@@ -4266,10 +4294,10 @@ def launch_coregistration_gui(
             "Importing H&E image...",
             lambda: add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs),
         )
-        coreg_dataset.sdata = _run_with_busy_dialog(
+        _run_with_busy_dialog(
             "Add H&E Image",
             "Refreshing H&E image layers...",
-            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+            refresh_datasets_after_reference_update,
         )
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
@@ -4280,7 +4308,7 @@ def launch_coregistration_gui(
         qptiff_level={"widget_type": "SpinBox", "min": 0, "max": 12, "step": 1},
         call_button="Add/Update H&E From QPTIFF",
     )
-    def add_hne_from_qptiff(qptiff_level: int = 0):
+    def add_hne_from_qptiff(qptiff_level: int = 4):
         state = get_active_state()
         coreg_dataset = state["dataset"]
         path, _ = QFileDialog.getOpenFileName(None, "Select H&E QPTIFF", "", "QPTIFF/OME-TIFF (*.qptiff *.ome.tif *.ome.tiff *.tif *.tiff);;All files (*)")
@@ -4291,10 +4319,10 @@ def launch_coregistration_gui(
             "Importing H&E QPTIFF...\nLarge pyramid images can take a little while.",
             lambda: add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs, qptiff_level=int(qptiff_level)),
         )
-        coreg_dataset.sdata = _run_with_busy_dialog(
+        _run_with_busy_dialog(
             "Add H&E QPTIFF",
             "Refreshing H&E image layers...",
-            lambda: sd.read_zarr(coreg_dataset.zarr_path),
+            refresh_datasets_after_reference_update,
         )
         if "hne" not in coreg_dataset.reference_image_keys:
             coreg_dataset.reference_image_keys.append("hne")
@@ -4316,7 +4344,7 @@ def launch_coregistration_gui(
         object_mode: str = "annotations_only",
         max_shapes: int = 0,
         simplify_tolerance: float = 0.0,
-        annotation_pyramid_level: int = -1,
+        annotation_pyramid_level: int = 4,
     ):
         state = get_active_state()
         coreg_dataset = state["dataset"]
@@ -4419,6 +4447,7 @@ def launch_coregistration_gui(
                 registered_cs=registered_cs,
             ),
         )
+        state["current_transform_is_initial_guess"] = False
 
     @magicgui(call_button="Save All Registrations")
     def save_all_registrations_widget():
@@ -4431,6 +4460,7 @@ def launch_coregistration_gui(
                     tic_key=state["dataset"].tic_key,
                     registered_cs=registered_cs,
                 )
+                state["current_transform_is_initial_guess"] = False
         _run_with_busy_dialog("Save Registrations", "Saving all registrations...", save_all)
 
     @magicgui(call_button="Export Current View TIFF")
@@ -4474,25 +4504,69 @@ def launch_coregistration_gui(
     controls_layout = QVBoxLayout(controls_container)
     controls_layout.setContentsMargins(6, 6, 6, 6)
     controls_layout.setSpacing(8)
-    controls_layout.addWidget(spectrum_widget)
-    controls_layout.addWidget(mz_selector.native)
-    controls_layout.addWidget(ion_display_options.native)
-    controls_layout.addWidget(ion_status_label)
-    controls_layout.addWidget(ion_viewer_selector.native)
-    controls_layout.addWidget(add_ion_viewer_widget.native)
-    controls_layout.addWidget(remove_ion_viewer_widget.native)
-    controls_layout.addWidget(scale_bar_controls.native)
-    controls_layout.addWidget(reset_canvas_view_widget.native)
-    controls_layout.addWidget(export_current_view_widget.native)
-    controls_layout.addWidget(rename_dataset_widget.native)
-    controls_layout.addWidget(copy_affine_to_target_widget.native)
-    controls_layout.addWidget(msi_layer_controls)
-    controls_layout.addWidget(roi_mask_controls.native)
-    controls_layout.addWidget(export_msi_from_roi_widget.native)
-    controls_layout.addWidget(annotation_display_controls.native)
-    controls_layout.addWidget(rename_selected_annotation_widget.native)
-    controls_layout.addWidget(view_selected_annotation_pixels_widget.native)
-    controls_layout.addWidget(export_selected_annotations_widget.native)
+
+    def section_panel(title: str, widgets: Iterable[QWidget], color: str) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName(f"section_{sanitize_name(title)}")
+        panel.setStyleSheet(
+            f"QWidget#{panel.objectName()} {{ "
+            f"background-color: {color}; "
+            "border: 1px solid #4f5258; "
+            "border-radius: 6px; "
+            "}"
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        label = QLabel(title)
+        label.setStyleSheet("color: #ffffff; font-weight: 600;")
+        layout.addWidget(label)
+        for widget in widgets:
+            layout.addWidget(widget)
+        return panel
+
+    controls_layout.addWidget(
+        section_panel(
+            "m/z selection / normalization",
+            [spectrum_widget, mz_selector.native, ion_display_options.native, ion_status_label],
+            "#2a3746",
+        )
+    )
+    controls_layout.addWidget(
+        section_panel(
+            "Ion viewers",
+            [ion_viewer_selector.native, add_ion_viewer_widget.native, remove_ion_viewer_widget.native],
+            "#303d32",
+        )
+    )
+    controls_layout.addWidget(
+        section_panel(
+            "Datasets and layers",
+            [rename_dataset_widget.native, msi_layer_controls],
+            "#42372a",
+        )
+    )
+    controls_layout.addWidget(
+        section_panel(
+            "Masks and annotations",
+            [
+                roi_mask_controls.native,
+                export_msi_from_roi_widget.native,
+                annotation_display_controls.native,
+                rename_selected_annotation_widget.native,
+                view_selected_annotation_pixels_widget.native,
+                export_selected_annotations_widget.native,
+            ],
+            "#3a3044",
+        )
+    )
+    controls_layout.addWidget(
+        section_panel(
+            "View and export",
+            [reset_canvas_view_widget.native, export_current_view_widget.native],
+            "#2d2d30",
+        )
+    )
     controls_layout.addStretch(1)
     controls_scroll.setWidget(controls_container)
 
@@ -4655,6 +4729,7 @@ def launch_coregistration_gui(
     alignment_dialog_container_layout.addWidget(preview_affine_mi_inputs_widget.native)
     alignment_dialog_container_layout.addWidget(optimize_affine_registration_widget.native)
     alignment_dialog_container_layout.addWidget(QLabel("Registration"))
+    alignment_dialog_container_layout.addWidget(copy_affine_to_target_widget.native)
     alignment_dialog_container_layout.addWidget(save_registration_widget.native)
     alignment_dialog_container_layout.addWidget(save_all_registrations_widget.native)
     alignment_dialog_container_layout.addStretch(1)

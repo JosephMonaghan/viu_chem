@@ -15,6 +15,7 @@ Welcome to the VIU Chemistry Python package documentation page!
    :caption: Contents:
 
    Quick Start Guide <quickstart>
+   Coregistration Workflow <coregistration>
    Function Documentation <viu_chem>
    Example #1 - MSI workflow <ExampleMSI>
    Example #2 - Chromatograms and calibration <ExampleChem412>

@@ -57,5 +57,28 @@ viu\_chem.msi_stats
    :undoc-members:
    :show-inheritance:
 
+viu\_chem.msi\_coregistration
+-----------------------------
+
+.. automodule:: viu_chem.msi_coregistration
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+viu\_chem.coreg\_figures
+-----------------------------
+
+.. automodule:: viu_chem.coreg_figures
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+viu\_chem.coreg\_gui
+-----------------------------
+
+.. automodule:: viu_chem.coreg_gui
+   :members:
+   :undoc-members:
+   :show-inheritance:
 
 

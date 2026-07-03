@@ -855,6 +855,31 @@ def _add_scale_bar(
     )
 
 
+def _save_figure_for_illustrator(fig, output_path: str | Path, *, dpi: int, background_color: str, save_pad_inches: float):
+    """Save a vector-container figure with editable text/vector annotations."""
+    vector_rc = {
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+    with plt.rc_context(vector_rc):
+        fig.savefig(
+            Path(output_path).expanduser(),
+            dpi=int(dpi),
+            facecolor=background_color,
+            bbox_inches="tight",
+            pad_inches=float(save_pad_inches),
+        )
+
+
+def _iter_output_paths(paths: str | Path | Iterable[str | Path] | None) -> list[Path]:
+    if paths is None:
+        return []
+    if isinstance(paths, (str, Path)):
+        return [Path(paths).expanduser()]
+    return [Path(path).expanduser() for path in paths]
+
+
 def _ion_layer_config(
     layer: Mapping[str, Any],
     *,
@@ -929,6 +954,8 @@ def export_reference_ion_overlay(
     *,
     reference_key: str = "hne",
     output_path: str | Path | None = None,
+    editable_output_path: str | Path | Iterable[str | Path] | None = None,
+    save_editable: bool = False,
     default_msi_dataset: str | None = None,
     ppm_tolerance: float = 5.0,
     normalize_to_tic: bool = True,
@@ -967,6 +994,12 @@ def export_reference_ion_overlay(
     save: bool = True,
     registered_cs: str = "registered",
 ):
+    """Export a reference image with one or more coregistered ion overlays.
+
+    TIFF/PNG outputs are standard raster figures. Use `editable_output_path` or
+    `save_editable=True` to also save a PDF/SVG-style file where text, scale
+    bars, colorbar ticks, and vector patches remain editable in Illustrator.
+    """
     zarr_path = Path(zarr_path).expanduser()
     reference_dataset = CoregistrationDataset(zarr_path, registered_cs=registered_cs)
     cmaps = list(ion_cmaps)
@@ -1116,8 +1149,26 @@ def export_reference_ion_overlay(
         fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
 
     if save:
-        fig.savefig(output_path, dpi=int(dpi), facecolor=background_color, bbox_inches="tight", pad_inches=float(save_pad_inches))
+        _save_figure_for_illustrator(
+            fig,
+            output_path,
+            dpi=int(dpi),
+            background_color=background_color,
+            save_pad_inches=float(save_pad_inches),
+        )
         print(f"Saved {output_path}")
+    editable_paths = _iter_output_paths(editable_output_path)
+    if save_editable:
+        editable_paths.append(Path(output_path).expanduser().with_suffix(".pdf"))
+    for editable_path in editable_paths:
+        _save_figure_for_illustrator(
+            fig,
+            editable_path,
+            dpi=int(dpi),
+            background_color=background_color,
+            save_pad_inches=float(save_pad_inches),
+        )
+        print(f"Saved editable {editable_path}")
     if show:
         plt.show()
     else:

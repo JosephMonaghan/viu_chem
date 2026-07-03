@@ -118,4 +118,6 @@ Where to Go Next
 
 See :doc:`ExampleMSI` for a command-line MSI image export workflow, and
 :doc:`ExampleChem412` for chromatogram overlay, peak integration, and
-calibration curve plotting.
+calibration curve plotting. See :doc:`coregistration` for SpatialData zarr
+preparation, napari registration, annotation masks, threshold summaries,
+colocalization, and coregistered figure export.
