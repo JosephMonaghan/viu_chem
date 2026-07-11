@@ -65,9 +65,7 @@ def get_TIC_image(src:str):
     
     :param src: File path to the imzML source
     :return tic_image: Total ion current image as a numpy array"""
-    with warnings.catch_warnings(action='ignore'):
-        with ImzMLParser.ImzMLParser(filename=src,parse_lib='lxml') as img:
-            tic_image = ImzMLParser.getionimage(img,500,9999)
+    tic_image = iw_utils.tic_image(src)
     
     return tic_image
 

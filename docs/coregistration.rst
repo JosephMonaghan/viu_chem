@@ -358,11 +358,114 @@ and optional editable PDF output:
 
 For treatment/replicate grids, use ``coregistered_campaign_drawgrid``.
 
-API Reference
--------------
+Coregistration API Reference
+----------------------------
 
-The most commonly used public API is documented in:
+These are the public functions and data containers used by the workflow above.
+The full module listings are also available in :mod:`viu_chem.msi_coregistration`,
+:mod:`viu_chem.coreg_figures`, and :mod:`viu_chem.coreg_gui`.
 
-* :mod:`viu_chem.msi_coregistration`
-* :mod:`viu_chem.coreg_figures`
-* :mod:`viu_chem.coreg_gui`
+Dataset Preparation and Management
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: viu_chem.msi_coregistration
+
+.. autosummary::
+
+   convert_input_to_zarr
+   prepare_coregistration_zarr
+   prepare_coregistration_batch
+   list_coregistration_msi_datasets
+   embed_msi_dataset
+   rename_msi_dataset
+   delete_msi_dataset
+   add_reference_image
+
+Registration and Display Utilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   CoregistrationDataset
+   save_coregistration
+   launch_coregistration_gui
+   xy_to_yx_matrix
+   auto_contrast_limits
+   finite_data_limits
+   normalize_image_for_registration
+   prepare_ion_for_display
+   sitk_affine_from_fixed_to_moving_matrix
+   sitk_transform_to_homogeneous_matrix
+
+Annotation and ROI Utilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   import_geojson_annotations
+   delete_geojson_annotations
+   rescale_geojson_annotations
+   transform_geojson_annotations
+   create_annotation_region_mask
+   summarize_annotation_region_spectra
+   summarize_msi_pixel_mask_spectra
+
+Threshold Masks and Threshold Summaries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   MSIThresholdMask
+   MSIThresholdSpectra
+   create_msi_threshold_mask
+   summarize_msi_threshold_spectra
+   ReferenceThresholdMask
+   ReferenceThresholdSpectra
+   sample_reference_channel_values_at_msi_pixels
+   summarize_reference_channels_in_msi_mask
+   create_reference_threshold_mask
+   summarize_reference_threshold_spectra
+
+Threshold Annotations
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   create_msi_threshold_annotation
+   create_pooled_msi_threshold_annotation
+   create_reference_threshold_annotation
+
+Colocalization and Correlation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   colocalized_msi_features
+   colocalized_msi_features_between_datasets
+   correlate_msi_features_with_reference_channels
+
+Coregistered Figure API
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: viu_chem.coreg_figures
+
+.. autosummary::
+
+   CoregisteredImage
+   mask_low_intensity_pixels
+   get_coregistered_reference_image
+   get_coregistered_ion_image
+   get_coregistered_msi_mask_image
+   get_coregistered_image_layers
+   reference_rgb_composite
+   export_reference_ion_overlay
+   coregistered_campaign_drawgrid
+
+GUI Entry Point
+~~~~~~~~~~~~~~~
+
+.. currentmodule:: viu_chem.coreg_gui
+
+.. autosummary::
+
+   launch_coregistration_gui
