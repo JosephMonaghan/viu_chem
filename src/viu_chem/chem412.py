@@ -55,6 +55,41 @@ def get_scan_filters(path:str | Path) -> list[str]:
 
     return filters
 
+def extract_cv_spectrum(path:Path, mz: float | list[float], tol: float = 10) -> pd.DataFrame:
+    """Extracts the CV spectrum from a FAIMS scan acquired from the tune page. Only accomodates one base scan filter.
+    
+    :param path: Path to the source mzML
+    :param mz: m/z value or list of values to extract
+    :param tol: m/z tolerance to extract at
+    
+    :return: DataFrame with a column for each m/z and the cv as the index"""
+    run = pymzml.run.Reader(path)
+    if isinstance(mz, float):
+        mz = [mz]
+    
+    data = []
+    
+    for spec in run:
+        local_dict = {}
+        local_dict['cv'] = float(spec['FAIMS compensation voltage'])
+        for local_mz in mz:
+            low, high = utils.calculate_tolerance_window(local_mz, tol)
+            intensity = spec.i[(spec.mz > low) &  (spec.mz < high)]
+            if len(intensity) > 0:
+                intensity = np.sum(intensity)
+            else:
+                intensity = 0
+            
+            local_dict[local_mz] = intensity
+        
+        data.append(local_dict)
+            
+    run.close()
+    df = pd.DataFrame(data)
+    df = df.set_index('cv')
+    return df
+
+
 def get_ms2(path: str | Path, precursor_mz:float, window:tuple[float, float],tol:float=0.5) -> list[np.array]:
     """Finds ms2 spectra (unaligned) within the window for the specified m/z in the target mzML. Tolerant to some float in precursor m/z from DDA.
     
@@ -69,7 +104,7 @@ def get_ms2(path: str | Path, precursor_mz:float, window:tuple[float, float],tol
         scan_time = spec.scan_time_in_minutes()
         if scan_time > window[0] and scan_time<window[1]:                
             if spec.ms_level >= 2:
-                selected_prec = spec['isolation window target m/z']
+                selected_prec = float(spec['isolation window target m/z'])
                 if selected_prec > (precursor_mz-tol) and selected_prec < (precursor_mz+tol):
                     spectra.append(np.column_stack([spec.mz, spec.i]))
                 
