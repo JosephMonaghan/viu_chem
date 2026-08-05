@@ -43,7 +43,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 from shapely.geometry import MultiPolygon, Point, Polygon
-from spatialdata.models import ShapesModel
+from spatialdata.models import ShapesModel, get_channel_names
 from spatialdata.transformations import get_transformation, set_transformation
 
 from . import msi_coregistration as _api
@@ -763,7 +763,9 @@ def launch_coregistration_gui(
                 channel_data = [raw_arr[idx] for idx in range(inferred_channels)]
             else:
                 channel_data = [raw_arr[..., idx] for idx in range(raw_arr.shape[-1])]
-            raw_names = image_attrs.get("channel_names", []) if isinstance(image_attrs, Mapping) else []
+            raw_names = list(get_channel_names(image))
+            if not raw_names and isinstance(image_attrs, Mapping):
+                raw_names = list(image_attrs.get("channel_names", []))
             raw_colors = image_attrs.get("channel_colors", []) if isinstance(image_attrs, Mapping) else []
             channel_names = [
                 f"{key}: {raw_names[idx]}" if idx < len(raw_names) and str(raw_names[idx]).strip() else f"{key} ch {idx + 1}"
@@ -794,7 +796,7 @@ def launch_coregistration_gui(
                     layer.name = channel_names[idx]
                     layer.visible = bool(visible and idx == 0)
                     layer.opacity = 1.0
-                    layer.blending = "translucent"
+                    layer.blending = "additive"
                     try:
                         layer.contrast_limits = auto_contrast_limits(channel_data[idx], low_pct=1.0, high_pct=99.8)
                     except Exception:
@@ -809,7 +811,7 @@ def launch_coregistration_gui(
                         data,
                         name=name,
                         visible=bool(visible and idx == 0),
-                        blending="translucent",
+                        blending="additive",
                         colormap=channel_colormaps[idx],
                         contrast_limits=auto_contrast_limits(data, low_pct=1.0, high_pct=99.8),
                         opacity=1.0,
@@ -830,7 +832,7 @@ def launch_coregistration_gui(
                 metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data)))))
                 metadata.setdefault("reference_gamma", float(getattr(layer, "gamma", 1.0)))
                 layer.opacity = 1.0
-                layer.blending = "translucent"
+                layer.blending = "additive"
                 _set_reference_layer_color(layer, str(metadata.get("reference_color_choice", "metadata")))
                 _apply_reference_layer_contrast(
                     layer,
@@ -2692,7 +2694,6 @@ def launch_coregistration_gui(
             _write_element_to_existing_store(
                 coreg_dataset.zarr_path,
                 element=shape_element,
-                element_type="shapes",
                 element_name=shape_key,
                 overwrite=True,
                 consolidate_metadata=True,

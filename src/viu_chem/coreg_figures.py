@@ -9,6 +9,7 @@ from matplotlib import gridspec
 from matplotlib.patches import Polygon as MplPolygon
 import numpy as np
 from scipy import ndimage
+from spatialdata.models import get_channel_names
 from spatialdata.transformations import get_transformation
 import zarr
 
@@ -530,7 +531,9 @@ def reference_rgb_composite(
     dims = tuple(getattr(image, "dims", ()))
     attrs = getattr(image, "attrs", {})
     raw_colors = attrs.get("channel_colors", []) if hasattr(attrs, "get") else []
-    raw_names = attrs.get("channel_names", []) if hasattr(attrs, "get") else []
+    raw_names = list(get_channel_names(image))
+    if not raw_names and hasattr(attrs, "get"):
+        raw_names = list(attrs.get("channel_names", []))
     source_channels = int(attrs.get("source_channels", 0)) if hasattr(attrs, "get") else 0
     saved_settings = _apply_reference_overrides(
         _read_saved_if_display_settings(dataset, reference_key),

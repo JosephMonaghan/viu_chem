@@ -1,4 +1,5 @@
 import imzml_writer.utils as utils
+import viu_chem.utils as viu_utils
 import pymzml
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,7 +74,7 @@ def extract_cv_spectrum(path:Path, mz: float | list[float], tol: float = 10) -> 
         local_dict = {}
         local_dict['cv'] = float(spec['FAIMS compensation voltage'])
         for local_mz in mz:
-            low, high = utils.calculate_tolerance_window(local_mz, tol)
+            low, high = viu_utils.calculate_tolerance_window(local_mz, tol)
             intensity = spec.i[(spec.mz > low) &  (spec.mz < high)]
             if len(intensity) > 0:
                 intensity = np.sum(intensity)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 import spatialdata as sd
-from spatialdata.models import Image2DModel, ShapesModel
+from spatialdata.models import Image2DModel, ShapesModel, TableModel, get_channel_names, get_table_keys
 from spatialdata.transformations import (
     Affine,
     Identity,
@@ -23,9 +23,6 @@ from matplotlib.path import Path as MplPath
 from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 from shapely import affinity
-from spatialdata._io import write_image, write_shapes, write_table
-
-
 import numpy as np
 import zarr
 from zarr.errors import ZarrUserWarning
@@ -49,11 +46,12 @@ def sanitize_name(name: str) -> str:
     return safe.strip("_").lower()
 
 
-def _parse_image_to_spatial(img: np.ndarray):
+def _parse_image_to_spatial(img: np.ndarray, *, channel_names: Iterable[str] | None = None):
     if img.ndim == 2:
-        return Image2DModel.parse(img, dims=("y", "x"))
+        return Image2DModel.parse(img[np.newaxis, ...], dims=("c", "y", "x"), c_coords=list(channel_names or ["image"]))
     if img.ndim == 3:
-        return Image2DModel.parse(img, dims=("y", "x", "c"))
+        names = list(channel_names) if channel_names is not None else None
+        return Image2DModel.parse(img, dims=("y", "x", "c"), c_coords=names)
     raise ValueError(f"Unexpected image shape: {img.shape}")
 
 
@@ -336,42 +334,24 @@ def _read_qptiff_image(path: Path, *, level: int = 0) -> tuple[np.ndarray, dict[
         return img, meta
 
 
-def _clone_spatial_image_element(image) -> Any:
-    data = np.asarray(image).copy()
-    dims = tuple(getattr(image, "dims", ()))
-    if dims and len(dims) == data.ndim:
-        return Image2DModel.parse(data, dims=dims)
-    return _parse_image_to_spatial(data)
-
-
 def _write_element_to_existing_store(
     zarr_path: str | Path,
     *,
     element: Any,
-    element_type: str,
     element_name: str,
     overwrite: bool = True,
     consolidate_metadata: bool = True,
 ) -> None:
-    """Write a new element into an existing SpatialData store without mutating a backed object in-place."""
+    """Add or replace one element using SpatialData's public backed-container API."""
     target_path = Path(zarr_path).expanduser()
-    if overwrite:
-        try:
-            root = zarr.open_group(target_path, mode="r+", use_consolidated=False)
-            if element_type in root and element_name in root[element_type]:
-                del root[element_type][element_name]
-        except Exception:
-            pass
-    scratch = sd.SpatialData()
-    scratch._write_element(  # type: ignore[attr-defined]
-        element=element,
-        zarr_container_path=target_path,
-        element_type=element_type,
-        element_name=element_name,
-        overwrite=overwrite,
-    )
+    sdata = sd.read_zarr(target_path)
+    if overwrite and sdata.get(element_name) is not None:
+        del sdata[element_name]
+        sdata.delete_element_from_disk(element_name)
+    sdata[element_name] = element
+    sdata.write_element(element_name)
     if consolidate_metadata:
-        sd.read_zarr(target_path).write_consolidated_metadata()
+        sdata.write_metadata(consolidate_metadata=True)
 
 
 def _geojson_json_compatible(value: Any) -> Any:
@@ -564,61 +544,8 @@ def _fallback_reference_channel_color(index: int) -> tuple[float, float, float]:
     return palette[index % len(palette)]
 
 
-def _extract_xy(vec, axes):
-    vals = np.asarray(vec, dtype=float).ravel()
-    if axes is not None:
-        axes = tuple(axes)
-        if "x" in axes and "y" in axes:
-            return float(vals[axes.index("x")]), float(vals[axes.index("y")])
-    if vals.size == 2:
-        return float(vals[0]), float(vals[1])
-    if vals.size >= 3:
-        return float(vals[-1]), float(vals[-2])
-    raise RuntimeError(f"Cannot extract x/y from vector with shape {vals.shape}")
-
-
 def _xy_matrix_from_transform(tr) -> np.ndarray:
-    name = tr.__class__.__name__
-    if name == "Identity":
-        return np.eye(3, dtype=float)
-    if name == "Scale":
-        vec = getattr(tr, "vector", None)
-        if vec is None:
-            vec = getattr(tr, "scale", None)
-        sx, sy = _extract_xy(vec, getattr(tr, "axes", None))
-        return np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], dtype=float)
-    if name == "Translation":
-        vec = getattr(tr, "vector", None)
-        if vec is None:
-            vec = getattr(tr, "translation", None)
-        tx, ty = _extract_xy(vec, getattr(tr, "axes", None))
-        return np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=float)
-    if name == "Affine":
-        m = np.asarray(getattr(tr, "matrix"), dtype=float)
-        in_axes = tuple(getattr(tr, "input_axes"))
-        out_axes = tuple(getattr(tr, "output_axes"))
-        in_x, in_y = in_axes.index("x"), in_axes.index("y")
-        out_x, out_y = out_axes.index("x"), out_axes.index("y")
-        tcol = m.shape[1] - 1
-        return np.array(
-            [
-                [m[out_x, in_x], m[out_x, in_y], m[out_x, tcol]],
-                [m[out_y, in_x], m[out_y, in_y], m[out_y, tcol]],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        )
-    if name == "Sequence":
-        transforms = getattr(tr, "transformations", None)
-        if transforms is None:
-            transforms = getattr(tr, "_transformations", None)
-        if transforms is None:
-            raise RuntimeError(f"Couldn't inspect Sequence transform: {tr}")
-        total = np.eye(3, dtype=float)
-        for item in transforms:
-            total = _xy_matrix_from_transform(item) @ total
-        return total
-    raise RuntimeError(f"Unsupported transform type for auto-load: {name}")
+    return np.asarray(tr.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")), dtype=float)
 
 
 def xy_to_yx_matrix(matrix_xy: np.ndarray) -> np.ndarray:
@@ -761,7 +688,6 @@ def _sanitize_dataset_label(value: str | Path) -> str:
 
 def _infer_msi_dataset_specs(sdata) -> list[dict[str, Any]]:
     tic_keys = [key for key in sdata.images.keys() if key.endswith("_tic")]
-    tic_set = set(tic_keys)
     table_keys = list(sdata.tables.keys())
     specs = []
     used_tics: set[str] = set()
@@ -790,8 +716,14 @@ def _infer_msi_dataset_specs(sdata) -> list[dict[str, Any]]:
             continue
         used_tics.add(tic_key)
 
-        raw_pixel_shape_keys = uns.get("coregistration_pixel_shape_keys", [])
-        pixel_shape_keys = [key for key in raw_pixel_shape_keys if isinstance(key, str) and key in sdata.shapes]
+        try:
+            annotated_regions = sdata.get_annotated_regions(table)
+        except Exception:
+            annotated_regions = []
+        pixel_shape_keys = [key for key in annotated_regions if key in sdata.shapes]
+        if not pixel_shape_keys:
+            raw_pixel_shape_keys = uns.get("coregistration_pixel_shape_keys", [])
+            pixel_shape_keys = [key for key in raw_pixel_shape_keys if isinstance(key, str) and key in sdata.shapes]
         if not pixel_shape_keys and len(table_keys) == 1:
             pixel_shape_keys = [key for key in sdata.shapes.keys() if "pixels" in key.lower()]
 
@@ -947,9 +879,7 @@ def embed_msi_dataset(
         table.uns["coregistration_tic_key"] = tic_key
 
         source_tic = source_sdata.images[source_spec["tic_key"]]
-        tic_element = _clone_spatial_image_element(source_tic)
-        for attr_key, attr_value in getattr(source_tic, "attrs", {}).items():
-            tic_element.attrs[attr_key] = attr_value
+        tic_element = source_tic.copy()
 
         transforms: dict[str, Any] = {}
         for cs in ("global", registered_cs):
@@ -966,6 +896,7 @@ def embed_msi_dataset(
 
         pixel_shape_keys = []
         shape_elements: list[tuple[str, Any]] = []
+        renamed_shapes: dict[str, str] = {}
         for old_key in source_spec["pixel_shape_keys"]:
             new_key = _choose_unique_element_key(existing_keys | {table_key, tic_key, *pixel_shape_keys}, f"{label}_{old_key}")
             shape_element = source_sdata.shapes[old_key].copy()
@@ -976,15 +907,31 @@ def embed_msi_dataset(
                     pass
             shape_elements.append((new_key, shape_element))
             pixel_shape_keys.append(new_key)
+            renamed_shapes[old_key] = new_key
 
         table.uns["coregistration_pixel_shape_keys"] = list(pixel_shape_keys)
-        root = zarr.open_group(str(host_zarr), mode="a", use_consolidated=False)
-        write_table(table, root.require_group("tables"), table_key)
-        write_image(tic_element, root.require_group("images").require_group(tic_key), tic_key)
-        shapes_root = root.require_group("shapes")
+        host_sdata[tic_key] = tic_element
         for new_key, shape_element in shape_elements:
-            write_shapes(shape_element, shapes_root.require_group(new_key))
-        zarr.consolidate_metadata(str(host_zarr))
+            host_sdata[new_key] = shape_element
+
+        try:
+            _regions, region_key, instance_key = get_table_keys(table)
+        except Exception:
+            region_key = instance_key = None
+        if region_key is not None and renamed_shapes:
+            table.obs[region_key] = table.obs[region_key].astype(str).replace(renamed_shapes)
+            table.obs[region_key] = pd.Categorical(table.obs[region_key])
+            table = TableModel.parse(
+                table,
+                region=list(renamed_shapes.values()),
+                region_key=region_key,
+                instance_key=instance_key,
+                overwrite_metadata=True,
+            )
+
+        host_sdata[table_key] = table
+        host_sdata.write_element([tic_key, *pixel_shape_keys, table_key])
+        host_sdata.write_metadata(consolidate_metadata=True)
         return {
             "label": label,
             "table_key": table_key,
@@ -1002,8 +949,6 @@ def rename_msi_dataset(
     table_key: str,
     display_name: str,
 ) -> str:
-    from spatialdata._io import write_table
-
     zarr_path = Path(zarr_path).expanduser()
     sdata = sd.read_zarr(zarr_path)
     if table_key not in sdata.tables:
@@ -1012,9 +957,7 @@ def rename_msi_dataset(
     cleaned = str(display_name).strip() or table_key
     table = sdata.tables[table_key].copy()
     table.uns["coregistration_display_name"] = cleaned
-    root = zarr.open_group(str(zarr_path), mode="a", use_consolidated=False)
-    write_table(table, root.require_group("tables"), table_key)
-    zarr.consolidate_metadata(str(zarr_path))
+    _write_element_to_existing_store(zarr_path, element=table, element_name=table_key, overwrite=True)
     return cleaned
 
 
@@ -1030,7 +973,6 @@ def delete_msi_dataset(
     if selected is None:
         raise KeyError(f"MSI dataset table not found: {table_key}")
 
-    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
     deleted: dict[str, list[str]] = {"tables": [], "images": [], "shapes": []}
     element_keys = {
         "tables": [str(selected["table_key"])],
@@ -1039,17 +981,14 @@ def delete_msi_dataset(
     }
 
     for element_type, keys in element_keys.items():
-        if element_type not in root:
-            continue
-        group = root[element_type]
-        for key in keys:
-            if key not in group:
-                continue
-            del group[key]
+        present = [key for key in keys if sdata.get(key) is not None]
+        for key in present:
+            del sdata[key]
+            sdata.delete_element_from_disk(key)
             deleted[element_type].append(key)
 
     if any(deleted.values()):
-        zarr.consolidate_metadata(str(host_zarr_path))
+        sdata.write_metadata(consolidate_metadata=True)
     return deleted
 
 
@@ -1277,10 +1216,6 @@ class CoregistrationDataset:
             source,
         )
 
-    def registration_sidecar_path(self) -> Path:
-        return self.zarr_path.with_name(f"{self.zarr_path.name}.{self.dataset_label}.coregistration_params.json")
-
-
 def add_reference_image(
     zarr_path: str | Path,
     image_path: str | Path,
@@ -1304,12 +1239,12 @@ def add_reference_image(
     except Exception:
         pass
     source_path = Path(image_path).expanduser()
-    qptiff_meta: dict[str, float | int | str] = {}
+    qptiff_meta: dict[str, Any] = {}
     if source_path.suffix.lower() in {".qptiff", ".ome.tiff", ".ome.tif"} and qptiff_level is not None:
         img, qptiff_meta = _read_qptiff_image(source_path, level=int(qptiff_level))
     else:
         img = iio.imread(source_path)
-    element = _parse_image_to_spatial(img)
+    element = _parse_image_to_spatial(img, channel_names=qptiff_meta.get("channel_names"))
 
     px_um_x = 2.54
     px_um_y = 2.54
@@ -1347,6 +1282,8 @@ def add_reference_image(
     if saved_display_settings:
         element.attrs["if_display_settings"] = saved_display_settings
     for attr_key, attr_value in qptiff_meta.items():
+        if attr_key == "channel_names":
+            continue
         element.attrs[attr_key] = attr_value
 
     set_transformation(element, Identity(), to_coordinate_system="global")
@@ -1354,7 +1291,6 @@ def add_reference_image(
     _write_element_to_existing_store(
         host_zarr_path,
         element=element,
-        element_type="images",
         element_name=key,
         overwrite=True,
         consolidate_metadata=True,
@@ -1453,7 +1389,6 @@ def import_geojson_annotations(
         _write_element_to_existing_store(
             host_zarr_path,
             element=shape_element,
-            element_type="shapes",
             element_name=key,
             overwrite=True,
             consolidate_metadata=False,
@@ -1461,7 +1396,7 @@ def import_geojson_annotations(
         imported.append(key)
 
     if imported:
-        sd.read_zarr(host_zarr_path).write_consolidated_metadata()
+        sd.read_zarr(host_zarr_path).write_metadata(consolidate_metadata=True)
     return imported
 
 
@@ -1473,26 +1408,15 @@ def delete_geojson_annotations(
     keys = [str(key) for key in annotation_keys]
     if not keys:
         return []
-    try:
-        sdata = sd.read_zarr(host_zarr_path)
-    except Exception:
-        sdata = None
-    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
-    shapes_root = root.require_group("shapes")
+    sdata = sd.read_zarr(host_zarr_path)
     deleted: list[str] = []
     for key in keys:
-        if sdata is not None and key in sdata.shapes:
-            try:
-                sdata.delete_element_from_disk(key)
-                deleted.append(key)
-                continue
-            except Exception:
-                pass
-        if key in shapes_root:
-            del shapes_root[key]
+        if key in sdata.shapes:
+            del sdata[key]
+            sdata.delete_element_from_disk(key)
             deleted.append(key)
     if deleted:
-        zarr.consolidate_metadata(str(host_zarr_path))
+        sdata.write_metadata(consolidate_metadata=True)
     return deleted
 
 
@@ -1521,20 +1445,18 @@ def rescale_geojson_annotations(
             annotation_scale_y=annotation_scale_y,
         )
         transforms = get_transformation(gdf, get_all=True)
-        sdata.delete_element_from_disk(key)
         shape_element = ShapesModel.parse(scaled)
         set_transformation(shape_element, transforms, set_all=True)
         _write_element_to_existing_store(
             host_zarr_path,
             element=shape_element,
-            element_type="shapes",
             element_name=key,
             overwrite=True,
             consolidate_metadata=False,
         )
         rewritten.append(key)
     if rewritten:
-        sd.read_zarr(host_zarr_path).write_consolidated_metadata()
+        sd.read_zarr(host_zarr_path).write_metadata(consolidate_metadata=True)
     return rewritten
 
 
@@ -1567,20 +1489,18 @@ def transform_geojson_annotations(
             annotation_translate_y=annotation_translate_y,
         )
         transforms = get_transformation(gdf, get_all=True)
-        sdata.delete_element_from_disk(key)
         shape_element = ShapesModel.parse(transformed)
         set_transformation(shape_element, transforms, set_all=True)
         _write_element_to_existing_store(
             host_zarr_path,
             element=shape_element,
-            element_type="shapes",
             element_name=key,
             overwrite=True,
             consolidate_metadata=False,
         )
         rewritten.append(key)
     if rewritten:
-        sd.read_zarr(host_zarr_path).write_consolidated_metadata()
+        sd.read_zarr(host_zarr_path).write_metadata(consolidate_metadata=True)
     return rewritten
 
 
@@ -2272,12 +2192,12 @@ def create_msi_threshold_annotation(
     gdf = gpd.GeoDataFrame(rows, geometry=geometries)
     shape_element = ShapesModel.parse(gdf)
     set_transformation(shape_element, Identity(), to_coordinate_system=registered_cs)
-    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
-    shapes_root = root.require_group("shapes")
-    if key in shapes_root:
-        del shapes_root[key]
-    write_shapes(shape_element, shapes_root.require_group(key))
-    zarr.consolidate_metadata(str(host_zarr_path))
+    _write_element_to_existing_store(
+        host_zarr_path,
+        element=shape_element,
+        element_name=key,
+        overwrite=True,
+    )
     return key
 
 
@@ -2290,45 +2210,20 @@ def _reference_channel_image(
         raise KeyError(f"Reference image {reference_key!r} was not found.")
     image = sdata.images[reference_key]
     raw_arr = np.asarray(image)
-    image_attrs = getattr(image, "attrs", {})
     image_dims = tuple(getattr(image, "dims", ()))
-    source_channels = int(image_attrs.get("source_channels", 0)) if isinstance(image_attrs, Mapping) else 0
     channel_index = int(channel_index)
 
-    if raw_arr.ndim == 2:
-        if channel_index != 0:
-            raise ValueError(f"Reference image {reference_key!r} has only one channel.")
-        return np.asarray(raw_arr, dtype=float)
-
-    if raw_arr.ndim != 3:
+    if raw_arr.ndim == 2:  # compatibility with pre-SpatialData-0.7 stores
+        channels = raw_arr[np.newaxis, ...]
+    elif raw_arr.ndim == 3 and image_dims == ("c", "y", "x"):
+        channels = raw_arr
+    elif raw_arr.ndim == 3 and image_dims == ("y", "x", "c"):
+        channels = np.moveaxis(raw_arr, -1, 0)
+    else:
         raise ValueError(f"Reference image {reference_key!r} has unsupported shape {raw_arr.shape}.")
-
-    if source_channels > 4:
-        if image_dims == ("c", "y", "x") and raw_arr.shape[0] == source_channels:
-            if channel_index < 0 or channel_index >= raw_arr.shape[0]:
-                raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
-            return np.asarray(raw_arr[channel_index], dtype=float)
-        if image_dims == ("y", "x", "c") and raw_arr.shape[-1] == source_channels:
-            if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
-                raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
-            return np.asarray(raw_arr[..., channel_index], dtype=float)
-
-    if image_dims == ("c", "y", "x") or (raw_arr.shape[0] > 4 and raw_arr.shape[-1] <= 4):
-        if channel_index < 0 or channel_index >= raw_arr.shape[0]:
-            raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
-        return np.asarray(raw_arr[channel_index], dtype=float)
-
-    if image_dims == ("y", "x", "c") or raw_arr.shape[-1] <= 4:
-        if channel_index == 0 and raw_arr.shape[-1] in (3, 4):
-            rgb = np.asarray(raw_arr[..., :3], dtype=float)
-            return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
-        if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
-            raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
-        return np.asarray(raw_arr[..., channel_index], dtype=float)
-
-    if channel_index < 0 or channel_index >= raw_arr.shape[-1]:
+    if channel_index < 0 or channel_index >= channels.shape[0]:
         raise ValueError(f"Channel {channel_index} is outside reference image {reference_key!r}.")
-    return np.asarray(raw_arr[..., channel_index], dtype=float)
+    return np.asarray(channels[channel_index], dtype=float)
 
 
 def _reference_channel_count_and_names(sdata, reference_key: str) -> tuple[int, list[str]]:
@@ -2338,25 +2233,16 @@ def _reference_channel_count_and_names(sdata, reference_key: str) -> tuple[int, 
     raw_arr = np.asarray(image)
     image_attrs = getattr(image, "attrs", {})
     image_dims = tuple(getattr(image, "dims", ()))
-    raw_names = image_attrs.get("channel_names", []) if isinstance(image_attrs, Mapping) else []
+    raw_names = list(get_channel_names(image))
+    if not raw_names and isinstance(image_attrs, Mapping):
+        raw_names = list(image_attrs.get("channel_names", []))
 
     if raw_arr.ndim == 2:
         count = 1
-    elif raw_arr.ndim == 3:
-        source_channels = int(image_attrs.get("source_channels", 0)) if isinstance(image_attrs, Mapping) else 0
-        if source_channels > 4:
-            if image_dims == ("c", "y", "x") and raw_arr.shape[0] == source_channels:
-                count = int(raw_arr.shape[0])
-            elif image_dims == ("y", "x", "c") and raw_arr.shape[-1] == source_channels:
-                count = int(raw_arr.shape[-1])
-            else:
-                count = int(source_channels)
-        elif image_dims == ("c", "y", "x") or (raw_arr.shape[0] > 4 and raw_arr.shape[-1] <= 4):
-            count = int(raw_arr.shape[0])
-        elif image_dims == ("y", "x", "c") or raw_arr.shape[-1] <= 4:
-            count = 1 if raw_arr.shape[-1] in (3, 4) else int(raw_arr.shape[-1])
-        else:
-            count = int(raw_arr.shape[-1])
+    elif raw_arr.ndim == 3 and image_dims == ("c", "y", "x"):
+        count = int(raw_arr.shape[0])
+    elif raw_arr.ndim == 3 and image_dims == ("y", "x", "c"):
+        count = int(raw_arr.shape[-1])
     else:
         raise ValueError(f"Reference image {reference_key!r} has unsupported shape {raw_arr.shape}.")
 
@@ -3045,12 +2931,12 @@ def create_pooled_msi_threshold_annotation(
     gdf = gpd.GeoDataFrame(rows, geometry=geometries)
     shape_element = ShapesModel.parse(gdf)
     set_transformation(shape_element, Identity(), to_coordinate_system=registered_cs)
-    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
-    shapes_root = root.require_group("shapes")
-    if key in shapes_root:
-        del shapes_root[key]
-    write_shapes(shape_element, shapes_root.require_group(key))
-    zarr.consolidate_metadata(str(host_zarr_path))
+    _write_element_to_existing_store(
+        host_zarr_path,
+        element=shape_element,
+        element_name=key,
+        overwrite=True,
+    )
     return key
 
 
@@ -3149,12 +3035,12 @@ def create_reference_threshold_annotation(
     gdf = gpd.GeoDataFrame(rows, geometry=geometries)
     shape_element = ShapesModel.parse(gdf)
     set_transformation(shape_element, Identity(), to_coordinate_system=registered_cs)
-    root = zarr.open_group(str(host_zarr_path), mode="a", use_consolidated=False)
-    shapes_root = root.require_group("shapes")
-    if key in shapes_root:
-        del shapes_root[key]
-    write_shapes(shape_element, shapes_root.require_group(key))
-    zarr.consolidate_metadata(str(host_zarr_path))
+    _write_element_to_existing_store(
+        host_zarr_path,
+        element=shape_element,
+        element_name=key,
+        overwrite=True,
+    )
     return key
 
 
@@ -3211,8 +3097,6 @@ def save_coregistration(
         "ty": float(transform_xy[1, 2]),
         "affine_xy_3x3": transform_xy.tolist(),
     }
-    dataset.msi_table.uns["coregistration_params"] = params
-
     dataset.sdata.write_transformations(dataset.tic_key)
     for key in dataset.reference_image_keys:
         if key in dataset.sdata.images:
@@ -3220,7 +3104,7 @@ def save_coregistration(
     for key in dataset.pixel_shape_keys:
         dataset.sdata.write_transformations(key)
 
-    dataset.sdata.write_consolidated_metadata()
+    dataset.sdata.write_metadata(consolidate_metadata=True)
     return params
 
 
