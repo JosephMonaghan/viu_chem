@@ -2,9 +2,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
-from scipy.stats import ttest_ind, chi2
+from scipy.stats import chi2, false_discovery_control, ttest_ind, ttest_rel
 import matplotlib.colors as mcolors
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Patch
 
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
@@ -130,7 +130,10 @@ def volcano(data_numerator:pd.DataFrame,
             left_label:str="Denominator",
             right_label:str="Numerator",
             xlabel:str = None,
-            ylabel:str = "p-value"):
+            ylabel:str = "p-value",
+            paired:bool = False,
+            cutoff_specifier:float=2.0,
+            fdr_control:bool=False):
     """Generates a volcano plot comparing two dataframes into the specified axes. If no axes provided it generates its own.
     
     :param data_numerator: Dataframe containing numerator group values
@@ -140,16 +143,25 @@ def volcano(data_numerator:pd.DataFrame,
     :param color_numer: Color for the numerator side gradient
     :param marker_color: Color to draw the data points
     :param sig_cutoff: P-value cutoff for significance
+    :param cutoff_specifier: Absolute fold-change cutoff for significance (for example, 1.5 means 1.5-fold)
     :param left_label: Label for the denominator side of the plot
     :param right_label: Label for the numerator side of the plot
     :param xlabel: String for the x axis label
     :param ylabel: String for the y axis label
+    :param paired: Pair samples by column position, using the mean matched log2 ratio and a paired t-test on log2 intensities
+    :param fdr_control: Apply Benjamini-Hochberg correction and use adjusted p-values for plotting and significance
     :return ax: Returns the populated axes object
     :return return_df: Dataframe containing fold changes and p-values"""
     
     # Check that dataframes are coherent and match
     if not data_numerator.index.equals(data_denom.index):
         raise ValueError("Dataframes do not match!")
+    if paired and data_numerator.shape[1] != data_denom.shape[1]:
+        raise ValueError("Paired dataframes must contain the same number of samples!")
+    cutoff_specifier = float(cutoff_specifier)
+    if not np.isfinite(cutoff_specifier) or cutoff_specifier <= 1:
+        raise ValueError("cutoff_specifier must be finite and greater than 1.")
+    log2_cutoff = float(np.log2(cutoff_specifier))
 
     # If no axis specified, make one
     if not ax:
@@ -165,9 +177,27 @@ def volcano(data_numerator:pd.DataFrame,
     for idx, mz in enumerate(index):
         local_numer = data_numerator.loc[mz]
         local_denom = data_denom.loc[mz]
+        if paired:
+            numer_values = np.asarray(local_numer, dtype=float)
+            denom_values = np.asarray(local_denom, dtype=float)
+            valid_pairs = (
+                np.isfinite(numer_values)
+                & np.isfinite(denom_values)
+                & (numer_values > 0)
+                & (denom_values > 0)
+            )
+            if np.count_nonzero(valid_pairs) < 2:
+                invalid[idx] = True
+                continue
+            log_numer = np.log2(numer_values[valid_pairs])
+            log_denom = np.log2(denom_values[valid_pairs])
+            fold_changes[idx] = float(np.mean(log_numer - log_denom))
+            _, p_val = ttest_rel(log_numer, log_denom)
+            pvals[idx] = p_val
+            continue
+
         numer_mean = local_numer.mean()
         denom_mean = local_denom.mean()
-
         if (denom_mean != 0) and (numer_mean != 0) and ((numer_mean / denom_mean) > 0):
             fold_changes[idx] = np.log2(numer_mean / denom_mean)
             _, p_val = ttest_ind(local_numer, local_denom, equal_var=False)
@@ -178,22 +208,32 @@ def volcano(data_numerator:pd.DataFrame,
     
 
     # Actual plotting
-    valid = (~invalid) & np.isfinite(fold_changes) & np.isfinite(pvals) & (pvals >= 0)
-    return_df = pd.DataFrame({
+    valid = (~invalid) & np.isfinite(fold_changes) & np.isfinite(pvals) & (pvals >= 0) & (pvals <= 1)
+    result_columns = {
         "fold_change": fold_changes,
         "pval": pvals,
-    }, index=index)
+    }
+    significance_pvals = pvals.copy()
+    if fdr_control:
+        adjusted_pvals = np.full(len(index), np.nan, dtype=float)
+        if valid.any():
+            adjusted_pvals[valid] = false_discovery_control(pvals[valid], method="bh")
+        significance_pvals = adjusted_pvals
+        result_columns["adjusted_pval"] = adjusted_pvals
+    return_df = pd.DataFrame(result_columns, index=index)
     return_df = return_df[valid]
+
+    plot_ylabel = "BH-adjusted p-value" if fdr_control and ylabel == "p-value" else ylabel
 
     if not valid.any():
         ax.set_yscale("log")
-        ax.set_ylabel(ylabel, fontweight='bold')
+        ax.set_ylabel(plot_ylabel, fontweight='bold')
         if not xlabel:
             xlabel = f"log2({right_label} / {left_label})"
         ax.set_xlabel(xlabel, fontweight='bold')
         return ax, return_df
 
-    plot_pvals = pvals.copy()
+    plot_pvals = significance_pvals.copy()
     positive_pvals = plot_pvals[valid & (plot_pvals > 0)]
     if len(positive_pvals):
         pval_floor = np.min(positive_pvals) * 0.1
@@ -201,7 +241,7 @@ def volcano(data_numerator:pd.DataFrame,
         pval_floor = max(sig_cutoff * 0.1, np.nextafter(0, 1))
     plot_pvals[valid & (plot_pvals <= 0)] = pval_floor
 
-    sig = valid & (np.abs(fold_changes) > 1) & (pvals < sig_cutoff)
+    sig = valid & (np.abs(fold_changes) > log2_cutoff) & (significance_pvals < sig_cutoff)
     ax.set_yscale("log")
     ax.scatter(
         fold_changes[valid],
@@ -217,6 +257,7 @@ def volcano(data_numerator:pd.DataFrame,
             marker_color,
             color_denom,
             color_numer,
+            log2_cutoff,
         )
         ax.scatter(
             fold_changes[sig],
@@ -250,8 +291,8 @@ def volcano(data_numerator:pd.DataFrame,
 
     overlay_col = "#6A6A6A"
     ax.axhline(sig_cutoff, color=overlay_col,linestyle="--")
-    ax.axvline(-1,color=overlay_col,linestyle="--")
-    ax.axvline(1, color=overlay_col,linestyle="--")
+    ax.axvline(-log2_cutoff,color=overlay_col,linestyle="--")
+    ax.axvline(log2_cutoff, color=overlay_col,linestyle="--")
 
 
     xmin, xmax = np.min(fold_changes[valid])*1.2, np.max(fold_changes[valid])*1.2
@@ -259,10 +300,10 @@ def volcano(data_numerator:pd.DataFrame,
 
     if xmin == xmax:
         xmin, xmax = xmin - 1, xmax + 1
-    if xmin > -1:
-        xmin = -1.2
-    if xmax < 1:
-        xmax = 1.2
+    if xmin > -log2_cutoff:
+        xmin = -log2_cutoff * 1.2
+    if xmax < log2_cutoff:
+        xmax = log2_cutoff * 1.2
     if ymin == ymax:
         ymin = max(ymin * 0.5, np.nextafter(0, 1))
         ymax = ymax * 2
@@ -275,7 +316,7 @@ def volcano(data_numerator:pd.DataFrame,
 
     ax.invert_yaxis()
     ax.set_xlim(xmin, xmax)
-    ax.set_ylabel(ylabel, fontweight='bold')
+    ax.set_ylabel(plot_ylabel, fontweight='bold')
     if not xlabel:
         xlabel = f"log2({right_label} / {left_label})"
     ax.set_xlabel(xlabel, fontweight='bold')
@@ -287,7 +328,7 @@ def volcano(data_numerator:pd.DataFrame,
     return ax, return_df
 
 
-def _volcano_sig_colors(fold_changes, marker_color, color_denom, color_numer):
+def _volcano_sig_colors(fold_changes, marker_color, color_denom, color_numer, log2_cutoff=1.0):
     """Returns marker fill colors that deepen with significant fold-change magnitude."""
     colors = []
     base = np.array(mcolors.to_rgb(marker_color))
@@ -299,10 +340,18 @@ def _volcano_sig_colors(fold_changes, marker_color, color_denom, color_numer):
 
     for change in fold_changes:
         if change < 0:
-            amount = np.clip((abs(change) - 1) / max(denom_max - 1, 1), 0, 1)
+            amount = np.clip(
+                (abs(change) - log2_cutoff) / max(denom_max - log2_cutoff, 1),
+                0,
+                1,
+            )
             colors.append(base + (denom - base) * amount)
         else:
-            amount = np.clip((change - 1) / max(numer_max - 1, 1), 0, 1)
+            amount = np.clip(
+                (change - log2_cutoff) / max(numer_max - log2_cutoff, 1),
+                0,
+                1,
+            )
             colors.append(base + (numer - base) * amount)
 
     return colors
@@ -507,6 +556,86 @@ def unpack_dataframe(
     return plot_data
 
 
+def _plot_group_structure(data):
+    """Validate plot data and return its primary and secondary group order."""
+    top_keys = list(data.keys())
+    if not top_keys:
+        raise ValueError("data must contain at least one primary group")
+
+    nested = [isinstance(data[top_key], dict) for top_key in top_keys]
+    if any(nested) and not all(nested):
+        raise ValueError("primary groups must all be grouped or all be ungrouped")
+
+    subkeys = []
+    if all(nested):
+        # Do not use the first primary group as the schema: later groups may have
+        # additional secondary categories, and any category may be absent from a
+        # particular primary group.
+        for top_key in top_keys:
+            for subkey in data[top_key]:
+                if subkey not in subkeys:
+                    subkeys.append(subkey)
+
+    return top_keys, all(nested), subkeys
+
+
+def _plot_color(colors, idx=0):
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if colors is None:
+        return default_colors[idx % len(default_colors)]
+    if isinstance(colors, str):
+        return colors
+    if not colors:
+        raise ValueError("colors must contain at least one color")
+    return colors[idx % len(colors)]
+
+
+def _group_offsets(num_subkeys):
+    if num_subkeys == 0:
+        return np.asarray([]), 0.55
+    if num_subkeys == 1:
+        return np.asarray([0.0]), 0.55
+    group_span = min(0.8, 0.4 + 0.1 * max(num_subkeys - 2, 0))
+    offsets = np.linspace(-group_span / 2, group_span / 2, num_subkeys)
+    return offsets, offsets[1] - offsets[0]
+
+
+def _normalized_group_values(data, top_keys, subkeys, autonormalize):
+    """Copy nested values as float arrays and optionally normalize per primary group."""
+    plot_data = {}
+    for top_key in top_keys:
+        present_values = {
+            subkey: np.asarray(data[top_key][subkey], dtype=float)
+            for subkey in subkeys
+            if subkey in data[top_key]
+        }
+        finite_values = [
+            values[np.isfinite(values)]
+            for values in present_values.values()
+            if np.isfinite(values).any()
+        ]
+        norm_limit = np.nanmax(np.concatenate(finite_values)) if finite_values else 1
+        if not autonormalize or norm_limit == 0:
+            norm_limit = 1
+        plot_data[top_key] = {
+            subkey: values / norm_limit
+            for subkey, values in present_values.items()
+        }
+    return plot_data
+
+
+def _violin_values(values):
+    """Return finite values with enough variance for Matplotlib's KDE."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return values
+    if len(values) == 1 or np.ptp(values) == 0:
+        delta = max(abs(float(values[0])) * 1e-6, 1e-6)
+        return values[0] + np.linspace(-delta, delta, max(len(values), 3))
+    return values
+
+
 def boxplot(
         data:dict | pd.DataFrame,
         ax:plt.Axes | None = None,
@@ -523,39 +652,31 @@ def boxplot(
             raise ValueError("value and primary_group must be supplied when data is a DataFrame")
         data = unpack_dataframe(data, value, primary_group, secondary_group)
     
-    top_keys = list(data.keys())
-    subkeys_present = isinstance(data[top_keys[0]],dict)
+    top_keys, subkeys_present, subkeys = _plot_group_structure(data)
 
     if subkeys_present:
-        subkeys = [key for key in data[top_keys[0]].keys()]
+        plot_data = _normalized_group_values(
+            data, top_keys, subkeys, autonormalize
+        )
+        offsets, width = _group_offsets(len(subkeys))
 
-        if autonormalize:
-            for key in top_keys:
-                all_data = []
-                for subkey in subkeys:
-                    all_data.append(data[key][subkey])
-                data[key]['_norm_limit'] = np.max(all_data)
-                for subkey in subkeys:
-                    data[key][subkey] = np.divide(data[key][subkey],[data[key]['_norm_limit']])
-
-        default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-        num_subkeys = len(subkeys)
-        positions = np.linspace(0.8,1.2,num_subkeys)
-        width = 0.4 * 3 / num_subkeys**2
-
-            
-        for idx, (key, pos) in enumerate(zip(subkeys,positions)):
-            key_data = [data[top_key][key] for top_key in top_keys]
-            positions = [pos+x for x in range(len(top_keys))]
-            if not colors:
-                color = default_colors[idx % len(default_colors)]
-            else:
-                color = colors[idx]
+        for idx, (subkey, offset) in enumerate(zip(subkeys, offsets)):
+            available = [
+                (top_idx, plot_data[top_key][subkey])
+                for top_idx, top_key in enumerate(top_keys)
+                if subkey in plot_data[top_key]
+                and np.isfinite(plot_data[top_key][subkey]).any()
+            ]
+            if not available:
+                continue
+            key_data = [values[np.isfinite(values)] for _, values in available]
+            positions = [top_idx + 1 + offset for top_idx, _ in available]
+            color = _plot_color(colors, idx)
 
             ax.boxplot(key_data,
                        positions=positions,
                        widths=width,
-                       label=key, 
+                       label=str(subkey),
                        patch_artist=True,
                        boxprops={'facecolor':color, 'edgecolor':'k'},
                        medianprops={'color':'k'})
@@ -563,9 +684,7 @@ def boxplot(
         ax.legend()
     
     else:
-        if not colors:
-            color = plt.rcParams['axes.prop_cycle'].by_key()['color'][0]
-        
+        color = _plot_color(colors)
         bp_data = [data[top_key] for top_key in top_keys]
         ax.boxplot(bp_data,
                    patch_artist=True,
@@ -573,6 +692,84 @@ def boxplot(
                    medianprops={'color':'k'})
     
     ax.set_xticks([x+1 for x in range(len(top_keys))],top_keys, rotation=45,ha='right')
+    return ax
+
+
+def violinplot(
+        data:dict | pd.DataFrame,
+        ax:plt.Axes | None = None,
+        colors:str | list[str] | None = None,
+        autonormalize:bool=False,
+        value:str | None = None,
+        primary_group:str | None = None,
+        secondary_group:str | None = None):
+    """Plot violins using the same dictionary or DataFrame workflow as boxplot.
+
+    Secondary categories are discovered across every primary group. Missing
+    primary/secondary combinations are omitted without shifting the remaining
+    categories, so colors and horizontal positions stay consistent.
+    """
+    if not ax:
+        fig, ax = plt.subplots()
+
+    if isinstance(data, pd.DataFrame):
+        if value is None or primary_group is None:
+            raise ValueError("value and primary_group must be supplied when data is a DataFrame")
+        data = unpack_dataframe(data, value, primary_group, secondary_group)
+
+    top_keys, subkeys_present, subkeys = _plot_group_structure(data)
+    if subkeys_present:
+        plot_data = _normalized_group_values(
+            data, top_keys, subkeys, autonormalize
+        )
+        offsets, width = _group_offsets(len(subkeys))
+        legend_handles = []
+
+        for idx, (subkey, offset) in enumerate(zip(subkeys, offsets)):
+            available = [
+                (top_idx, plot_data[top_key][subkey])
+                for top_idx, top_key in enumerate(top_keys)
+                if subkey in plot_data[top_key]
+                and np.isfinite(plot_data[top_key][subkey]).any()
+            ]
+            if not available:
+                continue
+            datasets = [_violin_values(values) for _, values in available]
+            positions = [top_idx + 1 + offset for top_idx, _ in available]
+            color = _plot_color(colors, idx)
+            artists = ax.violinplot(datasets, positions=positions, widths=width)
+            for body in artists['bodies']:
+                body.set_facecolor(color)
+                body.set_edgecolor('k')
+                body.set_alpha(1)
+            for name in ('cbars', 'cmins', 'cmaxes'):
+                artists[name].set_color('k')
+            legend_handles.append(Patch(facecolor=color, edgecolor='k', label=str(subkey)))
+
+        if legend_handles:
+            ax.legend(handles=legend_handles)
+    else:
+        color = _plot_color(colors)
+        available = [
+            (top_idx, _violin_values(data[top_key]))
+            for top_idx, top_key in enumerate(top_keys)
+        ]
+        available = [(top_idx, values) for top_idx, values in available if len(values)]
+        if available:
+            artists = ax.violinplot(
+                [values for _, values in available],
+                positions=[top_idx + 1 for top_idx, _ in available],
+                widths=0.55,
+            )
+            for body in artists['bodies']:
+                body.set_facecolor(color)
+                body.set_edgecolor('k')
+                body.set_alpha(1)
+            for name in ('cbars', 'cmins', 'cmaxes'):
+                artists[name].set_color('k')
+
+    ax.set_xticks([x + 1 for x in range(len(top_keys))], top_keys, rotation=45, ha='right')
+    return ax
 
 
 def barchart(
@@ -600,6 +797,8 @@ def barchart(
     :param colors: Single color or list of colors for grouped series
     :param autonormalize: Whether to normalize nested groups by their largest value
     :param error: Error bars to draw: "sd", "sem", or None
+    :param draw_points: Whether to draw the individual observations
+    :param draw_error: Whether to draw error bars
     :param point_color: Color for individual data points
     :param point_size: Marker size for individual data points
     :param point_alpha: Alpha for individual data points
@@ -616,8 +815,7 @@ def barchart(
             raise ValueError("value and primary_group must be supplied when data is a DataFrame")
         data = unpack_dataframe(data, value, primary_group, secondary_group)
 
-    top_keys = list(data.keys())
-    subkeys_present = isinstance(data[top_keys[0]], dict)
+    top_keys, subkeys_present, subkeys = _plot_group_structure(data)
 
     def prep_values(values):
         return np.asarray(values, dtype=float)
@@ -638,69 +836,55 @@ def barchart(
         point_width = min(width * 0.55, 0.18)
         return center + np.linspace(-point_width / 2, point_width / 2, count)
 
-    def get_color(idx=0):
-        default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-        if colors is None:
-            return default_colors[idx % len(default_colors)]
-        if isinstance(colors, str):
-            return colors
-        return colors[idx]
+    def directional_yerr(bar_values, errors):
+        """Extend errors away from zero according to each bar's direction."""
+        if not draw_error:
+            return None
+        bar_values = np.asarray(bar_values, dtype=float)
+        errors = np.asarray(errors, dtype=float)
+        lower = np.where(bar_values < 0, errors, 0.0)
+        upper = np.where(bar_values < 0, 0.0, errors)
+        return np.vstack([lower, upper])
 
     if subkeys_present:
-        subkeys = [key for key in data[top_keys[0]].keys()]
-        plot_data = {}
+        plot_data = _normalized_group_values(
+            data, top_keys, subkeys, autonormalize
+        )
+        offsets, width = _group_offsets(len(subkeys))
 
-        for top_key in top_keys:
-            plot_data[top_key] = {}
-            norm_limit = 1
-            if autonormalize:
-                all_values = [
-                    prep_values(data[top_key][subkey])
-                    for subkey in subkeys
-                ]
-                norm_limit = np.nanmax(np.concatenate(all_values))
-
-            for subkey in subkeys:
-                values = prep_values(data[top_key][subkey])
-                if autonormalize and norm_limit != 0:
-                    values = values / norm_limit
-                plot_data[top_key][subkey] = values
-
-        num_subkeys = len(subkeys)
-        group_span = min(0.8, 0.4 + 0.1 * max(num_subkeys - 2, 0))
-        positions = np.linspace(1 - group_span / 2.5, 1 + group_span / 2.5, num_subkeys)
-        if num_subkeys > 1:
-            width = (positions[1] - positions[0]) * 1
-        else:
-            width = 0.55
-
-        for idx, (subkey, pos) in enumerate(zip(subkeys, positions)):
-            centers = [pos + x for x in range(len(top_keys))]
+        for idx, (subkey, offset) in enumerate(zip(subkeys, offsets)):
+            available = [
+                (top_idx, top_key)
+                for top_idx, top_key in enumerate(top_keys)
+                if subkey in plot_data[top_key]
+                and np.isfinite(plot_data[top_key][subkey]).any()
+            ]
+            if not available:
+                continue
+            centers = [top_idx + 1 + offset for top_idx, _ in available]
             bar_values = [
                 np.nanmean(plot_data[top_key][subkey])
-                for top_key in top_keys
+                for _, top_key in available
             ]
             errors = [
                 get_error(plot_data[top_key][subkey])
-                for top_key in top_keys
+                for _, top_key in available
             ]
-            color = get_color(idx)
+            color = _plot_color(colors, idx)
 
-            if not draw_error:
-                errors = None
             ax.bar(
                 centers,
                 bar_values,
-                yerr=[np.zeros_like(errors), errors],
+                yerr=directional_yerr(bar_values, errors),
                 width=width,
-                label=subkey,
+                label=str(subkey),
                 color=color,
                 edgecolor='k',
                 capsize=4,
                 zorder=2)
 
             if draw_points:
-                for center, top_key in zip(centers, top_keys):
+                for center, (_, top_key) in zip(centers, available):
                     values = plot_data[top_key][subkey]
                     ax.scatter(
                         point_positions(center, width, len(values)),
@@ -720,15 +904,12 @@ def barchart(
         bar_values = [np.nanmean(values) for values in bar_data]
         errors = [get_error(values) for values in bar_data]
         width = 0.55
-        color = get_color()
-
-        if not draw_error:
-            draw_error = None
+        color = _plot_color(colors)
 
         ax.bar(
             centers,
             bar_values,
-            yerr=[np.zeros_like(errors), errors],
+            yerr=directional_yerr(bar_values, errors),
             width=width,
             color=color,
             edgecolor='k',

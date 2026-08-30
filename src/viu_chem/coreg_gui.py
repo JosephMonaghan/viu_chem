@@ -52,9 +52,11 @@ from .msi_coregistration import (
     CoregistrationDataset,
     REFERENCE_CHANNEL_COLOR_PRESETS,
     _annotation_mask_from_transformed_geometries,
+    _attach_stored_image_attrs,
     _fallback_reference_channel_color,
     _infer_msi_dataset_specs,
     _make_reference_channel_colormap,
+    _multiscale_image_levels,
     _sample_msi_values_at_msi_pixels,
     _sample_reference_values_at_msi_pixels,
     _sanitize_dataset_label,
@@ -75,6 +77,7 @@ from .msi_coregistration import (
     prepare_coregistration_zarr,
     prepare_ion_for_display,
     rename_msi_dataset,
+    rescale_registration_between_pyramid_levels,
     sanitize_name,
     save_coregistration,
     sitk_affine_from_fixed_to_moving_matrix,
@@ -626,6 +629,13 @@ def launch_coregistration_gui(
         except Exception:
             pass
 
+    def _current_reference_contrast_limits(layer) -> tuple[float, float]:
+        limits = getattr(layer, "contrast_limits", None)
+        if limits is not None:
+            return tuple(float(v) for v in limits)
+        data = layer.data[-1] if bool(getattr(layer, "multiscale", False)) else layer.data
+        return finite_data_limits(np.asarray(data))
+
     def _apply_reference_layer_contrast(
         layer,
         mode: str,
@@ -640,7 +650,7 @@ def launch_coregistration_gui(
 
         if mode == "intensity":
             if intensity_limits is None:
-                intensity_limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+                intensity_limits = _current_reference_contrast_limits(layer)
             low, high = float(intensity_limits[0]), float(intensity_limits[1])
             if high <= low:
                 high = low + 1e-9
@@ -648,11 +658,12 @@ def launch_coregistration_gui(
             metadata["reference_contrast_limits"] = (low, high)
             return
 
+        layer_data = layer.data[-1] if bool(getattr(layer, "multiscale", False)) else layer.data
         low_pct = float(percentiles[0])
         high_pct = float(percentiles[1])
         if high_pct <= low_pct:
             high_pct = min(100.0, low_pct + 0.1)
-        layer.contrast_limits = auto_contrast_limits(np.asarray(layer.data), low_pct=low_pct, high_pct=high_pct)
+        layer.contrast_limits = auto_contrast_limits(np.asarray(layer_data), low_pct=low_pct, high_pct=high_pct)
         metadata["reference_contrast_percentiles"] = (low_pct, high_pct)
         metadata["reference_contrast_limits"] = tuple(float(v) for v in layer.contrast_limits)
 
@@ -696,6 +707,11 @@ def launch_coregistration_gui(
             "contrast_percentiles",
             "contrast_limits",
             "gamma",
+            "if_threshold_percentile",
+            "if_threshold_value",
+            "if_threshold_analysis_pyramid_level",
+            "if_threshold_prefilter_annotation",
+            "if_threshold_prefilter_region",
         ):
             if key not in saved:
                 continue
@@ -714,6 +730,8 @@ def launch_coregistration_gui(
                 metadata["reference_contrast_limits"] = (float(value[0]), float(value[1]))
             elif key == "gamma":
                 metadata["reference_gamma"] = float(value)
+            elif key.startswith("if_threshold_"):
+                metadata[key] = value
 
     def _refresh_if_toolbox_widgets(preferred_layer_name: str | None = None):
         try:
@@ -737,15 +755,19 @@ def launch_coregistration_gui(
 
     def add_or_update_reference_layer(source_dataset: CoregistrationDataset, key: str, *, visible: bool = True):
         image = source_dataset.sdata.images[key]
-        raw_arr = np.asarray(image)
-        arr = _to_napari_image(raw_arr)
+        image_levels = _multiscale_image_levels(image)
+        level_arrays = [level.data for level in image_levels]
+        raw_arr = level_arrays[0]
+        display_levels = [_to_napari_image(level) for level in level_arrays]
+        arr = display_levels if len(display_levels) > 1 else display_levels[0]
         image_attrs = getattr(image, "attrs", {})
-        image_dims = tuple(getattr(image, "dims", ()))
+        image_dims = tuple(image_levels[0].dims)
         existing_layers = _reference_layer_list(key)
         source_channels = int(image_attrs.get("source_channels", 0)) if isinstance(image_attrs, Mapping) else 0
+        source_axes = str(image_attrs.get("source_axes", "")) if isinstance(image_attrs, Mapping) else ""
         inferred_channels = 0
         if raw_arr.ndim == 3:
-            if source_channels > 4:
+            if source_channels > 4 or (source_axes == "CYX" and source_channels > 1):
                 inferred_channels = source_channels
             elif image_dims == ("c", "y", "x") and raw_arr.shape[0] > 4:
                 inferred_channels = int(raw_arr.shape[0])
@@ -754,15 +776,16 @@ def launch_coregistration_gui(
             elif raw_arr.shape[0] > 4 and raw_arr.shape[-1] <= 4:
                 inferred_channels = int(raw_arr.shape[0])
 
-        if raw_arr.ndim == 3 and inferred_channels > 4:
+        if raw_arr.ndim == 3 and inferred_channels > 0:
             if image_dims == ("c", "y", "x") and raw_arr.shape[0] == inferred_channels:
-                channel_data = [raw_arr[idx] for idx in range(inferred_channels)]
+                channel_pyramids = [[level[idx] for level in level_arrays] for idx in range(inferred_channels)]
             elif image_dims == ("y", "x", "c") and raw_arr.shape[-1] == inferred_channels:
-                channel_data = [raw_arr[..., idx] for idx in range(inferred_channels)]
+                channel_pyramids = [[level[..., idx] for level in level_arrays] for idx in range(inferred_channels)]
             elif raw_arr.shape[0] == inferred_channels:
-                channel_data = [raw_arr[idx] for idx in range(inferred_channels)]
+                channel_pyramids = [[level[idx] for level in level_arrays] for idx in range(inferred_channels)]
             else:
-                channel_data = [raw_arr[..., idx] for idx in range(raw_arr.shape[-1])]
+                channel_pyramids = [[level[..., idx] for level in level_arrays] for idx in range(raw_arr.shape[-1])]
+            channel_data = [levels if len(levels) > 1 else levels[0] for levels in channel_pyramids]
             raw_names = list(get_channel_names(image))
             if not raw_names and isinstance(image_attrs, Mapping):
                 raw_names = list(image_attrs.get("channel_names", []))
@@ -783,7 +806,10 @@ def launch_coregistration_gui(
                 channel_colormaps.append(
                     _make_reference_channel_colormap(use_rgb, f"{sanitize_name(channel_names[idx])}_cmap")
                 )
-            if len(existing_layers) != len(channel_data):
+            expected_multiscale = len(image_levels) > 1
+            if len(existing_layers) != len(channel_data) or any(
+                bool(getattr(layer, "multiscale", False)) != expected_multiscale for layer in existing_layers
+            ):
                 for layer in existing_layers:
                     try:
                         viewer.layers.remove(layer)
@@ -798,7 +824,8 @@ def launch_coregistration_gui(
                     layer.opacity = 1.0
                     layer.blending = "additive"
                     try:
-                        layer.contrast_limits = auto_contrast_limits(channel_data[idx], low_pct=1.0, high_pct=99.8)
+                        contrast_data = channel_pyramids[idx][-1]
+                        layer.contrast_limits = auto_contrast_limits(contrast_data, low_pct=1.0, high_pct=99.8)
                     except Exception:
                         pass
                     try:
@@ -811,9 +838,10 @@ def launch_coregistration_gui(
                         data,
                         name=name,
                         visible=bool(visible and idx == 0),
+                        multiscale=expected_multiscale,
                         blending="additive",
                         colormap=channel_colormaps[idx],
-                        contrast_limits=auto_contrast_limits(data, low_pct=1.0, high_pct=99.8),
+                        contrast_limits=auto_contrast_limits(channel_pyramids[idx][-1], low_pct=1.0, high_pct=99.8),
                         opacity=1.0,
                     )
                     for idx, (data, name) in enumerate(zip(channel_data, channel_names))
@@ -829,7 +857,7 @@ def launch_coregistration_gui(
                 metadata.setdefault("reference_color_choice", "metadata")
                 metadata.setdefault("reference_contrast_mode", "percentile")
                 metadata.setdefault("reference_contrast_percentiles", (1.0, 99.8))
-                metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data)))))
+                metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in layer.contrast_limits))
                 metadata.setdefault("reference_gamma", float(getattr(layer, "gamma", 1.0)))
                 layer.opacity = 1.0
                 layer.blending = "additive"
@@ -843,12 +871,22 @@ def launch_coregistration_gui(
                 _apply_reference_layer_gamma(layer, float(metadata.get("reference_gamma", 1.0)))
             reference_layers[key] = existing_layers
         else:
+            expected_multiscale = len(image_levels) > 1
+            if len(existing_layers) != 1 or any(
+                bool(getattr(existing, "multiscale", False)) != expected_multiscale for existing in existing_layers
+            ):
+                for existing in existing_layers:
+                    try:
+                        viewer.layers.remove(existing)
+                    except Exception:
+                        pass
+                existing_layers = []
             layer = existing_layers[0] if existing_layers else None
             if layer is not None:
                 layer.data = arr
                 layer.visible = visible
             else:
-                layer = viewer.add_image(arr, name=key, visible=visible)
+                layer = viewer.add_image(arr, name=key, visible=visible, multiscale=expected_multiscale)
             metadata = _layer_metadata(layer)
             _apply_saved_reference_display_metadata(layer, _saved_reference_display_settings(image_attrs, 0, key))
             metadata["reference_key"] = key
@@ -857,7 +895,7 @@ def launch_coregistration_gui(
             metadata.setdefault("reference_color_choice", "metadata")
             metadata.setdefault("reference_contrast_mode", "percentile")
             metadata.setdefault("reference_contrast_percentiles", (1.0, 99.8))
-            metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data)))))
+            metadata.setdefault("reference_contrast_limits", tuple(float(v) for v in layer.contrast_limits))
             metadata.setdefault("reference_gamma", float(getattr(layer, "gamma", 1.0)))
             layer.opacity = 1.0
             layer.blending = "translucent"
@@ -885,6 +923,7 @@ def launch_coregistration_gui(
 
     def refresh_datasets_after_reference_update():
         refreshed_sdata = sd.read_zarr(host_zarr_path)
+        _attach_stored_image_attrs(refreshed_sdata, host_zarr_path)
         specs = _infer_msi_dataset_specs(refreshed_sdata)
         all_tic_keys = {str(spec["tic_key"]) for spec in specs}
         reference_keys = [key for key in refreshed_sdata.images.keys() if key not in all_tic_keys]
@@ -2182,8 +2221,21 @@ def launch_coregistration_gui(
         except Exception:
             pass
 
-    def _reference_intensity_from_layer(layer) -> np.ndarray:
-        arr = np.asarray(layer.data)
+    def _reference_intensity_from_layer(layer, pyramid_level: int = 0) -> np.ndarray:
+        if bool(getattr(layer, "multiscale", False)):
+            levels = list(layer.data)
+            pyramid_level = int(pyramid_level)
+            if pyramid_level < 0 or pyramid_level >= len(levels):
+                raise ValueError(
+                    f"Reference pyramid level {pyramid_level} is unavailable for {layer.name!r}; "
+                    f"valid levels are 0 through {len(levels) - 1}."
+                )
+            data = levels[pyramid_level]
+        else:
+            if int(pyramid_level) != 0:
+                raise ValueError(f"Reference layer {layer.name!r} has only pyramid level 0.")
+            data = layer.data
+        arr = np.asarray(data)
         if arr.ndim == 2:
             return np.asarray(arr, dtype=float)
         if arr.ndim == 3 and arr.shape[-1] in (3, 4):
@@ -2193,6 +2245,20 @@ def launch_coregistration_gui(
             rgb = np.moveaxis(np.asarray(arr[:3], dtype=float), 0, -1)
             return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
         raise ValueError(f"Reference layer {layer.name!r} is not a 2D fluorescence/intensity channel.")
+
+    def _if_reference_sampling_inputs(state: dict[str, Any], layer, pyramid_level: int) -> tuple[np.ndarray, np.ndarray]:
+        metadata = _layer_metadata(layer)
+        reference_key = str(metadata.get("reference_key", ""))
+        images = state["dataset"].sdata.images
+        if reference_key not in images:
+            raise ValueError(f"Reference image metadata is unavailable for layer {layer.name!r}.")
+        sampling_transform, _scales = rescale_registration_between_pyramid_levels(
+            state["current_transform_xy"],
+            images[reference_key],
+            source_level=0,
+            target_level=int(pyramid_level),
+        )
+        return _reference_intensity_from_layer(layer, int(pyramid_level)), sampling_transform
 
     if_threshold_preview_updates_enabled = False
     suppress_if_threshold_absolute_update = False
@@ -2204,6 +2270,7 @@ def launch_coregistration_gui(
         try:
             layer_name = str(if_threshold_reference_channel.value)
             percentile = float(if_threshold_percentile.value)
+            analysis_pyramid_level = int(if_threshold_analysis_pyramid_level.value)
             prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
             prefilter_region_label = str(if_threshold_prefilter_region.value)
         except Exception as exc:
@@ -2223,11 +2290,15 @@ def launch_coregistration_gui(
             if_threshold_prefilter_region.value = prefilter_region_label
 
         try:
-            reference_img = _reference_intensity_from_layer(layer)
+            reference_img, sampling_transform = _if_reference_sampling_inputs(
+                state,
+                layer,
+                analysis_pyramid_level,
+            )
             values = _sample_reference_values_at_msi_pixels(
                 reference_img,
                 coreg_dataset,
-                state["current_transform_xy"],
+                sampling_transform,
             )
         except Exception as exc:
             QMessageBox.warning(None, "IF Threshold Preview", str(exc))
@@ -2265,6 +2336,13 @@ def launch_coregistration_gui(
 
     @magicgui(
         reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        analysis_pyramid_level={
+            "widget_type": "SpinBox",
+            "min": 0,
+            "max": 32,
+            "step": 1,
+            "label": "Analysis pyramid level",
+        },
         prefilter_annotation={"widget_type": "ComboBox", "choices": ["(none)"], "label": "Prefilter annotation"},
         prefilter_region={"widget_type": "ComboBox", "choices": ["(all regions)"], "label": "Prefilter region"},
         auto_call=False,
@@ -2272,12 +2350,14 @@ def launch_coregistration_gui(
     )
     def if_threshold_preview_controls(
         reference_channel: str = "(none)",
+        analysis_pyramid_level: int = 4,
         prefilter_annotation: str = "(none)",
         prefilter_region: str = "(all regions)",
     ):
         schedule_if_threshold_preview_update()
 
     if_threshold_reference_channel = if_threshold_preview_controls.reference_channel
+    if_threshold_analysis_pyramid_level = if_threshold_preview_controls.analysis_pyramid_level
     if_threshold_prefilter_annotation = if_threshold_preview_controls.prefilter_annotation
     if_threshold_prefilter_region = if_threshold_preview_controls.prefilter_region
 
@@ -2356,6 +2436,7 @@ def launch_coregistration_gui(
                 channel_name=str(layer.name),
                 threshold=float(threshold),
                 transform_xy=state["current_transform_xy"],
+                reference_pyramid_level=int(if_threshold_analysis_pyramid_level.value),
                 prefilter_mask=prefilter_mask,
                 prefilter_shape_key=prefilter_shape_key if prefilter_mask is not None else "",
                 prefilter_region_label=prefilter_region_label if prefilter_mask is not None else "",
@@ -2403,6 +2484,7 @@ def launch_coregistration_gui(
         try:
             layer_name = str(if_threshold_reference_channel.value)
             threshold = float(if_threshold_absolute_value.value)
+            analysis_pyramid_level = int(if_threshold_analysis_pyramid_level.value)
             prefilter_shape_key = str(if_threshold_prefilter_annotation.value)
             prefilter_region_label = str(if_threshold_prefilter_region.value)
         except Exception as exc:
@@ -2422,11 +2504,15 @@ def launch_coregistration_gui(
             if_threshold_prefilter_region.value = prefilter_region_label
 
         try:
-            reference_img = _reference_intensity_from_layer(layer)
+            reference_img, sampling_transform = _if_reference_sampling_inputs(
+                state,
+                layer,
+                analysis_pyramid_level,
+            )
             values = _sample_reference_values_at_msi_pixels(
                 reference_img,
                 coreg_dataset,
-                state["current_transform_xy"],
+                sampling_transform,
             )
         except Exception as exc:
             QMessageBox.warning(None, "IF Threshold Preview", str(exc))
@@ -2474,8 +2560,20 @@ def launch_coregistration_gui(
         refresh_if_threshold_choices(state, preferred_layer=selected_layer)
         schedule_if_threshold_preview_update()
 
+    def update_if_threshold_analysis_level(*_args):
+        layer = _get_reference_layer_by_name(str(if_threshold_reference_channel.value))
+        if layer is not None:
+            _layer_metadata(layer)["if_threshold_analysis_pyramid_level"] = int(
+                if_threshold_analysis_pyramid_level.value
+            )
+        schedule_if_threshold_preview_update()
+
     try:
         if_threshold_reference_channel.changed.connect(update_if_threshold_channel_defaults)
+    except Exception:
+        pass
+    try:
+        if_threshold_analysis_pyramid_level.changed.connect(update_if_threshold_analysis_level)
     except Exception:
         pass
 
@@ -2539,6 +2637,16 @@ def launch_coregistration_gui(
         if_threshold_reference_channel.value = current_layer
         layer = _get_reference_layer_by_name(current_layer)
         layer_metadata = _layer_metadata(layer) if layer is not None else {}
+        pyramid_level_count = len(layer.data) if layer is not None and bool(getattr(layer, "multiscale", False)) else 1
+        maximum_pyramid_level = max(0, pyramid_level_count - 1)
+        try:
+            if_threshold_analysis_pyramid_level.max = maximum_pyramid_level
+        except Exception:
+            if_threshold_analysis_pyramid_level.native.setMaximum(maximum_pyramid_level)
+        preferred_pyramid_level = int(
+            layer_metadata.get("if_threshold_analysis_pyramid_level", min(4, maximum_pyramid_level))
+        )
+        if_threshold_analysis_pyramid_level.value = min(max(0, preferred_pyramid_level), maximum_pyramid_level)
 
         shape_keys = [key for key in coreg_dataset.sdata.shapes.keys() if "pixels" not in key.lower()]
         annotation_choices = ["(none)"] + shape_keys
@@ -3711,7 +3819,7 @@ def launch_coregistration_gui(
         metadata = _layer_metadata(layer)
         mode = str(metadata.get("reference_contrast_mode", "percentile"))
         if mode == "intensity":
-            limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+            limits = _current_reference_contrast_limits(layer)
             return mode, limits[0], limits[1]
         low, high = tuple(float(v) for v in metadata.get("reference_contrast_percentiles", (1.0, 99.8)))
         return "percentile", low, high
@@ -3793,7 +3901,7 @@ def launch_coregistration_gui(
                 _configure_if_contrast_spin(low_spin, mode)
                 _configure_if_contrast_spin(high_spin, mode)
                 if mode == "intensity":
-                    limits = tuple(float(v) for v in getattr(layer, "contrast_limits", finite_data_limits(np.asarray(layer.data))))
+                    limits = _current_reference_contrast_limits(layer)
                     low_spin.setValue(limits[0])
                     high_spin.setValue(limits[1])
                 else:
@@ -3834,6 +3942,7 @@ def launch_coregistration_gui(
             metadata = _layer_metadata(current_threshold_layer)
             metadata["if_threshold_percentile"] = float(if_threshold_percentile.value)
             metadata["if_threshold_value"] = float(if_threshold_absolute_value.value)
+            metadata["if_threshold_analysis_pyramid_level"] = int(if_threshold_analysis_pyramid_level.value)
             metadata["if_threshold_prefilter_annotation"] = str(if_threshold_prefilter_annotation.value)
             metadata["if_threshold_prefilter_region"] = str(if_threshold_prefilter_region.value)
         layers_by_key: dict[str, list[Any]] = {}
@@ -3858,6 +3967,7 @@ def launch_coregistration_gui(
                 "gamma": float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))),
                 "if_threshold_percentile": metadata.get("if_threshold_percentile", ""),
                 "if_threshold_value": metadata.get("if_threshold_value", ""),
+                "if_threshold_analysis_pyramid_level": metadata.get("if_threshold_analysis_pyramid_level", ""),
                 "if_threshold_prefilter_annotation": str(metadata.get("if_threshold_prefilter_annotation", "")),
                 "if_threshold_prefilter_region": str(metadata.get("if_threshold_prefilter_region", "")),
             }
@@ -3889,6 +3999,7 @@ def launch_coregistration_gui(
         "gamma",
         "if_threshold_percentile",
         "if_threshold_value",
+        "if_threshold_analysis_pyramid_level",
         "if_threshold_prefilter_annotation",
         "if_threshold_prefilter_region",
     ]
@@ -3919,6 +4030,7 @@ def launch_coregistration_gui(
             metadata = _layer_metadata(current_threshold_layer)
             metadata["if_threshold_percentile"] = float(if_threshold_percentile.value)
             metadata["if_threshold_value"] = float(if_threshold_absolute_value.value)
+            metadata["if_threshold_analysis_pyramid_level"] = int(if_threshold_analysis_pyramid_level.value)
             metadata["if_threshold_prefilter_annotation"] = str(if_threshold_prefilter_annotation.value)
             metadata["if_threshold_prefilter_region"] = str(if_threshold_prefilter_region.value)
 
@@ -3963,6 +4075,7 @@ def launch_coregistration_gui(
                         "gamma": float(metadata.get("reference_gamma", getattr(layer, "gamma", 1.0))),
                         "if_threshold_percentile": metadata.get("if_threshold_percentile", ""),
                         "if_threshold_value": metadata.get("if_threshold_value", ""),
+                        "if_threshold_analysis_pyramid_level": metadata.get("if_threshold_analysis_pyramid_level", ""),
                         "if_threshold_prefilter_annotation": str(metadata.get("if_threshold_prefilter_annotation", "")),
                         "if_threshold_prefilter_region": str(metadata.get("if_threshold_prefilter_region", "")),
                     }
@@ -4024,10 +4137,13 @@ def launch_coregistration_gui(
             _apply_reference_layer_gamma(layer, float(gamma if gamma is not None else 1.0))
             threshold_percentile = _parse_csv_float(row.get("if_threshold_percentile", ""), None)
             threshold_value = _parse_csv_float(row.get("if_threshold_value", ""), None)
+            threshold_pyramid_level = _parse_csv_float(row.get("if_threshold_analysis_pyramid_level", ""), None)
             if threshold_percentile is not None:
                 metadata["if_threshold_percentile"] = float(threshold_percentile)
             if threshold_value is not None:
                 metadata["if_threshold_value"] = float(threshold_value)
+            if threshold_pyramid_level is not None:
+                metadata["if_threshold_analysis_pyramid_level"] = int(threshold_pyramid_level)
             threshold_annotation = str(row.get("if_threshold_prefilter_annotation", "")).strip()
             threshold_region = str(row.get("if_threshold_prefilter_region", "")).strip()
             if threshold_annotation:
@@ -4265,7 +4381,12 @@ def launch_coregistration_gui(
     def add_optical_image():
         state = get_active_state()
         coreg_dataset = state["dataset"]
-        path, _ = QFileDialog.getOpenFileName(None, "Select optical image", "", "Image files (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select optical image",
+            "",
+            "Image files (*.qptiff *.ome.tif *.ome.tiff *.tif *.tiff *.png *.jpg *.jpeg);;All files (*)",
+        )
         if not path:
             return
         _run_with_busy_dialog(
@@ -4306,10 +4427,10 @@ def launch_coregistration_gui(
         refresh_if_threshold_choices(state)
 
     @magicgui(
-        qptiff_level={"widget_type": "SpinBox", "min": 0, "max": 12, "step": 1},
+        qptiff_level={"widget_type": "SpinBox", "min": -1, "max": 12, "step": 1},
         call_button="Add/Update H&E From QPTIFF",
     )
-    def add_hne_from_qptiff(qptiff_level: int = 4):
+    def add_hne_from_qptiff(qptiff_level: int = -1):
         state = get_active_state()
         coreg_dataset = state["dataset"]
         path, _ = QFileDialog.getOpenFileName(None, "Select H&E QPTIFF", "", "QPTIFF/OME-TIFF (*.qptiff *.ome.tif *.ome.tiff *.tif *.tiff);;All files (*)")
@@ -4318,7 +4439,13 @@ def launch_coregistration_gui(
         _run_with_busy_dialog(
             "Add H&E QPTIFF",
             "Importing H&E QPTIFF...\nLarge pyramid images can take a little while.",
-            lambda: add_reference_image(coreg_dataset.zarr_path, path, key="hne", registered_cs=registered_cs, qptiff_level=int(qptiff_level)),
+            lambda: add_reference_image(
+                coreg_dataset.zarr_path,
+                path,
+                key="hne",
+                registered_cs=registered_cs,
+                qptiff_level=(int(qptiff_level) if int(qptiff_level) >= 0 else None),
+            ),
         )
         _run_with_busy_dialog(
             "Add H&E QPTIFF",
@@ -4449,6 +4576,47 @@ def launch_coregistration_gui(
             ),
         )
         state["current_transform_is_initial_guess"] = False
+
+    @magicgui(
+        reference_image={"widget_type": "ComboBox", "choices": ["(none)"]},
+        source_level={"widget_type": "SpinBox", "min": 0, "max": 32, "step": 1},
+        target_level={"widget_type": "SpinBox", "min": 0, "max": 32, "step": 1},
+        call_button="Convert Active Affine",
+    )
+    def rescale_registration_pyramid_widget(
+        reference_image: str = "(none)",
+        source_level: int = 4,
+        target_level: int = 0,
+    ):
+        """Convert the live MSI affine from one reference pyramid level to another."""
+        state = get_active_state()
+        image_key = str(reference_image)
+        images = state["dataset"].sdata.images
+        if image_key not in images:
+            QMessageBox.warning(None, "Convert Affine", "Select a reference image with a stored pyramid.")
+            return
+        try:
+            converted, (scale_x, scale_y) = rescale_registration_between_pyramid_levels(
+                state["current_transform_xy"],
+                images[image_key],
+                source_level=int(source_level),
+                target_level=int(target_level),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(None, "Convert Affine", str(exc))
+            return
+
+        state["current_transform_xy"][:] = converted
+        state["current_transform_is_initial_guess"] = False
+        apply_transform_to_state(state)
+        sync_controls_to_active_dataset()
+        QMessageBox.information(
+            None,
+            "Convert Affine",
+            f"Updated the active affine from {image_key} level {int(source_level)} "
+            f"to level {int(target_level)} (x {scale_x:g}, y {scale_y:g}).\n\n"
+            "Review the overlay, then use Save Active Registration to persist it.",
+        )
 
     @magicgui(call_button="Save All Registrations")
     def save_all_registrations_widget():
@@ -4731,6 +4899,10 @@ def launch_coregistration_gui(
     alignment_dialog_container_layout.addWidget(optimize_affine_registration_widget.native)
     alignment_dialog_container_layout.addWidget(QLabel("Registration"))
     alignment_dialog_container_layout.addWidget(copy_affine_to_target_widget.native)
+    alignment_dialog_container_layout.addWidget(rescale_registration_pyramid_widget.native)
+    alignment_dialog_container_layout.addWidget(
+        QLabel("Convert an affine fitted on one reference pyramid level to another; level 0 is full resolution")
+    )
     alignment_dialog_container_layout.addWidget(save_registration_widget.native)
     alignment_dialog_container_layout.addWidget(save_all_registrations_widget.native)
     alignment_dialog_container_layout.addStretch(1)
@@ -4738,6 +4910,14 @@ def launch_coregistration_gui(
     alignment_dialog_layout.addWidget(alignment_dialog_scroll)
 
     def open_alignment_dialog():
+        state = get_active_state()
+        reference_choices = [
+            key for key in state["dataset"].reference_image_keys
+            if key in state["dataset"].sdata.images
+        ]
+        rescale_registration_pyramid_widget.reference_image.choices = reference_choices or ["(none)"]
+        if rescale_registration_pyramid_widget.reference_image.value not in rescale_registration_pyramid_widget.reference_image.choices:
+            rescale_registration_pyramid_widget.reference_image.value = rescale_registration_pyramid_widget.reference_image.choices[0]
         preview_affine_mi_inputs_widget.reference_channel.choices = _reference_channel_choice_names()
         if preview_affine_mi_inputs_widget.reference_channel.value not in preview_affine_mi_inputs_widget.reference_channel.choices:
             preview_affine_mi_inputs_widget.reference_channel.value = preview_affine_mi_inputs_widget.reference_channel.choices[0]

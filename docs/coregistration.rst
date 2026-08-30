@@ -42,7 +42,7 @@ If the zarr already exists, you can add data incrementally:
    )
 
    add_reference_image("sample.zarr", "sample_hne.tif", key="hne")
-   add_reference_image("sample.zarr", "sample_if.qptiff", key="optical", qptiff_level=2)
+   add_reference_image("sample.zarr", "sample_if.qptiff", key="optical")
 
    embed_msi_dataset(
        "sample.zarr",
@@ -57,6 +57,16 @@ If the zarr already exists, you can add data incrementally:
        object_mode="annotations_only",
        annotation_pyramid_level=4,
    )
+
+QPTIFF and OME-TIFF reference images are imported as chunked multiscale
+images by default. Napari then selects a pyramid level as the view is zoomed,
+without loading the full-resolution plane into memory. Pass an explicit
+``qptiff_level`` to ``add_reference_image`` only when a single pyramid level
+is desired. In the GUI's QPTIFF importer, ``-1`` selects the complete pyramid.
+If a registration was fitted against a lower-resolution level, use **Alignment
+Tools > Registration > Convert Active Affine** to convert it to another level
+(``0`` is full resolution). The conversion updates the live overlay for review;
+use **Save Active Registration** afterward to persist it.
 
 The dataset selector used throughout the API accepts the dataset display name,
 internal label, table key, or TIC image key:
@@ -127,8 +137,13 @@ The public helpers can also sample reference channels at MSI pixels:
        "sample.zarr",
        reference_key="hne",
        channel_index=0,
+       reference_pyramid_level=4,
        msi_dataset="nanoDESI Negative",
    )
+
+``reference_pyramid_level`` controls only the level used for intensity
+sampling. Registration matrices remain in level-0 (full-resolution)
+coordinates and are converted internally for the selected analysis level.
 
 Annotations and ROI Masks
 -------------------------
@@ -159,6 +174,25 @@ annotation or one annotation label into a boolean MSI pixel mask, use
        msi_dataset="nanoDESI Negative",
        normalize_to_tic=True,
    )
+
+To normalize every selected spectrum to a reference ion instead of TIC, pass
+the reference m/z and its ppm window. Intensities from all features inside the
+window are summed to form the per-pixel denominator:
+
+.. code-block:: python
+
+   summary = summarize_annotation_region_spectra(
+       "sample.zarr",
+       "anno_tumor_regions",
+       region_label="Tumor",
+       normalize_to=611.1447,
+       normalize_to_ppm_tolerance=5,
+   )
+
+When ``normalize_to`` is supplied it takes precedence over
+``normalize_to_tic``. Pixels whose reference-ion denominator is zero produce a
+zero-filled normalized spectrum. An error is raised if no feature falls within
+the requested ppm window.
 
 ``summarize_msi_pixel_mask_spectra`` can summarize any boolean mask that is the
 same length as the number of MSI spectra.
@@ -197,6 +231,7 @@ locations.
        reference_key="hne",
        channel_index=0,
        percentile=75,
+       reference_pyramid_level=4,
        msi_dataset="nanoDESI Negative",
        prefilter_mask=roi_mask,
    )
@@ -205,7 +240,8 @@ For percentile thresholds, the percentile is computed only from finite pixels
 inside ``prefilter_mask``. Pixels outside the prefilter are excluded from both
 ``below_mask`` and ``above_mask``. For absolute thresholds, the threshold value
 is fixed, but the prefilter still controls which pixels are eligible for either
-output group.
+output group. The GUI exposes the same setting as **Analysis pyramid level** in
+the IF Threshold Tools and prefers level 4 when that level exists.
 
 Use the summary wrappers when you want mean spectra for the thresholded groups:
 
@@ -218,6 +254,7 @@ Use the summary wrappers when you want mean spectra for the thresholded groups:
        reference_key="hne",
        channel_index=0,
        percentile=75,
+       reference_pyramid_level=4,
        msi_dataset="nanoDESI Negative",
        prefilter_mask=roi_mask,
    )

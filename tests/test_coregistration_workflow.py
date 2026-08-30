@@ -20,6 +20,7 @@ from spatialdata.transformations import Identity, get_transformation, set_transf
 from viu_chem.coreg_figures import get_coregistered_ion_image
 from viu_chem.msi_coregistration import (
     CoregistrationDataset,
+    _multiscale_image_levels,
     _xy_matrix_from_transform,
     add_reference_image,
     create_annotation_region_mask,
@@ -28,6 +29,7 @@ from viu_chem.msi_coregistration import (
     import_geojson_annotations,
     list_coregistration_msi_datasets,
     rename_msi_dataset,
+    rescale_registration_between_pyramid_levels,
     sample_reference_channel_values_at_msi_pixels,
     save_coregistration,
     sitk_affine_from_fixed_to_moving_matrix,
@@ -152,6 +154,36 @@ def test_dataset_reconstructs_raw_and_tic_normalized_ion_images(coregistration_s
         np.array([[1.0 / 10.0, 3.0 / 20.0], [5.0 / 30.0, 7.0 / 40.0]]),
     )
     np.testing.assert_array_equal(dataset.find_feature_indices_from_mz(100.0004, 5.0), np.array([0]))
+
+
+def test_region_spectra_can_normalize_each_pixel_to_a_reference_mz(coregistration_store: Path):
+    dataset = CoregistrationDataset(coregistration_store)
+    selected = np.ones(4, dtype=bool)
+
+    summary = dataset.summarize_region_spectra(
+        selected,
+        normalize_to=200.0,
+        normalize_to_ppm_tolerance=5.0,
+    )
+
+    normalized = np.array(
+        [
+            [1.0 / 2.0, 1.0],
+            [3.0 / 4.0, 1.0],
+            [5.0 / 6.0, 1.0],
+            [7.0 / 8.0, 1.0],
+        ]
+    )
+    np.testing.assert_allclose(summary["mean_intensity"], normalized.mean(axis=0))
+    np.testing.assert_allclose(summary["std_intensity"], normalized.std(axis=0, ddof=0))
+    assert summary["n_spectra"] == 4
+
+    with pytest.raises(ValueError, match="No MSI features found"):
+        dataset.summarize_region_spectra(
+            selected,
+            normalize_to=300.0,
+            normalize_to_ppm_tolerance=5.0,
+        )
 
 
 def test_save_registration_persists_one_affine_for_tic_and_pixel_shapes(coregistration_store: Path):
@@ -325,6 +357,100 @@ def test_grayscale_reference_ingestion_is_supported(tmp_path: Path):
     assert image.dims == ("c", "y", "x")
     assert image.shape == (1, 4, 5)
     assert list(get_channel_names(image)) == ["image"]
+
+
+def test_qptiff_reference_ingestion_preserves_native_lazy_pyramid(tmp_path: Path):
+    import tifffile
+
+    store = _write_coregistration_store(
+        tmp_path / "pyramidal.zarr",
+        include_reference=False,
+        include_roi=False,
+    )
+    reference_path = tmp_path / "fluorescence.qptiff"
+    full = np.arange(3 * 64 * 80, dtype=np.uint16).reshape(3, 64, 80)
+    with tifffile.TiffWriter(reference_path, ome=False) as tif:
+        tif.write(full, metadata={"axes": "CYX"}, tile=(16, 16), subifds=2)
+        tif.write(full[:, ::2, ::2], metadata={"axes": "CYX"}, tile=(16, 16), subfiletype=1)
+        tif.write(full[:, ::4, ::4], metadata={"axes": "CYX"}, tile=(16, 16), subfiletype=1)
+
+    dataset = add_reference_image(store, reference_path, key="hne", qptiff_level=None)
+    image = dataset.sdata.images["hne"]
+    levels = _multiscale_image_levels(image)
+
+    assert [level.shape for level in levels] == [(3, 64, 80), (3, 32, 40), (3, 16, 20)]
+    assert all(hasattr(level.data, "chunks") for level in levels)
+    assert image.attrs["image_source"] == "qptiff_pyramid_multiscale"
+    assert image.attrs["pyramid_level_shapes_yx"] == [[64, 80], [32, 40], [16, 20]]
+    np.testing.assert_array_equal(np.asarray(levels[0][0, :2, :3]), full[0, :2, :3])
+
+
+def test_registration_affine_can_be_converted_between_reference_pyramid_levels(tmp_path: Path):
+    import tifffile
+
+    store = _write_coregistration_store(
+        tmp_path / "affine-pyramid.zarr",
+        include_reference=False,
+        include_roi=False,
+    )
+    reference_path = tmp_path / "affine-fluorescence.qptiff"
+    full = np.ones((1, 65, 81), dtype=np.uint16)
+    coarse = np.full((1, 17, 21), 7, dtype=np.uint16)
+    with tifffile.TiffWriter(reference_path, ome=False) as tif:
+        tif.write(full, metadata={"axes": "CYX"}, tile=(16, 16), subifds=1)
+        tif.write(coarse, metadata={"axes": "CYX"}, tile=(16, 16), subfiletype=1)
+
+    image = add_reference_image(store, reference_path, key="hne", qptiff_level=None).sdata.images["hne"]
+    level_transform = np.array(
+        [[1.2, -0.1, 3.0], [0.2, 0.9, -4.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    converted, scales = rescale_registration_between_pyramid_levels(
+        level_transform,
+        image,
+        source_level=1,
+        target_level=0,
+    )
+
+    expected_scale_x = 81 / 21
+    expected_scale_y = 65 / 17
+    np.testing.assert_allclose(scales, (expected_scale_x, expected_scale_y))
+    np.testing.assert_allclose(
+        converted,
+        np.diag([expected_scale_x, expected_scale_y, 1.0]) @ level_transform,
+    )
+    round_trip, _ = rescale_registration_between_pyramid_levels(
+        converted,
+        image,
+        source_level=0,
+        target_level=1,
+    )
+    np.testing.assert_allclose(round_trip, level_transform)
+
+    full_values = sample_reference_channel_values_at_msi_pixels(
+        CoregistrationDataset(store),
+        reference_key="hne",
+        channel_index=0,
+        transform_xy=np.eye(3),
+        reference_pyramid_level=0,
+    )
+    coarse_values = sample_reference_channel_values_at_msi_pixels(
+        CoregistrationDataset(store),
+        reference_key="hne",
+        channel_index=0,
+        transform_xy=np.eye(3),
+        reference_pyramid_level=1,
+    )
+    np.testing.assert_allclose(full_values, 1.0)
+    np.testing.assert_allclose(coarse_values, 7.0)
+
+    with pytest.raises(ValueError, match="valid levels are 0 through 1"):
+        rescale_registration_between_pyramid_levels(
+            level_transform,
+            image,
+            source_level=4,
+            target_level=0,
+        )
 
 
 def test_embedding_another_msi_dataset_preserves_current_selection_contract(tmp_path: Path):

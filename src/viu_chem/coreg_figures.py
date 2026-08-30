@@ -18,6 +18,7 @@ from .msi_coregistration import (
     REFERENCE_CHANNEL_COLOR_PRESETS,
     _annotation_mask_from_transformed_geometries,
     _fallback_reference_channel_color,
+    _full_resolution_image,
     _reference_channel_image,
     _resolve_msi_dataset_keys,
     _sample_reference_values_at_msi_pixels,
@@ -103,9 +104,11 @@ def _reference_grid_for_coregistered_arrays(
     if reference_key is None:
         return None, (dataset.ny, dataset.nx), np.eye(3, dtype=float)
 
-    reference_img = np.asarray(dataset.sdata.images[reference_key])
+    reference_element = dataset.sdata.images[reference_key]
+    reference_level = _full_resolution_image(reference_element)
+    reference_img = np.asarray(reference_level)
     reference_attrs = getattr(dataset.sdata.images[reference_key], "attrs", {})
-    reference_dims = tuple(getattr(dataset.sdata.images[reference_key], "dims", ()))
+    reference_dims = tuple(reference_level.dims)
     source_channels = int(reference_attrs.get("source_channels", 0)) if isinstance(reference_attrs, Mapping) else 0
     if reference_img.ndim == 2:
         output_shape = reference_img.shape
@@ -527,8 +530,9 @@ def reference_rgb_composite(
 ) -> np.ndarray:
     dataset = zarr_path if isinstance(zarr_path, CoregistrationDataset) else CoregistrationDataset(zarr_path, registered_cs=registered_cs)
     image = dataset.sdata.images[reference_key]
-    arr = np.asarray(image)
-    dims = tuple(getattr(image, "dims", ()))
+    full_resolution = _full_resolution_image(image)
+    arr = np.asarray(full_resolution)
+    dims = tuple(full_resolution.dims)
     attrs = getattr(image, "attrs", {})
     raw_colors = attrs.get("channel_colors", []) if hasattr(attrs, "get") else []
     raw_names = list(get_channel_names(image))

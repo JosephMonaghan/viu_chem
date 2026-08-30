@@ -16,6 +16,7 @@ from spatialdata.transformations import (
     set_transformation,
 )
 import imageio.v3 as iio
+import dask.array as da
 import geopandas as gpd
 import pandas as pd
 import tifffile
@@ -24,6 +25,7 @@ from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 from shapely import affinity
 import numpy as np
+from xarray import DataArray, DataTree
 import zarr
 from zarr.errors import ZarrUserWarning
 
@@ -46,7 +48,7 @@ def sanitize_name(name: str) -> str:
     return safe.strip("_").lower()
 
 
-def _parse_image_to_spatial(img: np.ndarray, *, channel_names: Iterable[str] | None = None):
+def _parse_image_to_spatial(img: Any, *, channel_names: Iterable[str] | None = None):
     if img.ndim == 2:
         return Image2DModel.parse(img[np.newaxis, ...], dims=("c", "y", "x"), c_coords=list(channel_names or ["image"]))
     if img.ndim == 3:
@@ -55,7 +57,70 @@ def _parse_image_to_spatial(img: np.ndarray, *, channel_names: Iterable[str] | N
     raise ValueError(f"Unexpected image shape: {img.shape}")
 
 
-def _prepare_qptiff_image(arr: np.ndarray, axes: str) -> tuple[np.ndarray, dict[str, Any]]:
+def _multiscale_image_levels(image: DataArray | DataTree) -> list[DataArray]:
+    """Return image levels from finest to coarsest without computing their data."""
+    if isinstance(image, DataTree):
+        levels: list[DataArray] = []
+        for idx in range(len(image.children)):
+            node = image[f"scale{idx}"]
+            if not node.data_vars:
+                raise ValueError(f"Multiscale image level scale{idx!s} contains no image data.")
+            levels.append(next(iter(node.data_vars.values())))
+        return levels
+    return [image]
+
+
+def _full_resolution_image(image: DataArray | DataTree) -> DataArray:
+    return _multiscale_image_levels(image)[0]
+
+
+def rescale_registration_between_pyramid_levels(
+    transform_xy: np.ndarray,
+    reference_image: DataArray | DataTree,
+    *,
+    source_level: int,
+    target_level: int,
+) -> tuple[np.ndarray, tuple[float, float]]:
+    """Convert an MSI-to-reference affine between reference pyramid levels.
+
+    The returned scale tuple is ``(x, y)``.  Actual level dimensions are used
+    instead of assuming that every pyramid step is exactly two-fold.
+    """
+    matrix = np.asarray(transform_xy, dtype=float)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"Registration transform must have shape (3, 3), got {matrix.shape}.")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Registration transform contains non-finite values.")
+
+    levels = _multiscale_image_levels(reference_image)
+    source_level = int(source_level)
+    target_level = int(target_level)
+    for name, index in (("source", source_level), ("target", target_level)):
+        if index < 0 or index >= len(levels):
+            raise ValueError(
+                f"The {name} pyramid level {index} is unavailable; "
+                f"valid levels are 0 through {len(levels) - 1}."
+            )
+
+    source = levels[source_level]
+    target = levels[target_level]
+    source_width = float(source.sizes["x"])
+    source_height = float(source.sizes["y"])
+    target_width = float(target.sizes["x"])
+    target_height = float(target.sizes["y"])
+    if min(source_width, source_height, target_width, target_height) <= 0:
+        raise ValueError("Reference pyramid levels must have positive x and y dimensions.")
+
+    scale_x = target_width / source_width
+    scale_y = target_height / source_height
+    level_conversion = np.array(
+        [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    return level_conversion @ matrix, (scale_x, scale_y)
+
+
+def _prepare_qptiff_image(arr: Any, axes: str) -> tuple[Any, dict[str, Any]]:
     meta: dict[str, Any] = {"source_axes": axes}
     if axes == "YXS":
         if arr.ndim == 3:
@@ -334,6 +399,82 @@ def _read_qptiff_image(path: Path, *, level: int = 0) -> tuple[np.ndarray, dict[
         return img, meta
 
 
+def _is_pyramidal_tiff_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith((".qptiff", ".ome.tif", ".ome.tiff"))
+
+
+def _read_qptiff_pyramid(path: Path) -> tuple[DataTree, dict[str, Any], Any]:
+    """Open a QPTIFF pyramid lazily and convert its native levels to SpatialData."""
+    with tifffile.TiffFile(path) as tf:
+        if not tf.series:
+            raise ValueError(f"No TIFF series found in {path}")
+        series = tf.series[0]
+        levels = list(getattr(series, "levels", []) or [series])
+        axes = str(getattr(series, "axes", ""))
+        level_shapes = [tuple(int(v) for v in level.shape) for level in levels]
+        first_shape = level_shapes[0]
+        probe = da.empty(first_shape, dtype=levels[0].dtype)
+        _, display_meta = _prepare_qptiff_image(probe, axes)
+        channel_count = int(display_meta.get("source_channels", 0))
+        channel_names, channel_colors = _extract_qptiff_channel_metadata(tf, channel_count) if channel_count else ([], [])
+
+    store = tifffile.imread(path, series=0, aszarr=True)
+    try:
+        root = zarr.open(store, mode="r")
+        if len(level_shapes) == 1 and hasattr(root, "shape"):
+            zarr_levels = [root]
+        else:
+            zarr_levels = [root[str(idx)] for idx in range(len(level_shapes))]
+
+        nodes = {}
+        for idx, zarr_level in enumerate(zarr_levels):
+            lazy = da.from_zarr(zarr_level)
+            prepared, _ = _prepare_qptiff_image(lazy, axes)
+            names = channel_names or (["image"] if prepared.ndim == 2 else None)
+            parsed = _parse_image_to_spatial(prepared, channel_names=names)
+            parsed = parsed.chunk(
+                {
+                    "c": 1,
+                    "y": min(1024, int(parsed.sizes["y"])),
+                    "x": min(1024, int(parsed.sizes["x"])),
+                }
+            )
+            nodes[f"scale{idx}"] = parsed.to_dataset(name="image")
+
+        pyramid = DataTree.from_dict(nodes)
+        set_transformation(pyramid, Identity(), to_coordinate_system="global")
+        Image2DModel.validate(pyramid)
+    except Exception:
+        store.close()
+        raise
+
+    y_idx = axes.index("Y")
+    x_idx = axes.index("X")
+    full_y = int(level_shapes[0][y_idx])
+    full_x = int(level_shapes[0][x_idx])
+    meta = {
+        "qptiff_level": 0,
+        "fullres_to_image_scale_x": 1.0,
+        "fullres_to_image_scale_y": 1.0,
+        "image_to_fullres_scale_x": 1.0,
+        "image_to_fullres_scale_y": 1.0,
+        "image_source": "qptiff_pyramid_multiscale",
+        "pyramid_level_shapes_yx": [
+            [int(shape[y_idx]), int(shape[x_idx])] for shape in level_shapes
+        ],
+        "pyramid_level_scales_yx": [
+            [float(full_y) / float(shape[y_idx]), float(full_x) / float(shape[x_idx])]
+            for shape in level_shapes
+        ],
+    }
+    meta.update(display_meta)
+    if channel_names:
+        meta["channel_names"] = channel_names
+        meta["channel_colors"] = channel_colors
+    return pyramid, meta, store
+
+
 def _write_element_to_existing_store(
     zarr_path: str | Path,
     *,
@@ -352,6 +493,27 @@ def _write_element_to_existing_store(
     sdata.write_element(element_name)
     if consolidate_metadata:
         sdata.write_metadata(consolidate_metadata=True)
+
+
+def _attach_stored_image_attrs(sdata: Any, zarr_path: str | Path) -> None:
+    """Attach non-schema image-group metadata that SpatialData does not expose."""
+    try:
+        root = zarr.open_group(Path(zarr_path).expanduser(), mode="r", use_consolidated=False)
+        image_group = root["images"]
+    except Exception:
+        return
+    for key, image in sdata.images.items():
+        if key not in image_group:
+            continue
+        try:
+            stored = dict(image_group[key].attrs)
+        except Exception:
+            continue
+        custom = {name: value for name, value in stored.items() if name not in {"ome", "multiscales", "spatialdata_attrs"}}
+        try:
+            image.attrs.update(custom)
+        except Exception:
+            pass
 
 
 def _geojson_json_compatible(value: Any) -> Any:
@@ -1002,6 +1164,7 @@ class CoregistrationDataset:
     def __post_init__(self) -> None:
         self.zarr_path = Path(self.zarr_path).expanduser()
         self.sdata = sd.read_zarr(self.zarr_path)
+        _attach_stored_image_attrs(self.sdata, self.zarr_path)
 
         specs = _infer_msi_dataset_specs(self.sdata)
         if not specs:
@@ -1026,7 +1189,7 @@ class CoregistrationDataset:
         self.msi_table = self.sdata.tables[self.table_key]
         self.mz_values = self.msi_table.var["mz"].values.astype(float)
         self.X = self.msi_table.X
-        self.tic_array = np.asarray(self.sdata.images[self.tic_key])[0]
+        self.tic_array = np.asarray(_full_resolution_image(self.sdata.images[self.tic_key]))[0]
         all_tic_keys = {spec["tic_key"] for spec in specs}
         self.reference_image_keys = [key for key in self.sdata.images.keys() if key not in all_tic_keys]
 
@@ -1108,6 +1271,8 @@ class CoregistrationDataset:
         selected_mask: np.ndarray,
         *,
         normalize_to_tic: bool = True,
+        normalize_to: float | None = None,
+        normalize_to_ppm_tolerance: float = 5.0,
     ) -> dict[str, np.ndarray | int]:
         selected = np.asarray(selected_mask, dtype=bool).ravel()
         if selected.shape[0] != self.x_coords.shape[0]:
@@ -1118,7 +1283,31 @@ class CoregistrationDataset:
             raise ValueError("No MSI spectra were selected for export.")
         subset = self.X[selected_idx, :]
         dense = np.asarray(subset.toarray() if hasattr(subset, "toarray") else subset, dtype=float)
-        if normalize_to_tic:
+        if normalize_to is not None:
+            normalization_mz = float(normalize_to)
+            normalization_tolerance = float(normalize_to_ppm_tolerance)
+            if not np.isfinite(normalization_mz) or normalization_mz <= 0:
+                raise ValueError("normalize_to must be a finite positive m/z.")
+            if not np.isfinite(normalization_tolerance) or normalization_tolerance <= 0:
+                raise ValueError("normalize_to_ppm_tolerance must be finite and greater than zero.")
+            normalization_indices = self.find_feature_indices_from_mz(
+                normalization_mz,
+                normalization_tolerance,
+            )
+            if normalization_indices.size == 0:
+                raise ValueError(
+                    f"No MSI features found within +/- {normalization_tolerance:g} ppm "
+                    f"of normalization m/z {normalization_mz:g}."
+                )
+            denominator = dense[:, normalization_indices].sum(axis=1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                dense = np.divide(
+                    dense,
+                    denominator[:, None],
+                    out=np.zeros_like(dense, dtype=float),
+                    where=denominator[:, None] != 0,
+                )
+        elif normalize_to_tic:
             tic = self.pixel_tic_values[selected_idx]
             with np.errstate(divide="ignore", invalid="ignore"):
                 dense = np.divide(
@@ -1240,11 +1429,15 @@ def add_reference_image(
         pass
     source_path = Path(image_path).expanduser()
     qptiff_meta: dict[str, Any] = {}
-    if source_path.suffix.lower() in {".qptiff", ".ome.tiff", ".ome.tif"} and qptiff_level is not None:
+    pyramid_store = None
+    if _is_pyramidal_tiff_path(source_path) and qptiff_level is None:
+        element, qptiff_meta, pyramid_store = _read_qptiff_pyramid(source_path)
+    elif _is_pyramidal_tiff_path(source_path):
         img, qptiff_meta = _read_qptiff_image(source_path, level=int(qptiff_level))
+        element = _parse_image_to_spatial(img, channel_names=qptiff_meta.get("channel_names"))
     else:
         img = iio.imread(source_path)
-    element = _parse_image_to_spatial(img, channel_names=qptiff_meta.get("channel_names"))
+        element = _parse_image_to_spatial(img)
 
     px_um_x = 2.54
     px_um_y = 2.54
@@ -1288,14 +1481,32 @@ def add_reference_image(
 
     set_transformation(element, Identity(), to_coordinate_system="global")
     set_transformation(element, Identity(), to_coordinate_system=registered_cs)
-    _write_element_to_existing_store(
-        host_zarr_path,
-        element=element,
-        element_name=key,
-        overwrite=True,
-        consolidate_metadata=True,
-    )
+    try:
+        _write_element_to_existing_store(
+            host_zarr_path,
+            element=element,
+            element_name=key,
+            overwrite=True,
+            consolidate_metadata=False,
+        )
+    finally:
+        if pyramid_store is not None:
+            pyramid_store.close()
+
+    stored_attrs = {
+        "pixel_size_x_um": float(px_um_x),
+        "pixel_size_y_um": float(px_um_y),
+        "pixel_size_source": pixel_size_source,
+        "source_path": str(source_path),
+        **qptiff_meta,
+    }
+    if saved_display_settings:
+        stored_attrs["if_display_settings"] = saved_display_settings
+    root = zarr.open_group(host_zarr_path, mode="r+", use_consolidated=False)
+    root["images"][key].attrs.update(stored_attrs)
+    zarr.consolidate_metadata(host_zarr_path)
     dataset.sdata = sd.read_zarr(host_zarr_path)
+    _attach_stored_image_attrs(dataset.sdata, host_zarr_path)
     return dataset
 
 
@@ -1624,6 +1835,8 @@ def summarize_msi_threshold_spectra(
     percentile: float | None = None,
     threshold_normalize_to_tic: bool = True,
     summary_normalize_to_tic: bool = True,
+    summary_normalize_to: float | None = None,
+    summary_normalize_to_ppm_tolerance: float = 5.0,
     msi_dataset: str | None = None,
     table_key: str | None = None,
     tic_key: str | None = None,
@@ -1652,12 +1865,22 @@ def summarize_msi_threshold_spectra(
         prefilter_mask=prefilter_mask,
     )
     below_summary = (
-        dataset.summarize_region_spectra(mask.below_mask, normalize_to_tic=bool(summary_normalize_to_tic))
+        dataset.summarize_region_spectra(
+            mask.below_mask,
+            normalize_to_tic=bool(summary_normalize_to_tic),
+            normalize_to=summary_normalize_to,
+            normalize_to_ppm_tolerance=summary_normalize_to_ppm_tolerance,
+        )
         if np.any(mask.below_mask)
         else None
     )
     above_summary = (
-        dataset.summarize_region_spectra(mask.above_mask, normalize_to_tic=bool(summary_normalize_to_tic))
+        dataset.summarize_region_spectra(
+            mask.above_mask,
+            normalize_to_tic=bool(summary_normalize_to_tic),
+            normalize_to=summary_normalize_to,
+            normalize_to_ppm_tolerance=summary_normalize_to_ppm_tolerance,
+        )
         if np.any(mask.above_mask)
         else None
     )
@@ -2205,12 +2428,21 @@ def _reference_channel_image(
     sdata,
     reference_key: str,
     channel_index: int = 0,
+    pyramid_level: int = 0,
 ) -> np.ndarray:
     if reference_key not in sdata.images:
         raise KeyError(f"Reference image {reference_key!r} was not found.")
     image = sdata.images[reference_key]
-    raw_arr = np.asarray(image)
-    image_dims = tuple(getattr(image, "dims", ()))
+    levels = _multiscale_image_levels(image)
+    pyramid_level = int(pyramid_level)
+    if pyramid_level < 0 or pyramid_level >= len(levels):
+        raise ValueError(
+            f"Reference pyramid level {pyramid_level} is unavailable for {reference_key!r}; "
+            f"valid levels are 0 through {len(levels) - 1}."
+        )
+    selected_level = levels[pyramid_level]
+    raw_arr = np.asarray(selected_level)
+    image_dims = tuple(getattr(selected_level, "dims", ()))
     channel_index = int(channel_index)
 
     if raw_arr.ndim == 2:  # compatibility with pre-SpatialData-0.7 stores
@@ -2230,9 +2462,10 @@ def _reference_channel_count_and_names(sdata, reference_key: str) -> tuple[int, 
     if reference_key not in sdata.images:
         raise KeyError(f"Reference image {reference_key!r} was not found.")
     image = sdata.images[reference_key]
-    raw_arr = np.asarray(image)
+    full_resolution = _full_resolution_image(image)
+    raw_arr = full_resolution.data
     image_attrs = getattr(image, "attrs", {})
-    image_dims = tuple(getattr(image, "dims", ()))
+    image_dims = tuple(getattr(full_resolution, "dims", ()))
     raw_names = list(get_channel_names(image))
     if not raw_names and isinstance(image_attrs, Mapping):
         raw_names = list(image_attrs.get("channel_names", []))
@@ -2427,6 +2660,7 @@ def sample_reference_channel_values_at_msi_pixels(
     table_key: str | None = None,
     tic_key: str | None = None,
     transform_xy: np.ndarray | None = None,
+    reference_pyramid_level: int = 0,
     registered_cs: str = "registered",
 ) -> np.ndarray:
     if not isinstance(zarr_path, CoregistrationDataset):
@@ -2443,8 +2677,20 @@ def sample_reference_channel_values_at_msi_pixels(
     )
     if transform_xy is None:
         transform_xy, _found = dataset.load_saved_registration_if_available()
-    reference_img = _reference_channel_image(dataset.sdata, reference_key, int(channel_index))
-    return _sample_reference_values_at_msi_pixels(reference_img, dataset, np.asarray(transform_xy, dtype=float))
+    reference_image = dataset.sdata.images[reference_key]
+    sampling_transform, _scales = rescale_registration_between_pyramid_levels(
+        np.asarray(transform_xy, dtype=float),
+        reference_image,
+        source_level=0,
+        target_level=int(reference_pyramid_level),
+    )
+    reference_img = _reference_channel_image(
+        dataset.sdata,
+        reference_key,
+        int(channel_index),
+        pyramid_level=int(reference_pyramid_level),
+    )
+    return _sample_reference_values_at_msi_pixels(reference_img, dataset, sampling_transform)
 
 
 def get_coregistered_msi_mask_image(*args, **kwargs):
@@ -2534,6 +2780,8 @@ def summarize_annotation_region_spectra(
     inclusion_mode: str = "center",
     min_hole_area: float = 0.0,
     normalize_to_tic: bool = True,
+    normalize_to: float | None = None,
+    normalize_to_ppm_tolerance: float = 5.0,
     registered_cs: str = "registered",
 ) -> dict[str, np.ndarray | int]:
     if not isinstance(zarr_path, CoregistrationDataset):
@@ -2557,7 +2805,12 @@ def summarize_annotation_region_spectra(
         min_hole_area=min_hole_area,
         registered_cs=registered_cs,
     )
-    return dataset.summarize_region_spectra(selected, normalize_to_tic=bool(normalize_to_tic))
+    return dataset.summarize_region_spectra(
+        selected,
+        normalize_to_tic=bool(normalize_to_tic),
+        normalize_to=normalize_to,
+        normalize_to_ppm_tolerance=normalize_to_ppm_tolerance,
+    )
 
 
 def summarize_msi_pixel_mask_spectra(
@@ -2568,6 +2821,8 @@ def summarize_msi_pixel_mask_spectra(
     table_key: str | None = None,
     tic_key: str | None = None,
     normalize_to_tic: bool = True,
+    normalize_to: float | None = None,
+    normalize_to_ppm_tolerance: float = 5.0,
     registered_cs: str = "registered",
 ) -> dict[str, np.ndarray | int]:
     if not isinstance(zarr_path, CoregistrationDataset):
@@ -2582,7 +2837,12 @@ def summarize_msi_pixel_mask_spectra(
         if isinstance(zarr_path, CoregistrationDataset)
         else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
     )
-    return dataset.summarize_region_spectra(pixel_mask, normalize_to_tic=bool(normalize_to_tic))
+    return dataset.summarize_region_spectra(
+        pixel_mask,
+        normalize_to_tic=bool(normalize_to_tic),
+        normalize_to=normalize_to,
+        normalize_to_ppm_tolerance=normalize_to_ppm_tolerance,
+    )
 
 
 @dataclass
@@ -2617,6 +2877,7 @@ def create_reference_threshold_mask(
     table_key: str | None = None,
     tic_key: str | None = None,
     transform_xy: np.ndarray | None = None,
+    reference_pyramid_level: int = 0,
     prefilter_mask: np.ndarray | None = None,
     registered_cs: str = "registered",
 ) -> ReferenceThresholdMask:
@@ -2635,10 +2896,22 @@ def create_reference_threshold_mask(
         if isinstance(zarr_path, CoregistrationDataset)
         else CoregistrationDataset(zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
     )
-    reference_img = _reference_channel_image(dataset.sdata, reference_key, int(channel_index))
     if transform_xy is None:
         transform_xy, _found = dataset.load_saved_registration_if_available()
-    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, np.asarray(transform_xy, dtype=float))
+    reference_image = dataset.sdata.images[reference_key]
+    sampling_transform, _scales = rescale_registration_between_pyramid_levels(
+        np.asarray(transform_xy, dtype=float),
+        reference_image,
+        source_level=0,
+        target_level=int(reference_pyramid_level),
+    )
+    reference_img = _reference_channel_image(
+        dataset.sdata,
+        reference_key,
+        int(channel_index),
+        pyramid_level=int(reference_pyramid_level),
+    )
+    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, sampling_transform)
 
     allowed = np.isfinite(values)
     if prefilter_mask is not None:
@@ -2696,8 +2969,11 @@ def summarize_reference_threshold_spectra(
     table_key: str | None = None,
     tic_key: str | None = None,
     transform_xy: np.ndarray | None = None,
+    reference_pyramid_level: int = 0,
     prefilter_mask: np.ndarray | None = None,
     normalize_to_tic: bool = True,
+    normalize_to: float | None = None,
+    normalize_to_ppm_tolerance: float = 5.0,
     registered_cs: str = "registered",
 ) -> ReferenceThresholdSpectra:
     if not isinstance(zarr_path, CoregistrationDataset):
@@ -2719,16 +2995,27 @@ def summarize_reference_threshold_spectra(
         threshold=threshold,
         percentile=percentile,
         transform_xy=transform_xy,
+        reference_pyramid_level=reference_pyramid_level,
         prefilter_mask=prefilter_mask,
     )
 
     below_summary = (
-        dataset.summarize_region_spectra(mask.below_mask, normalize_to_tic=bool(normalize_to_tic))
+        dataset.summarize_region_spectra(
+            mask.below_mask,
+            normalize_to_tic=bool(normalize_to_tic),
+            normalize_to=normalize_to,
+            normalize_to_ppm_tolerance=normalize_to_ppm_tolerance,
+        )
         if np.any(mask.below_mask)
         else None
     )
     above_summary = (
-        dataset.summarize_region_spectra(mask.above_mask, normalize_to_tic=bool(normalize_to_tic))
+        dataset.summarize_region_spectra(
+            mask.above_mask,
+            normalize_to_tic=bool(normalize_to_tic),
+            normalize_to=normalize_to,
+            normalize_to_ppm_tolerance=normalize_to_ppm_tolerance,
+        )
         if np.any(mask.above_mask)
         else None
     )
@@ -2950,6 +3237,7 @@ def create_reference_threshold_annotation(
     channel_name: str = "",
     threshold: float,
     transform_xy: np.ndarray | None = None,
+    reference_pyramid_level: int = 0,
     prefilter_mask: np.ndarray | None = None,
     prefilter_shape_key: str = "",
     prefilter_region_label: str = "",
@@ -2960,9 +3248,21 @@ def create_reference_threshold_annotation(
     host_zarr_path = Path(zarr_path).expanduser()
     dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs, table_key=table_key, tic_key=tic_key)
     sdata = sd.read_zarr(host_zarr_path)
-    reference_img = _reference_channel_image(sdata, reference_key, int(channel_index))
     transform = np.asarray(transform_xy if transform_xy is not None else np.eye(3, dtype=float), dtype=float)
-    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, transform)
+    reference_image = sdata.images[reference_key]
+    sampling_transform, _scales = rescale_registration_between_pyramid_levels(
+        transform,
+        reference_image,
+        source_level=0,
+        target_level=int(reference_pyramid_level),
+    )
+    reference_img = _reference_channel_image(
+        sdata,
+        reference_key,
+        int(channel_index),
+        pyramid_level=int(reference_pyramid_level),
+    )
+    values = _sample_reference_values_at_msi_pixels(reference_img, dataset, sampling_transform)
     allowed = np.isfinite(values)
     if prefilter_mask is not None:
         prefilter = np.asarray(prefilter_mask, dtype=bool)
@@ -3024,6 +3324,7 @@ def create_reference_threshold_annotation(
                 "threshold": float(threshold),
                 "threshold_side": threshold_side,
                 "reference_pooling": "mean",
+                "reference_pyramid_level": int(reference_pyramid_level),
                 "prefilter_shape_key": str(prefilter_shape_key),
                 "prefilter_region_label": str(prefilter_region_label),
                 "n_pixels": int(np.count_nonzero(selected)),
