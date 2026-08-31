@@ -70,6 +70,50 @@ def _multiscale_image_levels(image: DataArray | DataTree) -> list[DataArray]:
     return [image]
 
 
+def _resolve_pyramid_level_index(pyramid_level: int, level_count: int) -> int:
+    """Resolve ``-1`` to the highest available pyramid level index."""
+    level_count = int(level_count)
+    if level_count < 1:
+        raise ValueError("A pyramid must contain at least one level.")
+    requested_level = int(pyramid_level)
+    resolved_level = level_count - 1 if requested_level == -1 else requested_level
+    if resolved_level < 0 or resolved_level >= level_count:
+        raise ValueError(
+            f"Pyramid level {requested_level} is unavailable; valid levels are 0 through {level_count - 1}, "
+            "or -1 for the highest available level."
+        )
+    return resolved_level
+
+
+REGISTRATION_METRIC_CHOICES = ("Mutual information", "Normalized cross-correlation")
+
+
+def _normalize_registration_metric(metric: str) -> str:
+    """Return the canonical name for a supported intensity-registration metric."""
+    normalized = str(metric).strip().lower().replace("_", " ").replace("-", " ")
+    aliases = {
+        "mi": REGISTRATION_METRIC_CHOICES[0],
+        "mutual information": REGISTRATION_METRIC_CHOICES[0],
+        "ncc": REGISTRATION_METRIC_CHOICES[1],
+        "normalized cross correlation": REGISTRATION_METRIC_CHOICES[1],
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported registration metric {metric!r}; choose one of {', '.join(REGISTRATION_METRIC_CHOICES)}."
+        )
+    return aliases[normalized]
+
+
+def _set_registration_metric(registration: Any, metric: str, *, histogram_bins: int) -> str:
+    """Configure a SimpleITK registration object and return the canonical metric name."""
+    canonical_metric = _normalize_registration_metric(metric)
+    if canonical_metric == REGISTRATION_METRIC_CHOICES[0]:
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=int(histogram_bins))
+    else:
+        registration.SetMetricAsCorrelation()
+    return canonical_metric
+
+
 def _full_resolution_image(image: DataArray | DataTree) -> DataArray:
     return _multiscale_image_levels(image)[0]
 

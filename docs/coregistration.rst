@@ -94,7 +94,12 @@ Inside the GUI, use the alignment tools to adjust landmarks, optimize the
 affine registration, and save the active transform. The saved transform is
 written to the SpatialData coordinate system named ``registered`` by default.
 When multiple MSI datasets are embedded, each dataset can have its own saved
-MSI-to-reference transform.
+MSI-to-reference transform. Intensity-based optimization supports mutual
+information and normalized cross-correlation through the **Metric** control.
+Its input preview and optimization use the highest available reference pyramid
+level by default (``-1`` in the **Pyramid level** control). Choose a specific
+level when needed; level ``0`` is full resolution. Affines are converted back
+to level-0 coordinates before they are applied or saved.
 
 Reference and MSI Access
 ------------------------

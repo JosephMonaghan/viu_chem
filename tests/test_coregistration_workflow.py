@@ -21,6 +21,9 @@ from viu_chem.coreg_figures import get_coregistered_ion_image
 from viu_chem.msi_coregistration import (
     CoregistrationDataset,
     _multiscale_image_levels,
+    _normalize_registration_metric,
+    _resolve_pyramid_level_index,
+    _set_registration_metric,
     _xy_matrix_from_transform,
     add_reference_image,
     create_annotation_region_mask,
@@ -35,6 +38,44 @@ from viu_chem.msi_coregistration import (
     sitk_affine_from_fixed_to_moving_matrix,
     sitk_transform_to_homogeneous_matrix,
 )
+
+
+def test_pyramid_level_minus_one_resolves_to_highest_available_level():
+    assert _resolve_pyramid_level_index(-1, 5) == 4
+    assert _resolve_pyramid_level_index(2, 5) == 2
+    assert _resolve_pyramid_level_index(-1, 1) == 0
+
+    with pytest.raises(ValueError, match="valid levels are 0 through 4"):
+        _resolve_pyramid_level_index(5, 5)
+
+
+def test_registration_metric_names_support_mi_and_normalized_cross_correlation():
+    assert _normalize_registration_metric("MI") == "Mutual information"
+    assert _normalize_registration_metric("mutual_information") == "Mutual information"
+    assert _normalize_registration_metric("NCC") == "Normalized cross-correlation"
+    assert _normalize_registration_metric("normalized cross correlation") == "Normalized cross-correlation"
+
+    with pytest.raises(ValueError, match="Unsupported registration metric"):
+        _normalize_registration_metric("mean squared error")
+
+
+def test_registration_metric_configures_mutual_information_or_correlation():
+    class FakeRegistration:
+        def __init__(self):
+            self.metric = None
+
+        def SetMetricAsMattesMutualInformation(self, *, numberOfHistogramBins):
+            self.metric = ("mi", numberOfHistogramBins)
+
+        def SetMetricAsCorrelation(self):
+            self.metric = ("ncc", None)
+
+    registration = FakeRegistration()
+    assert _set_registration_metric(registration, "MI", histogram_bins=64) == "Mutual information"
+    assert registration.metric == ("mi", 64)
+
+    assert _set_registration_metric(registration, "NCC", histogram_bins=64) == "Normalized cross-correlation"
+    assert registration.metric == ("ncc", None)
 
 
 def _pixel_shapes(name: str = "pixels"):

@@ -51,15 +51,19 @@ from .coreg_figures import _msi_pixel_size_um, _reference_display_pixel_size_fro
 from .msi_coregistration import (
     CoregistrationDataset,
     REFERENCE_CHANNEL_COLOR_PRESETS,
+    REGISTRATION_METRIC_CHOICES,
     _annotation_mask_from_transformed_geometries,
     _attach_stored_image_attrs,
     _fallback_reference_channel_color,
     _infer_msi_dataset_specs,
     _make_reference_channel_colormap,
     _multiscale_image_levels,
+    _normalize_registration_metric,
+    _resolve_pyramid_level_index,
     _sample_msi_values_at_msi_pixels,
     _sample_reference_values_at_msi_pixels,
     _sanitize_dataset_label,
+    _set_registration_metric,
     _to_napari_image,
     _write_element_to_existing_store,
     add_reference_image,
@@ -2246,7 +2250,19 @@ def launch_coregistration_gui(
             return np.dot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=float))
         raise ValueError(f"Reference layer {layer.name!r} is not a 2D fluorescence/intensity channel.")
 
+    def _resolve_reference_pyramid_level(layer, pyramid_level: int = -1) -> int:
+        """Resolve ``-1`` to the highest available reference pyramid level."""
+        level_count = len(layer.data) if bool(getattr(layer, "multiscale", False)) else 1
+        try:
+            return _resolve_pyramid_level_index(pyramid_level, level_count)
+        except ValueError as exc:
+            raise ValueError(
+                f"Reference pyramid level {int(pyramid_level)} is unavailable for {layer.name!r}; "
+                f"valid levels are 0 through {level_count - 1}, or -1 for the highest available level."
+            ) from exc
+
     def _if_reference_sampling_inputs(state: dict[str, Any], layer, pyramid_level: int) -> tuple[np.ndarray, np.ndarray]:
+        pyramid_level = _resolve_reference_pyramid_level(layer, pyramid_level)
         metadata = _layer_metadata(layer)
         reference_key = str(metadata.get("reference_key", ""))
         images = state["dataset"].sdata.images
@@ -3255,11 +3271,12 @@ def launch_coregistration_gui(
             "candidate_masks": candidate_masks,
         }
 
-    def optimize_affine_with_mutual_information(
+    def optimize_affine_registration(
         fixed_img: np.ndarray,
         moving_img: np.ndarray,
         initial_moving_to_fixed_xy: np.ndarray,
         *,
+        metric: str,
         histogram_bins: int,
         learning_rate: float,
         min_step: float,
@@ -3269,14 +3286,14 @@ def launch_coregistration_gui(
         max_translation: float,
         max_linear_delta: float,
         max_passes: int,
-        min_mi_improvement: float,
+        min_score_improvement: float,
     ) -> tuple[np.ndarray, float, float, str, int, int, int]:
         import SimpleITK as sitk
 
         sitk.ProcessObject_SetGlobalWarningDisplay(False)
         current_transform_xy = np.asarray(initial_moving_to_fixed_xy, dtype=float).copy()
-        first_before_mi = None
-        last_after_mi = None
+        first_before_score = None
+        last_after_score = None
         last_transform_label = ""
         last_overlap_pixels = 0
         accepted_passes = 0
@@ -3285,10 +3302,11 @@ def launch_coregistration_gui(
         for pass_idx in range(max(1, int(max_passes))):
             evaluated_passes = pass_idx + 1
             mi_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, current_transform_xy)
-            candidate_transform_xy, before_mi, after_mi, transform_label, overlap_pixels = optimize_affine_mi_single_pass(
+            candidate_transform_xy, before_score, after_score, transform_label, overlap_pixels = optimize_affine_single_pass(
                 fixed_img,
                 moving_img,
                 mi_inputs=mi_inputs,
+                metric=metric,
                 histogram_bins=histogram_bins,
                 learning_rate=learning_rate,
                 min_step=min_step,
@@ -3296,35 +3314,36 @@ def launch_coregistration_gui(
                 max_translation=max_translation,
                 max_linear_delta=max_linear_delta,
             )
-            if first_before_mi is None:
-                first_before_mi = before_mi
-            improvement = float(after_mi - before_mi)
-            if improvement < float(min_mi_improvement):
-                last_after_mi = before_mi if last_after_mi is None else last_after_mi
+            if first_before_score is None:
+                first_before_score = before_score
+            improvement = float(after_score - before_score)
+            if improvement < float(min_score_improvement):
+                last_after_score = before_score if last_after_score is None else last_after_score
                 last_transform_label = f"{transform_label}; stopped at pass {pass_idx + 1}"
                 last_overlap_pixels = overlap_pixels
                 break
             current_transform_xy = np.asarray(candidate_transform_xy, dtype=float)
-            last_after_mi = after_mi
+            last_after_score = after_score
             accepted_passes += 1
             last_transform_label = f"{transform_label}; {accepted_passes} accepted pass(es)"
             last_overlap_pixels = overlap_pixels
 
         return (
             current_transform_xy,
-            float(first_before_mi),
-            float(last_after_mi),
+            float(first_before_score),
+            float(last_after_score),
             last_transform_label,
             int(last_overlap_pixels),
             int(accepted_passes),
             int(evaluated_passes),
         )
 
-    def optimize_affine_mi_single_pass(
+    def optimize_affine_single_pass(
         fixed_img: np.ndarray,
         moving_img: np.ndarray,
         *,
         mi_inputs: dict[str, Any],
+        metric: str,
         histogram_bins: int,
         learning_rate: float,
         min_step: float,
@@ -3340,7 +3359,7 @@ def launch_coregistration_gui(
         initial_transform = sitk.AffineTransform(2)
 
         registration = sitk.ImageRegistrationMethod()
-        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=int(histogram_bins))
+        metric = _set_registration_metric(registration, metric, histogram_bins=histogram_bins)
         registration.SetMetricFixedMask(mi_inputs["fixed_crop_mask_sitk"])
         registration.SetMetricSamplingStrategy(registration.NONE)
         registration.SetOptimizerAsRegularStepGradientDescent(
@@ -3355,13 +3374,13 @@ def launch_coregistration_gui(
         registration.SetSmoothingSigmasPerLevel([1, 0])
         registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
         registration.SetInitialTransform(initial_transform, inPlace=False)
-        before_mi = -float(registration.MetricEvaluate(fixed, moving))
+        before_score = -float(registration.MetricEvaluate(fixed, moving))
 
         try:
             final_transform = registration.Execute(fixed, moving)
         except Exception as exc:
             raise RuntimeError(
-                "SimpleITK mutual-information optimization failed after initialization. "
+                f"SimpleITK {metric} optimization failed after initialization. "
                 f"Chosen initializer: {mi_inputs['transform_label']}; fixed-mask overlap: {mi_inputs['overlap_pixels']} pixels; SITK overlap sample count: {mi_inputs['sitk_overlap_pixels']}. "
                 f"Candidate overlaps: {', '.join(f'{label}={int(sitk_count)} SITK samples/{int(np.count_nonzero(mask))} mask pixels' for label, _matrix, _transform, mask, sitk_count in mi_inputs['candidate_masks'])}. "
                 f"Fixed shape: {np.asarray(fixed_img).shape}; fixed crop: {mi_inputs['fixed_crop_arr'].shape} at x={mi_inputs['crop_bounds'][0]}:{mi_inputs['crop_bounds'][1]}, y={mi_inputs['crop_bounds'][2]}:{mi_inputs['crop_bounds'][3]}; moving shape: {np.asarray(moving_img).shape}. "
@@ -3381,23 +3400,27 @@ def launch_coregistration_gui(
         crop_fixed_to_moving_xy = initial_crop_fixed_to_moving_xy @ delta_crop_fixed_to_prewarped_xy
         fixed_to_moving_xy = crop_fixed_to_moving_xy @ np.linalg.inv(mi_inputs["crop_to_full_xy"])
         moving_to_fixed_xy = np.linalg.inv(fixed_to_moving_xy)
-        after_mi = -float(registration.GetMetricValue())
-        return moving_to_fixed_xy, before_mi, after_mi, mi_inputs["transform_label"], mi_inputs["overlap_pixels"]
+        after_score = -float(registration.GetMetricValue())
+        return moving_to_fixed_xy, before_score, after_score, mi_inputs["transform_label"], mi_inputs["overlap_pixels"]
 
     def show_affine_optimization_result_dialog(
         state: dict[str, Any],
         fixed_img: np.ndarray,
         moving_img: np.ndarray,
-        candidate_transform_xy: np.ndarray,
-        before_mi: float,
-        after_mi: float,
+        initial_optimization_transform_xy: np.ndarray,
+        candidate_optimization_transform_xy: np.ndarray,
+        candidate_level_zero_transform_xy: np.ndarray,
+        pyramid_level: int,
+        metric: str,
+        before_score: float,
+        after_score: float,
         transform_label: str,
         overlap_pixels: int,
         accepted_passes: int,
         evaluated_passes: int,
     ):
         try:
-            before_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, state["current_transform_xy"])
+            before_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, initial_optimization_transform_xy)
             fixed_crop = normalize_image_for_registration(before_inputs["fixed_crop_arr"])
             before_overlay = normalize_image_for_registration(before_inputs["moving_on_fixed_crop_arr"])
             after_overlay = normalize_image_for_registration(
@@ -3405,7 +3428,7 @@ def launch_coregistration_gui(
                     moving_img,
                     before_inputs["fixed_crop_sitk"],
                     before_inputs["crop_to_full_xy"],
-                    candidate_transform_xy,
+                    candidate_optimization_transform_xy,
                 )
             )
         except Exception as exc:
@@ -3431,7 +3454,7 @@ def launch_coregistration_gui(
         axes[1].set_title("After optimization", loc="left")
         min_x, max_x, min_y, max_y = before_inputs["crop_bounds"]
         fig.suptitle(
-            f"Mutual information: before {before_mi:.6g}, after {after_mi:.6g}; "
+            f"Pyramid level {int(pyramid_level)}; {metric}: before {before_score:.6g}, after {after_score:.6g}; "
             f"passes accepted {accepted_passes}/{evaluated_passes}; crop x={min_x}:{max_x}, y={min_y}:{max_y}"
         )
         layout.addWidget(canvas)
@@ -3446,7 +3469,7 @@ def launch_coregistration_gui(
         layout.addWidget(button_row)
 
         def accept_candidate():
-            state["current_transform_xy"][:] = np.asarray(candidate_transform_xy, dtype=float)
+            state["current_transform_xy"][:] = np.asarray(candidate_level_zero_transform_xy, dtype=float)
             remove_optimization_preview(state, restore_visibility=False)
             state["ion_layer"].visible = True
             apply_transform_to_state(state)
@@ -3468,37 +3491,45 @@ def launch_coregistration_gui(
 
     @magicgui(
         reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
-        call_button="Preview MI Inputs",
+        pyramid_level={
+            "widget_type": "SpinBox",
+            "min": -1,
+            "max": 32,
+            "step": 1,
+            "label": "Pyramid level (-1 = highest)",
+        },
+        call_button="Preview Optimization Inputs",
     )
-    def preview_affine_mi_inputs_widget(reference_channel: str = "(none)"):
+    def preview_affine_mi_inputs_widget(reference_channel: str = "(none)", pyramid_level: int = -1):
         state = get_active_state()
         layer = _get_reference_layer_by_name(reference_channel)
         if layer is None:
-            QMessageBox.warning(None, "Preview MI Inputs", "Select a fluorescence/reference channel first.")
+            QMessageBox.warning(None, "Preview Optimization Inputs", "Select a fluorescence/reference channel first.")
             return
         def prepare_preview():
-            fixed_img = _reference_intensity_from_layer(layer)
+            resolved_level = _resolve_reference_pyramid_level(layer, pyramid_level)
+            fixed_img, optimization_transform_xy = _if_reference_sampling_inputs(state, layer, resolved_level)
             moving_img = active_msi_registration_image(state)
-            mi_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, state["current_transform_xy"])
-            return fixed_img, moving_img, mi_inputs
+            mi_inputs = prepare_affine_mi_inputs(fixed_img, moving_img, optimization_transform_xy)
+            return fixed_img, moving_img, mi_inputs, resolved_level
 
         try:
-            fixed_img, moving_img, mi_inputs = _run_with_busy_dialog(
-                "Preview MI Inputs",
-                "Preparing mutual-information input preview...",
+            fixed_img, moving_img, mi_inputs, resolved_level = _run_with_busy_dialog(
+                "Preview Optimization Inputs",
+                "Preparing optimization input preview...",
                 prepare_preview,
             )
         except ModuleNotFoundError:
-            QMessageBox.warning(None, "Preview MI Inputs", "SimpleITK is not installed. Install the coregistration extra again to enable this tool.")
+            QMessageBox.warning(None, "Preview Optimization Inputs", "SimpleITK is not installed. Install the coregistration extra again to enable this tool.")
             return
         except Exception as exc:
-            QMessageBox.warning(None, "Preview MI Inputs", str(exc))
+            QMessageBox.warning(None, "Preview Optimization Inputs", str(exc))
             return
 
         fixed_crop = normalize_image_for_registration(mi_inputs["fixed_crop_arr"])
         moving_overlay = normalize_image_for_registration(mi_inputs["moving_on_fixed_crop_arr"])
         dialog = QDialog()
-        dialog.setWindowTitle("MI Input Preview")
+        dialog.setWindowTitle("Optimization Input Preview")
         dialog.setModal(False)
         dialog.resize(920, 460)
         layout = QVBoxLayout(dialog)
@@ -3517,7 +3548,10 @@ def launch_coregistration_gui(
             f"MSI after current affine\n{mi_inputs['transform_label']}; overlap {mi_inputs['sitk_overlap_pixels']} samples",
             loc="left",
         )
-        fig.suptitle(f"Crop x={min_x}:{max_x}, y={min_y}:{max_y}; moving shape {np.asarray(moving_img).shape}")
+        fig.suptitle(
+            f"Pyramid level {resolved_level}; crop x={min_x}:{max_x}, y={min_y}:{max_y}; "
+            f"moving shape {np.asarray(moving_img).shape}"
+        )
         layout.addWidget(canvas)
         dialog.show()
         dialog.raise_()
@@ -3526,7 +3560,15 @@ def launch_coregistration_gui(
 
     @magicgui(
         reference_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
-        histogram_bins={"widget_type": "SpinBox", "min": 8, "max": 256, "step": 1},
+        pyramid_level={
+            "widget_type": "SpinBox",
+            "min": -1,
+            "max": 32,
+            "step": 1,
+            "label": "Pyramid level (-1 = highest)",
+        },
+        metric={"widget_type": "ComboBox", "choices": list(REGISTRATION_METRIC_CHOICES)},
+        histogram_bins={"widget_type": "SpinBox", "min": 8, "max": 256, "step": 1, "label": "Histogram bins (MI only)"},
         learning_rate={"widget_type": "FloatSpinBox", "min": 0.0001, "max": 100.0, "step": 0.1},
         min_step={"widget_type": "FloatSpinBox", "min": 1e-8, "max": 1.0, "step": 1e-4},
         iterations={"widget_type": "SpinBox", "min": 1, "max": 5000, "step": 25},
@@ -3535,11 +3577,13 @@ def launch_coregistration_gui(
         max_translation={"widget_type": "FloatSpinBox", "min": 0.0, "max": 1000.0, "step": 1.0},
         max_linear_delta={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.01},
         max_passes={"widget_type": "SpinBox", "min": 1, "max": 100, "step": 1},
-        min_mi_improvement={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.0001},
-        call_button="Optimize Affine With MI",
+        min_score_improvement={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.0001},
+        call_button="Optimize Affine",
     )
     def optimize_affine_registration_widget(
         reference_channel: str = "(none)",
+        pyramid_level: int = -1,
+        metric: str = "Mutual information",
         histogram_bins: int = 50,
         learning_rate: float = 0.05,
         min_step: float = 1e-4,
@@ -3549,7 +3593,7 @@ def launch_coregistration_gui(
         max_translation: float = 25.0,
         max_linear_delta: float = 0.15,
         max_passes: int = 25,
-        min_mi_improvement: float = 0.001,
+        min_score_improvement: float = 0.001,
     ):
         state = get_active_state()
         layer = _get_reference_layer_by_name(reference_channel)
@@ -3557,12 +3601,15 @@ def launch_coregistration_gui(
             QMessageBox.warning(None, "Affine Optimization", "Select a fluorescence/reference channel first.")
             return
         def run_optimization():
-            fixed_img = _reference_intensity_from_layer(layer)
+            resolved_level = _resolve_reference_pyramid_level(layer, pyramid_level)
+            fixed_img, optimization_transform_xy = _if_reference_sampling_inputs(state, layer, resolved_level)
             moving_img = active_msi_registration_image(state)
-            result = optimize_affine_with_mutual_information(
+            selected_metric = _normalize_registration_metric(metric)
+            result = optimize_affine_registration(
                 fixed_img,
                 moving_img,
-                state["current_transform_xy"],
+                optimization_transform_xy,
+                metric=selected_metric,
                 histogram_bins=int(histogram_bins),
                 learning_rate=float(learning_rate),
                 min_step=float(min_step),
@@ -3572,20 +3619,45 @@ def launch_coregistration_gui(
                 max_translation=float(max_translation),
                 max_linear_delta=float(max_linear_delta),
                 max_passes=int(max_passes),
-                min_mi_improvement=float(min_mi_improvement),
+                min_score_improvement=float(min_score_improvement),
             )
-            return fixed_img, moving_img, result
+            candidate_optimization_transform_xy = result[0]
+            reference_key = str(_layer_metadata(layer).get("reference_key", ""))
+            reference_image = state["dataset"].sdata.images[reference_key]
+            candidate_level_zero_transform_xy, _scales = rescale_registration_between_pyramid_levels(
+                candidate_optimization_transform_xy,
+                reference_image,
+                source_level=resolved_level,
+                target_level=0,
+            )
+            return (
+                fixed_img,
+                moving_img,
+                optimization_transform_xy,
+                candidate_level_zero_transform_xy,
+                resolved_level,
+                selected_metric,
+                result,
+            )
 
         try:
-            fixed_img, moving_img, optimization_result = _run_with_busy_dialog(
+            (
+                fixed_img,
+                moving_img,
+                initial_optimization_transform_xy,
+                candidate_level_zero_transform_xy,
+                resolved_level,
+                selected_metric,
+                optimization_result,
+            ) = _run_with_busy_dialog(
                 "Affine Optimization",
-                "Optimizing affine registration with mutual information...\nThis can take a minute.",
+                f"Optimizing affine registration with {str(metric).lower()}...\nThis can take a minute.",
                 run_optimization,
             )
             (
                 candidate_transform_xy,
-                before_mi,
-                after_mi,
+                before_score,
+                after_score,
                 transform_label,
                 overlap_pixels,
                 accepted_passes,
@@ -3602,9 +3674,13 @@ def launch_coregistration_gui(
             state,
             fixed_img,
             moving_img,
+            initial_optimization_transform_xy,
             candidate_transform_xy,
-            before_mi,
-            after_mi,
+            candidate_level_zero_transform_xy,
+            resolved_level,
+            selected_metric,
+            before_score,
+            after_score,
             transform_label,
             overlap_pixels,
             accepted_passes,
@@ -4894,7 +4970,7 @@ def launch_coregistration_gui(
     alignment_dialog_container_layout.addWidget(flip_horizontal.native)
     alignment_dialog_container_layout.addWidget(flip_vertical.native)
     alignment_dialog_container_layout.addWidget(clear_landmarks.native)
-    alignment_dialog_container_layout.addWidget(QLabel("Mutual-information refinement"))
+    alignment_dialog_container_layout.addWidget(QLabel("Intensity-based refinement"))
     alignment_dialog_container_layout.addWidget(preview_affine_mi_inputs_widget.native)
     alignment_dialog_container_layout.addWidget(optimize_affine_registration_widget.native)
     alignment_dialog_container_layout.addWidget(QLabel("Registration"))
