@@ -1,6 +1,6 @@
 [project]
 name = "viu-chem"
-version = "0.1.74"
+version = "0.1.75"
 description = "Collection of commonly used functions by VIU chemistry"
 authors = [
     {name = "Joseph Monaghan",email = "Joseph_Monaghan@outlook.com"}
@@ -20,19 +20,24 @@ dependencies = [
 
 [project.optional-dependencies]
 coregistration = [
-    "spatialdata",
+    "spatialdata >=0.8,<0.9",
+    "anndata >=0.13.2,<0.14",
+    "zarr >=3.1.4,<3.2",
+    "ome-zarr >=0.16,<0.19",
+    "dask >=2026.3,<2026.8",
+    "xarray >=2024.10,<2027",
     "napari",
     "simpleitk",
-    "pydantic >=2.7,<2.11",
+    "pydantic >=2.11.5,<2.13",
     "npe2 == 0.8.1",
     "magicgui",
     "imageio",
+    "tifffile >=2022.8.12",
     "geopandas",
     "shapely",
     "QtPy",
     "PyQt5",
-    "thyra",
-    "ome-zarr==0.13.0",
+    "thyra >=3.7.4,<4",
     "defusedxml",
 ]
 

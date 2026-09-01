@@ -179,6 +179,14 @@ def _prepare_qptiff_image(arr: Any, axes: str) -> tuple[Any, dict[str, Any]]:
             return arr, meta
 
     if axes == "YX":
+        # tifffile >=2026.8 collapses a singleton channel from the series
+        # shape/axes while its aszarr view retains the leading dimension.
+        # Restore the declared CYX interpretation before building a
+        # SpatialData pyramid so its channel coordinates match every level.
+        if arr.ndim == 3 and int(arr.shape[0]) == 1:
+            meta["source_axes"] = "CYX"
+            meta["source_channels"] = 1
+            return np.moveaxis(arr, 0, -1), meta
         return arr, meta
 
     raise ValueError(f"Unsupported qptiff axes {axes!r}")
@@ -863,24 +871,48 @@ def convert_input_to_zarr(
     output_path: str | Path | None = None,
     *,
     converter: Any | None = None,
+    resample: bool = True,
+    resampling_config: Mapping[str, Any] | None = None,
 ) -> Path:
+    """Convert MSI input to SpatialData, resampling onto a shared mass axis.
+
+    Thyra's command-line interface enables automatic resampling by default,
+    while its Python API requires a non-``None`` ``resampling_config`` to do
+    so.  Match the CLI here because a raw union axis for unaligned centroid
+    spectra can contain millions of columns and makes interactive ion lookup
+    unnecessarily expensive.  Pass ``resample=False`` to preserve the raw
+    union axis, or provide ``resampling_config`` to override Thyra's automatic
+    method, axis type, or bin width.
+    """
     src = Path(input_path).expanduser()
     dst = Path(output_path).expanduser() if output_path is not None else _infer_default_zarr_path(src)
     if dst.suffix.lower() != ".zarr":
         dst = dst.with_suffix(".zarr")
+
+    if not resample and resampling_config is not None:
+        raise ValueError("resampling_config requires resample=True.")
 
     if converter is None:
         try:
             from thyra import convert_msi as converter
         except ImportError as exc:
             raise ImportError(
-                "Converting `.imzML`/`.npz` into SpatialData zarr currently requires "
+                "Converting MSI input into SpatialData zarr currently requires "
                 "`thyra.convert_msi` to be installed."
             ) from exc
 
-    ok = converter(input_path=src, output_path=str(dst))
+    converter_kwargs: dict[str, Any] = {
+        "input_path": src,
+        "output_path": str(dst),
+    }
+    if resample:
+        # An empty config asks Thyra to select the method, mass-axis physics,
+        # range, and bin width from the instrument metadata.
+        converter_kwargs["resampling_config"] = dict(resampling_config or {})
+
+    ok = converter(**converter_kwargs)
     if ok is False:
-        ok = converter(input_path=src, output_path=str(dst),pixel_size_um=50)
+        ok = converter(**converter_kwargs, pixel_size_um=50)
         if ok is False:
             raise RuntimeError(f"Failed to convert MSI input {src} -> {dst}")
     return dst
@@ -1061,7 +1093,7 @@ def embed_msi_dataset(
                     "Selected .zarr is not a compatible MSI dataset for `Add MSI Dataset`. "
                     f"It does not contain any SpatialData tables and appears to be image-only or partial. "
                     f"Top-level keys: {layout.get('top_level_keys', [])}. "
-                    "Use an MSI `.imzML`, `.npz`, or a full SpatialData MSI `.zarr` that includes both `tables/` "
+                    "Use a Thyra-supported MSI input or a full SpatialData MSI `.zarr` that includes both `tables/` "
                     "and the MSI TIC image."
                 ) from exc
             raise ValueError(
@@ -1232,6 +1264,9 @@ class CoregistrationDataset:
         self.pixel_shape_keys = list(selected["pixel_shape_keys"])
         self.msi_table = self.sdata.tables[self.table_key]
         self.mz_values = self.msi_table.var["mz"].values.astype(float)
+        self._mz_values_are_sorted = bool(
+            self.mz_values.size < 2 or np.all(self.mz_values[:-1] <= self.mz_values[1:])
+        )
         self.X = self.msi_table.X
         self.tic_array = np.asarray(_full_resolution_image(self.sdata.images[self.tic_key]))[0]
         all_tic_keys = {spec["tic_key"] for spec in specs}
@@ -1286,9 +1321,21 @@ class CoregistrationDataset:
     def find_feature_idx_from_mz(self, target_mz: float, ppm_tolerance: float = 5.0) -> tuple[int | None, float]:
         if target_mz <= 0:
             return None, float("inf")
-        ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
-        idx = int(np.argmin(ppm_errors))
-        ppm_error = float(ppm_errors[idx])
+        if self._mz_values_are_sorted:
+            insertion = int(np.searchsorted(self.mz_values, target_mz, side="left"))
+            candidates = []
+            if insertion > 0:
+                candidates.append(insertion - 1)
+            if insertion < self.mz_values.size:
+                candidates.append(insertion)
+            if not candidates:
+                return None, float("inf")
+            idx = min(candidates, key=lambda candidate: abs(float(self.mz_values[candidate]) - target_mz))
+            ppm_error = float(abs(float(self.mz_values[idx]) - target_mz) / target_mz * 1e6)
+        else:
+            ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
+            idx = int(np.argmin(ppm_errors))
+            ppm_error = float(ppm_errors[idx])
         if ppm_error <= ppm_tolerance:
             return idx, ppm_error
         return None, ppm_error
@@ -1296,6 +1343,11 @@ class CoregistrationDataset:
     def find_feature_indices_from_mz(self, target_mz: float, ppm_tolerance: float = 5.0) -> np.ndarray:
         if target_mz <= 0 or ppm_tolerance <= 0:
             return np.array([], dtype=int)
+        if self._mz_values_are_sorted:
+            tolerance_da = target_mz * ppm_tolerance * 1e-6
+            left = int(np.searchsorted(self.mz_values, target_mz - tolerance_da, side="left"))
+            right = int(np.searchsorted(self.mz_values, target_mz + tolerance_da, side="right"))
+            return np.arange(left, right, dtype=int)
         ppm_errors = np.abs(self.mz_values - target_mz) / target_mz * 1e6
         return np.flatnonzero(ppm_errors <= ppm_tolerance).astype(int)
 

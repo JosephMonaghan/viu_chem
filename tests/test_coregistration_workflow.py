@@ -22,11 +22,13 @@ from viu_chem.msi_coregistration import (
     CoregistrationDataset,
     _multiscale_image_levels,
     _normalize_registration_metric,
+    _prepare_qptiff_image,
     _resolve_pyramid_level_index,
     _set_registration_metric,
     _xy_matrix_from_transform,
     add_reference_image,
     create_annotation_region_mask,
+    convert_input_to_zarr,
     delete_msi_dataset,
     embed_msi_dataset,
     import_geojson_annotations,
@@ -38,6 +40,57 @@ from viu_chem.msi_coregistration import (
     sitk_affine_from_fixed_to_moving_matrix,
     sitk_transform_to_homogeneous_matrix,
 )
+
+
+def test_qptiff_singleton_channel_axis_is_restored_for_zarr_views():
+    raw = np.ones((1, 5, 7), dtype=np.uint16)
+
+    prepared, metadata = _prepare_qptiff_image(raw, "YX")
+
+    assert prepared.shape == (5, 7, 1)
+    assert metadata["source_axes"] == "CYX"
+    assert metadata["source_channels"] == 1
+
+
+def test_conversion_enables_thyra_auto_resampling_by_default(tmp_path: Path):
+    calls = []
+
+    def converter(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    output = convert_input_to_zarr(
+        tmp_path / "input.imzML",
+        tmp_path / "output.zarr",
+        converter=converter,
+    )
+
+    assert output == tmp_path / "output.zarr"
+    assert calls[0]["resampling_config"] == {}
+
+
+def test_conversion_can_preserve_the_raw_union_mass_axis(tmp_path: Path):
+    calls = []
+
+    def converter(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    convert_input_to_zarr(
+        tmp_path / "input.imzML",
+        tmp_path / "output.zarr",
+        converter=converter,
+        resample=False,
+    )
+
+    assert "resampling_config" not in calls[0]
+    with pytest.raises(ValueError, match="requires resample=True"):
+        convert_input_to_zarr(
+            tmp_path / "input.imzML",
+            converter=converter,
+            resample=False,
+            resampling_config={"method": "nearest_neighbor"},
+        )
 
 
 def test_pyramid_level_minus_one_resolves_to_highest_available_level():
@@ -195,6 +248,33 @@ def test_dataset_reconstructs_raw_and_tic_normalized_ion_images(coregistration_s
         np.array([[1.0 / 10.0, 3.0 / 20.0], [5.0 / 30.0, 7.0 / 40.0]]),
     )
     np.testing.assert_array_equal(dataset.find_feature_indices_from_mz(100.0004, 5.0), np.array([0]))
+
+
+def test_sorted_mass_axis_lookups_use_ppm_window_boundaries(coregistration_store: Path):
+    dataset = CoregistrationDataset(coregistration_store)
+    dataset.mz_values = np.array([99.9990, 100.0, 100.0004, 100.0010])
+    dataset._mz_values_are_sorted = True
+
+    np.testing.assert_array_equal(
+        dataset.find_feature_indices_from_mz(100.0, 5.0),
+        np.array([1, 2]),
+    )
+    idx, ppm_error = dataset.find_feature_idx_from_mz(100.0003, 5.0)
+    assert idx == 2
+    assert ppm_error == pytest.approx(1.0, rel=1e-3)
+
+
+def test_unsorted_legacy_mass_axis_lookup_keeps_compatibility(coregistration_store: Path):
+    dataset = CoregistrationDataset(coregistration_store)
+    dataset.mz_values = np.array([200.0, 100.0004, 100.0])
+    dataset._mz_values_are_sorted = False
+
+    np.testing.assert_array_equal(
+        dataset.find_feature_indices_from_mz(100.0, 5.0),
+        np.array([1, 2]),
+    )
+    idx, _ = dataset.find_feature_idx_from_mz(100.0001, 5.0)
+    assert idx == 2
 
 
 def test_region_spectra_can_normalize_each_pixel_to_a_reference_mz(coregistration_store: Path):

@@ -147,9 +147,9 @@ def _pick_input_or_convert(default_zarr_path: str | Path | None = None) -> Path:
 
     chooser = QMessageBox()
     chooser.setWindowTitle("Choose Startup Input")
-    chooser.setText("Select a SpatialData .zarr folder, or an .imzML/.npz file to convert.")
+    chooser.setText("Select a SpatialData .zarr folder, or an .imzML file to convert.")
     btn_zarr = chooser.addButton("Open .zarr Folder", QMessageBox.AcceptRole)
-    btn_file = chooser.addButton("Open .imzML/.npz File", QMessageBox.ActionRole)
+    btn_file = chooser.addButton("Open .imzML File", QMessageBox.ActionRole)
     chooser.addButton(QMessageBox.Cancel)
     chooser.exec_()
     clicked = chooser.clickedButton()
@@ -166,9 +166,9 @@ def _pick_input_or_convert(default_zarr_path: str | Path | None = None) -> Path:
     if clicked is btn_file:
         selected, _ = QFileDialog.getOpenFileName(
             None,
-            "Select .imzML or .npz input",
+            "Select .imzML input",
             "",
-            "MSI input files (*.imzML *.npz);;imzML (*.imzML);;NPZ (*.npz);;All files (*)",
+            "MSI input files (*.imzML);;imzML (*.imzML);;All files (*)",
         )
         if not selected:
             raise SystemExit("No input selected.")
@@ -1519,16 +1519,26 @@ def launch_coregistration_gui(
         if denominator_indices.size == 0:
             return np.zeros_like(numerator, dtype=float)
         denominator = coreg_dataset.reconstruct_ion_image(denominator_indices, normalize_to_tic=False)
-        raw_numerator = coreg_dataset.reconstruct_ion_image(state["current_feature_indices"], normalize_to_tic=False)
         with np.errstate(divide="ignore", invalid="ignore"):
             return np.divide(
-                raw_numerator,
+                numerator,
                 denominator,
-                out=np.zeros_like(raw_numerator, dtype=float),
+                out=np.zeros_like(numerator, dtype=float),
                 where=np.isfinite(denominator) & (denominator > 0),
             )
 
+    ion_view_update_timer = QTimer()
+    ion_view_update_timer.setSingleShot(True)
+    ion_view_update_timer.setInterval(300)
+    pending_ion_view_update: tuple[float, float] | None = None
+
+    def cancel_pending_ion_view_update():
+        nonlocal pending_ion_view_update
+        ion_view_update_timer.stop()
+        pending_ion_view_update = None
+
     def update_ion_view(feature_idx: int):
+        cancel_pending_ion_view_update()
         state = get_active_state()
         coreg_dataset = state["dataset"]
         state["current_feature_idx"] = int(np.clip(feature_idx, 0, len(coreg_dataset.mz_values) - 1))
@@ -1548,6 +1558,7 @@ def launch_coregistration_gui(
             spectrum_canvas.draw_idle()
 
     def update_ion_view_for_mz(target_mz: float, ppm_tolerance: float):
+        cancel_pending_ion_view_update()
         state = get_active_state()
         coreg_dataset = state["dataset"]
         indices = coreg_dataset.find_feature_indices_from_mz(float(target_mz), float(ppm_tolerance))
@@ -1567,6 +1578,20 @@ def launch_coregistration_gui(
         if current_mz_line is not None:
             current_mz_line.set_xdata([float(target_mz), float(target_mz)])
             spectrum_canvas.draw_idle()
+
+    def schedule_ion_view_update(target_mz: float, ppm_tolerance: float):
+        nonlocal pending_ion_view_update
+        pending_ion_view_update = (float(target_mz), float(ppm_tolerance))
+        ion_view_update_timer.start()
+
+    def run_scheduled_ion_view_update():
+        nonlocal pending_ion_view_update
+        request = pending_ion_view_update
+        pending_ion_view_update = None
+        if request is not None:
+            update_ion_view_for_mz(*request)
+
+    ion_view_update_timer.timeout.connect(run_scheduled_ion_view_update)
 
     ion_viewer_widget_syncing = False
 
@@ -1806,6 +1831,8 @@ def launch_coregistration_gui(
     ):
         state = get_active_state()
         norm_mode = normalize_ion_display_mode(normalization_mode)
+        previous_norm_mode = normalize_ion_display_mode(state.get("current_normalization_mode", "tic"))
+        previous_ratio_mz = str(state.get("current_ratio_mz", "")).strip()
         state["current_normalization_mode"] = norm_mode
         state["current_normalize_to_tic"] = norm_mode == "tic"
         state["current_ratio_mz"] = str(ratio_mz).strip()
@@ -1834,7 +1861,14 @@ def launch_coregistration_gui(
             ion_display_options.absolute_high.value = f"{absolute_high:g}"
         state["current_contrast_low"] = absolute_low
         state["current_contrast_high"] = absolute_high
-        update_ion_view_for_mz(state["current_target_mz"], state["current_ppm_tolerance"])
+        ion_data_changed = norm_mode != previous_norm_mode or state["current_ratio_mz"] != previous_ratio_mz
+        if ion_data_changed:
+            schedule_ion_view_update(state["current_target_mz"], state["current_ppm_tolerance"])
+            return
+
+        display_img = np.asarray(state["ion_layer"].data)
+        apply_ion_contrast_to_active_layer(display_img)
+        sync_active_ion_viewer_record(state)
 
     @magicgui(
         target_mz={"widget_type": "LineEdit"},
@@ -1846,7 +1880,7 @@ def launch_coregistration_gui(
             parsed_target_mz = float(str(target_mz).strip())
         except Exception:
             return
-        update_ion_view_for_mz(parsed_target_mz, float(ppm_tolerance))
+        schedule_ion_view_update(parsed_target_mz, float(ppm_tolerance))
 
     threshold_preview_updates_enabled = False
     suppress_threshold_absolute_update = False
