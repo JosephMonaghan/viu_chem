@@ -1236,11 +1236,13 @@ class CoregistrationDataset:
     registered_cs: str = "registered"
     table_key: str | None = None
     tic_key: str | None = None
+    sdata: Any | None = None
 
     def __post_init__(self) -> None:
         self.zarr_path = Path(self.zarr_path).expanduser()
-        self.sdata = sd.read_zarr(self.zarr_path)
-        _attach_stored_image_attrs(self.sdata, self.zarr_path)
+        if self.sdata is None:
+            self.sdata = sd.read_zarr(self.zarr_path)
+            _attach_stored_image_attrs(self.sdata, self.zarr_path)
 
         specs = _infer_msi_dataset_specs(self.sdata)
         if not specs:
@@ -1263,7 +1265,7 @@ class CoregistrationDataset:
         self.display_name = selected.get("display_name", self.dataset_label)
         self.pixel_shape_keys = list(selected["pixel_shape_keys"])
         self.msi_table = self.sdata.tables[self.table_key]
-        self.mz_values = self.msi_table.var["mz"].values.astype(float)
+        self.mz_values = self.msi_table.var["mz"].values.astype(float, copy=False)
         self._mz_values_are_sorted = bool(
             self.mz_values.size < 2 or np.all(self.mz_values[:-1] <= self.mz_values[1:])
         )
@@ -1287,6 +1289,7 @@ class CoregistrationDataset:
         self.avg_spectrum = avg_spectrum
 
         self.local_maxima_indices = self._find_local_maxima()
+        self.avg_spectrum_plot_indices = self.spectrum_plot_indices(self.avg_spectrum)
 
     def _find_local_maxima(self) -> np.ndarray:
         mask = np.zeros_like(self.avg_spectrum, dtype=bool)
@@ -1297,6 +1300,30 @@ class CoregistrationDataset:
             )
         idx = np.flatnonzero(mask)
         return idx if idx.size else np.arange(self.avg_spectrum.size)
+
+    @staticmethod
+    def spectrum_plot_indices(intensity: np.ndarray, max_peaks: int = 6000) -> np.ndarray:
+        """Choose a bounded set of representative peaks for interactive plotting."""
+        values = np.asarray(intensity, dtype=float).ravel()
+        max_peaks = max(1, int(max_peaks))
+        finite_positive = np.isfinite(values) & (values > 0)
+        local_maxima = np.zeros(values.shape, dtype=bool)
+        if values.size >= 3:
+            local_maxima[1:-1] = (
+                finite_positive[1:-1]
+                & (values[1:-1] >= values[:-2])
+                & (values[1:-1] > values[2:])
+            )
+        if values.size:
+            local_maxima[0] = finite_positive[0]
+            local_maxima[-1] = finite_positive[-1]
+        candidates = np.flatnonzero(local_maxima)
+        if candidates.size == 0:
+            candidates = np.flatnonzero(finite_positive)
+        if candidates.size <= max_peaks:
+            return candidates.astype(int, copy=False)
+        strongest = np.argpartition(values[candidates], -max_peaks)[-max_peaks:]
+        return np.sort(candidates[strongest]).astype(int, copy=False)
 
     def reconstruct_ion_image(self, feature_idx: int | Iterable[int] | np.ndarray, *, normalize_to_tic: bool = True) -> np.ndarray:
         feature_indices = np.atleast_1d(np.asarray(feature_idx, dtype=int))
@@ -1418,6 +1445,50 @@ class CoregistrationDataset:
             "std_intensity": dense.std(axis=0, ddof=0),
             "n_spectra": n_spectra,
         }
+
+    def spectrum_mask_at_image_position(self, position_yx: Iterable[float]) -> np.ndarray:
+        """Select the acquired MSI pixel containing an image-space ``(y, x)`` point."""
+        position = np.asarray(tuple(position_yx), dtype=float).ravel()
+        if position.size != 2 or not np.all(np.isfinite(position)):
+            return np.zeros(self.x_coords.shape[0], dtype=bool)
+        y, x = float(position[0]), float(position[1])
+        candidates = (np.abs(self.x_coords - x) <= 0.5) & (np.abs(self.y_coords - y) <= 0.5)
+        candidate_indices = np.flatnonzero(candidates)
+        selected = np.zeros(self.x_coords.shape[0], dtype=bool)
+        if candidate_indices.size:
+            distances = (
+                (self.x_coords[candidate_indices].astype(float) - x) ** 2
+                + (self.y_coords[candidate_indices].astype(float) - y) ** 2
+            )
+            selected[int(candidate_indices[int(np.argmin(distances))])] = True
+        return selected
+
+    def spectrum_mask_in_image_regions(self, regions_yx: Iterable[np.ndarray]) -> np.ndarray:
+        """Select spectra whose pixel centers fall in one or more image-space polygons."""
+        selected = np.zeros(self.x_coords.shape[0], dtype=bool)
+        points_xy = np.column_stack([self.x_coords.astype(float), self.y_coords.astype(float)])
+        for region_yx in regions_yx:
+            vertices_yx = np.asarray(region_yx, dtype=float)
+            if vertices_yx.ndim != 2 or vertices_yx.shape[0] < 3 or vertices_yx.shape[1] != 2:
+                continue
+            if not np.all(np.isfinite(vertices_yx)):
+                continue
+            # ``contains_points`` implicitly closes the polygon. Passing
+            # ``closed=True`` would treat the final rectangle corner as a
+            # CLOSEPOLY placeholder and omit it from the boundary.
+            selected |= MplPath(vertices_yx[:, [1, 0]]).contains_points(points_xy, radius=1e-9)
+        return selected
+
+    def mean_spectrum_for_selection(self, selected_mask: np.ndarray) -> tuple[np.ndarray, int]:
+        """Return a raw mean spectrum without densifying a sparse region matrix."""
+        selected = np.asarray(selected_mask, dtype=bool).ravel()
+        if selected.shape[0] != self.x_coords.shape[0]:
+            raise ValueError("Selected mask must match the number of MSI spectra.")
+        selected_idx = np.flatnonzero(selected)
+        if selected_idx.size == 0:
+            raise ValueError("No MSI spectra were selected.")
+        mean_intensity = np.asarray(self.X[selected_idx, :].mean(axis=0), dtype=float).ravel()
+        return mean_intensity, int(selected_idx.size)
 
     def load_saved_registration_if_available(self) -> tuple[np.ndarray, bool]:
         try:

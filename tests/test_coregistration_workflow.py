@@ -250,6 +250,28 @@ def test_dataset_reconstructs_raw_and_tic_normalized_ion_images(coregistration_s
     np.testing.assert_array_equal(dataset.find_feature_indices_from_mz(100.0004, 5.0), np.array([0]))
 
 
+def test_dataset_can_reuse_loaded_spatialdata_without_reading_store_again(coregistration_store: Path, monkeypatch):
+    shared_sdata = sd.read_zarr(coregistration_store)
+
+    def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("shared SpatialData should avoid another read_zarr call")
+
+    monkeypatch.setattr("viu_chem.msi_coregistration.sd.read_zarr", unexpected_read)
+    dataset = CoregistrationDataset(coregistration_store, sdata=shared_sdata)
+
+    assert dataset.sdata is shared_sdata
+    assert dataset.table_key == "msi"
+
+
+def test_spectrum_plot_indices_are_bounded_and_keep_strongest_local_peaks():
+    intensity = np.zeros(30, dtype=float)
+    intensity[[2, 5, 8, 11, 14, 17, 20, 23]] = [1, 8, 2, 7, 3, 6, 4, 5]
+
+    indices = CoregistrationDataset.spectrum_plot_indices(intensity, max_peaks=4)
+
+    np.testing.assert_array_equal(indices, np.array([5, 11, 17, 23]))
+
+
 def test_sorted_mass_axis_lookups_use_ppm_window_boundaries(coregistration_store: Path):
     dataset = CoregistrationDataset(coregistration_store)
     dataset.mz_values = np.array([99.9990, 100.0, 100.0004, 100.0010])
@@ -305,6 +327,32 @@ def test_region_spectra_can_normalize_each_pixel_to_a_reference_mz(coregistratio
             normalize_to=300.0,
             normalize_to_ppm_tolerance=5.0,
         )
+
+
+def test_interactive_spectrum_masks_select_pixels_and_regions(coregistration_store: Path):
+    dataset = CoregistrationDataset(coregistration_store)
+
+    np.testing.assert_array_equal(
+        dataset.spectrum_mask_at_image_position((0.1, 0.2)),
+        np.array([True, False, False, False]),
+    )
+    assert not dataset.spectrum_mask_at_image_position((2.0, 2.0)).any()
+
+    region = np.array(
+        [
+            [-0.25, -0.25],
+            [-0.25, 1.25],
+            [0.25, 1.25],
+            [0.25, -0.25],
+        ]
+    )
+    np.testing.assert_array_equal(
+        dataset.spectrum_mask_in_image_regions([region]),
+        np.array([True, True, False, False]),
+    )
+    mean_spectrum, count = dataset.mean_spectrum_for_selection(np.array([True, True, False, False]))
+    np.testing.assert_allclose(mean_spectrum, np.array([2.0, 3.0]))
+    assert count == 2
 
 
 def test_save_registration_persists_one_affine_for_tic_and_pixel_shapes(coregistration_store: Path):

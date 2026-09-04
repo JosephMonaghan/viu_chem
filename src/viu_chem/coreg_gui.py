@@ -265,6 +265,7 @@ def launch_coregistration_gui(
         return overlay_colormap_cache[cmap_name]
 
     roi_overlay_colormap = make_binary_overlay_colormap()
+    spectrum_selection_colormap = make_binary_overlay_colormap(rgb=(0.0, 1.0, 1.0), alpha=0.55)
     threshold_preview_colormap = make_threshold_preview_colormap()
 
     def choose_dataset_label(base_value: str | Path, existing: set[str]) -> str:
@@ -431,6 +432,12 @@ def launch_coregistration_gui(
             "ion_viewers": [],
             "roi_mask_layer": None,
             "selected_annotation_mask_layer": None,
+            "spectrum_selection_layer": None,
+            "spectrum_lasso_layer": None,
+            "spectrum_selection_intensity": coreg_dataset.avg_spectrum,
+            "spectrum_selection_plot_indices": coreg_dataset.avg_spectrum_plot_indices.copy(),
+            "spectrum_selection_description": "All pixels",
+            "spectrum_selection_count": len(coreg_dataset.x_coords),
             "threshold_preview_layer": None,
             "threshold_preview_img": None,
             "threshold_preview_feature_indices": None,
@@ -489,7 +496,7 @@ def launch_coregistration_gui(
                 layer.translate = (0.0, 0.0)
             except Exception:
                 pass
-        for layer_key in ("roi_mask_layer", "selected_annotation_mask_layer"):
+        for layer_key in ("roi_mask_layer", "selected_annotation_mask_layer", "spectrum_selection_layer"):
             overlay_layer = state.get(layer_key)
             if overlay_layer is not None:
                 overlay_layer.affine = aff_yx
@@ -954,12 +961,16 @@ def launch_coregistration_gui(
             apply_transform_to_state(state)
 
     for spec in _infer_msi_dataset_specs(dataset.sdata):
-        embedded_dataset = CoregistrationDataset(
-            host_zarr_path,
-            registered_cs=registered_cs,
-            table_key=spec["table_key"],
-            tic_key=spec["tic_key"],
-        )
+        if spec["table_key"] == dataset.table_key and spec["tic_key"] == dataset.tic_key:
+            embedded_dataset = dataset
+        else:
+            embedded_dataset = CoregistrationDataset(
+                host_zarr_path,
+                registered_cs=registered_cs,
+                table_key=spec["table_key"],
+                tic_key=spec["tic_key"],
+                sdata=dataset.sdata,
+            )
         add_dataset_to_view(embedded_dataset, str(embedded_dataset.display_name))
 
     annotation_shape_layers = {}
@@ -1668,8 +1679,20 @@ def launch_coregistration_gui(
     pick_mz_action = QAction("Pick m/z", spectrum_toolbar)
     pick_mz_action.setCheckable(True)
     pick_mz_action.setChecked(True)
+    pick_pixel_spectrum_action = QAction("Pick pixel", spectrum_toolbar)
+    pick_pixel_spectrum_action.setCheckable(True)
+    pick_pixel_spectrum_action.setToolTip("Click an MSI pixel in the main viewer to show its spectrum")
+    pick_region_spectrum_action = QAction("Lasso region", spectrum_toolbar)
+    pick_region_spectrum_action.setCheckable(True)
+    pick_region_spectrum_action.setToolTip("Draw one or more freehand regions in the main viewer to average their MSI pixels")
+    reset_spectrum_action = QAction("All pixels", spectrum_toolbar)
+    reset_spectrum_action.setToolTip("Restore the average spectrum for the entire MSI dataset")
     spectrum_toolbar.addSeparator()
     spectrum_toolbar.addAction(pick_mz_action)
+    spectrum_toolbar.addSeparator()
+    spectrum_toolbar.addAction(pick_pixel_spectrum_action)
+    spectrum_toolbar.addAction(pick_region_spectrum_action)
+    spectrum_toolbar.addAction(reset_spectrum_action)
     for action in list(spectrum_toolbar.actions()):
         text = str(action.text()).lower()
         if any(token in text for token in ("back", "forward", "subplots", "customize")):
@@ -1747,16 +1770,182 @@ def launch_coregistration_gui(
         action.triggered.connect(schedule_toolbar_recolor)
     spectrum_canvas.mpl_connect("button_release_event", lambda event: clamp_spectrum_ylim())
 
+    def ensure_spectrum_selection_layer(state: dict[str, Any]):
+        layer = state.get("spectrum_selection_layer")
+        if layer is not None:
+            return layer
+        coreg_dataset = state["dataset"]
+        layer = viewer.add_image(
+            np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8),
+            name=f"{state['label']} spectrum selection",
+            colormap=spectrum_selection_colormap,
+            contrast_limits=(0, 1),
+            interpolation2d="nearest",
+            opacity=1.0,
+            blending="translucent",
+            visible=False,
+        )
+        state["spectrum_selection_layer"] = layer
+        apply_transform_to_state(state)
+        return layer
+
+    def ensure_spectrum_lasso_layer(state: dict[str, Any]):
+        layer = state.get("spectrum_lasso_layer")
+        if layer is not None:
+            return layer
+        layer = viewer.add_shapes(
+            name=f"{state['label']} spectrum lasso",
+            ndim=2,
+            edge_color="#00ffff",
+            face_color=[0.0, 0.0, 0.0, 0.0],
+            edge_width=1.5,
+            opacity=1.0,
+            blending="translucent",
+            visible=True,
+        )
+        state["spectrum_lasso_layer"] = layer
+
+        def update_from_regions(_event=None):
+            if not pick_region_spectrum_action.isChecked() or state is not get_active_state():
+                return
+            selection_layer = ensure_spectrum_selection_layer(state)
+            regions = []
+            for vertices_world in list(layer.data):
+                vertices_local = np.asarray(
+                    [selection_layer.world_to_data(vertex) for vertex in np.asarray(vertices_world, dtype=float)],
+                    dtype=float,
+                )
+                regions.append(vertices_local[:, -2:])
+            selected = state["dataset"].spectrum_mask_in_image_regions(regions)
+            if np.any(selected):
+                show_selected_spectrum(state, selected, "Selected region")
+
+        layer.events.data.connect(update_from_regions)
+        return layer
+
+    def show_selected_spectrum(state: dict[str, Any], selected: np.ndarray, description: str):
+        selected = np.asarray(selected, dtype=bool)
+        if not np.any(selected):
+            return
+        mean_intensity, count = state["dataset"].mean_spectrum_for_selection(selected)
+        state["spectrum_selection_intensity"] = mean_intensity
+        state["spectrum_selection_plot_indices"] = state["dataset"].spectrum_plot_indices(mean_intensity)
+        state["spectrum_selection_description"] = str(description)
+        state["spectrum_selection_count"] = count
+        coreg_dataset = state["dataset"]
+        mask = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+        mask[coreg_dataset.y_coords[selected], coreg_dataset.x_coords[selected]] = 1
+        selection_layer = ensure_spectrum_selection_layer(state)
+        selection_layer.data = mask
+        selection_layer.visible = True
+        if state is get_active_state():
+            redraw_spectrum_for_active_dataset()
+
+    def reset_selected_spectrum(_checked=False):
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        state["spectrum_selection_intensity"] = coreg_dataset.avg_spectrum
+        state["spectrum_selection_plot_indices"] = coreg_dataset.avg_spectrum_plot_indices.copy()
+        state["spectrum_selection_description"] = "All pixels"
+        state["spectrum_selection_count"] = len(coreg_dataset.x_coords)
+        layer = state.get("spectrum_selection_layer")
+        if layer is not None:
+            layer.data = np.zeros((coreg_dataset.ny, coreg_dataset.nx), dtype=np.uint8)
+            layer.visible = False
+        lasso_layer = state.get("spectrum_lasso_layer")
+        if lasso_layer is not None:
+            lasso_layer.data = []
+            lasso_layer.visible = False
+        pick_pixel_spectrum_action.setChecked(False)
+        pick_region_spectrum_action.setChecked(False)
+        redraw_spectrum_for_active_dataset()
+
+    def on_pick_pixel_spectrum_toggled(checked: bool):
+        if not checked:
+            return
+        pick_region_spectrum_action.setChecked(False)
+        state = get_active_state()
+        lasso_layer = state.get("spectrum_lasso_layer")
+        if lasso_layer is not None:
+            lasso_layer.visible = False
+
+    def on_pick_region_spectrum_toggled(checked: bool):
+        state = get_active_state()
+        layer = state.get("spectrum_lasso_layer")
+        if not checked:
+            if layer is not None:
+                layer.visible = False
+                try:
+                    layer.mode = "pan_zoom"
+                except Exception:
+                    pass
+            return
+        pick_pixel_spectrum_action.setChecked(False)
+        selection_layer = ensure_spectrum_selection_layer(state)
+        selection_layer.data = np.zeros(
+            (state["dataset"].ny, state["dataset"].nx), dtype=np.uint8
+        )
+        selection_layer.visible = False
+        layer = ensure_spectrum_lasso_layer(state)
+        layer.data = []
+        layer.visible = True
+        try:
+            viewer.layers.selection.active = layer
+            layer.mode = "add_polygon_lasso"
+        except Exception:
+            pass
+
+    def pick_pixel_spectrum(_viewer, event):
+        if not pick_pixel_spectrum_action.isChecked() or getattr(event, "button", None) != 1:
+            return
+        state = get_active_state()
+        layer = ensure_spectrum_selection_layer(state)
+        position_yx = np.asarray(layer.world_to_data(event.position), dtype=float).ravel()[-2:]
+        selected = state["dataset"].spectrum_mask_at_image_position(position_yx)
+        if not np.any(selected):
+            return
+        selected_idx = int(np.flatnonzero(selected)[0])
+        y = int(state["dataset"].y_coords[selected_idx])
+        x = int(state["dataset"].x_coords[selected_idx])
+        show_selected_spectrum(state, selected, f"Pixel (x={int(x)}, y={int(y)})")
+
+    pick_pixel_spectrum_action.toggled.connect(on_pick_pixel_spectrum_toggled)
+    pick_region_spectrum_action.toggled.connect(on_pick_region_spectrum_toggled)
+    reset_spectrum_action.triggered.connect(reset_selected_spectrum)
+    viewer.mouse_drag_callbacks.append(pick_pixel_spectrum)
+
     def redraw_spectrum_for_active_dataset():
         nonlocal current_mz_line
         state = get_active_state()
         coreg_dataset = state["dataset"]
+        intensity = np.asarray(state.get("spectrum_selection_intensity", coreg_dataset.avg_spectrum), dtype=float)
+        plot_indices = np.asarray(
+            state.get("spectrum_selection_plot_indices", coreg_dataset.avg_spectrum_plot_indices),
+            dtype=int,
+        )
+        description = str(state.get("spectrum_selection_description", "All pixels"))
+        count = int(state.get("spectrum_selection_count", len(coreg_dataset.x_coords)))
         spectrum_ax.clear()
         apply_spectrum_theme()
-        spectrum_ax.vlines(coreg_dataset.mz_values, 0, coreg_dataset.avg_spectrum, color="#ffffff", linewidth=0.7, alpha=0.9)
+        spectrum_ax.vlines(
+            coreg_dataset.mz_values[plot_indices],
+            0,
+            intensity[plot_indices],
+            color="#ffffff",
+            linewidth=0.7,
+            alpha=0.9,
+        )
         spectrum_ax.set_xlabel("m/z")
         spectrum_ax.set_ylabel("Average intensity")
-        spectrum_ax.set_title(f"Average spectrum: {state['label']}")
+        if coreg_dataset.mz_values.size >= 2:
+            spectrum_ax.set_xlim(
+                float(np.min(coreg_dataset.mz_values)),
+                float(np.max(coreg_dataset.mz_values)),
+            )
+        spectrum_ax.set_title(
+            f"Average spectrum: {state['label']} — {description} "
+            f"({count} pixel{'s' if count != 1 else ''})"
+        )
         current_mz_line = spectrum_ax.axvline(
             coreg_dataset.mz_values[state["current_feature_idx"]],
             color="#d7191c",
@@ -3798,6 +3987,12 @@ def launch_coregistration_gui(
         selected_annotation_mask_layer = state.get("selected_annotation_mask_layer")
         if selected_annotation_mask_layer is not None:
             selected_annotation_mask_layer.name = f"{new_name} selected annotation mask"
+        spectrum_selection_layer = state.get("spectrum_selection_layer")
+        if spectrum_selection_layer is not None:
+            spectrum_selection_layer.name = f"{new_name} spectrum selection"
+        spectrum_lasso_layer = state.get("spectrum_lasso_layer")
+        if spectrum_lasso_layer is not None:
+            spectrum_lasso_layer.name = f"{new_name} spectrum lasso"
         state["msi_landmarks"].name = f"{new_name} MSI landmarks"
         for idx, viewer_record in enumerate(state.get("ion_viewers", [])):
             viewer_record["name"] = viewer_record.get("name") or f"Viewer {idx + 1}"
@@ -3835,12 +4030,33 @@ def launch_coregistration_gui(
     msi_layer_controls_layout.setVerticalSpacing(2)
     msi_layer_active_group = QButtonGroup(msi_layer_controls)
     msi_layer_active_group.setExclusive(True)
+    msi_layer_controls_signature = None
+    msi_layer_control_rows: dict[str, tuple[QRadioButton, QCheckBox, QComboBox]] = {}
 
     def rebuild_msi_layer_controls():
-        nonlocal msi_layer_active_group
+        nonlocal msi_layer_active_group, msi_layer_controls_signature, msi_layer_control_rows
+        signature = tuple((str(state["id"]), str(state["label"])) for state in datasets.values())
+        if signature == msi_layer_controls_signature:
+            for dataset_key, (active_button, checkbox, cmap_combo) in msi_layer_control_rows.items():
+                if dataset_key not in datasets:
+                    continue
+                state = datasets[dataset_key]
+                for widget, value in (
+                    (active_button, dataset_key == str(active_dataset_label)),
+                    (checkbox, bool(state["ion_layer"].visible)),
+                ):
+                    widget.blockSignals(True)
+                    widget.setChecked(value)
+                    widget.blockSignals(False)
+                cmap_combo.blockSignals(True)
+                cmap_combo.setCurrentText(str(state["current_colormap_name"]))
+                cmap_combo.blockSignals(False)
+            return
+
         clear_layout(msi_layer_controls_layout)
         msi_layer_active_group = QButtonGroup(msi_layer_controls)
         msi_layer_active_group.setExclusive(True)
+        msi_layer_control_rows = {}
         msi_layer_controls_layout.addWidget(QLabel("Dataset"), 0, 0)
         msi_layer_controls_layout.addWidget(QLabel("Active"), 0, 1)
         msi_layer_controls_layout.addWidget(QLabel("Show"), 0, 2)
@@ -3887,6 +4103,8 @@ def launch_coregistration_gui(
             msi_layer_controls_layout.addWidget(active_button, row_idx, 1)
             msi_layer_controls_layout.addWidget(checkbox, row_idx, 2)
             msi_layer_controls_layout.addWidget(cmap_combo, row_idx, 3)
+            msi_layer_control_rows[dataset_key] = (active_button, checkbox, cmap_combo)
+        msi_layer_controls_signature = signature
 
     if_layer_controls = QWidget()
     if_layer_controls_layout = QVBoxLayout(if_layer_controls)
@@ -4330,6 +4548,8 @@ def launch_coregistration_gui(
             "msi_landmarks",
             "roi_mask_layer",
             "selected_annotation_mask_layer",
+            "spectrum_selection_layer",
+            "spectrum_lasso_layer",
             "threshold_preview_layer",
             "optimization_preview_layer",
         ):
@@ -4427,7 +4647,6 @@ def launch_coregistration_gui(
         refresh_if_threshold_choices(state)
         refresh_annotation_widget_choices()
         rebuild_msi_layer_controls()
-        _refresh_if_toolbox_widgets()
         preview_affine_mi_inputs_widget.reference_channel.choices = _reference_channel_choice_names()
         if preview_affine_mi_inputs_widget.reference_channel.value not in preview_affine_mi_inputs_widget.reference_channel.choices:
             preview_affine_mi_inputs_widget.reference_channel.value = preview_affine_mi_inputs_widget.reference_channel.choices[0]
@@ -4440,6 +4659,18 @@ def launch_coregistration_gui(
             pass
         for key, other_state in datasets.items():
             other_state["msi_landmarks"].visible = (key == str(state["id"]))
+            spectrum_selection_layer = other_state.get("spectrum_selection_layer")
+            if spectrum_selection_layer is not None:
+                spectrum_selection_layer.visible = (
+                    key == str(state["id"])
+                    and str(other_state.get("spectrum_selection_description", "All pixels")) != "All pixels"
+                )
+            spectrum_lasso_layer = other_state.get("spectrum_lasso_layer")
+            if spectrum_lasso_layer is not None:
+                spectrum_lasso_layer.visible = (
+                    key == str(state["id"])
+                    and pick_region_spectrum_action.isChecked()
+                )
             if key != str(state["id"]):
                 roi_mask_layer = other_state.get("roi_mask_layer")
                 if roi_mask_layer is not None:
@@ -4453,6 +4684,14 @@ def launch_coregistration_gui(
                 optimization_preview_layer = other_state.get("optimization_preview_layer")
                 if optimization_preview_layer is not None:
                     optimization_preview_layer.visible = False
+        if pick_region_spectrum_action.isChecked():
+            spectrum_lasso_layer = ensure_spectrum_lasso_layer(state)
+            spectrum_lasso_layer.visible = True
+            try:
+                viewer.layers.selection.active = spectrum_lasso_layer
+                spectrum_lasso_layer.mode = "add_polygon_lasso"
+            except Exception:
+                pass
         redraw_spectrum_for_active_dataset()
         try:
             roi_mask_controls()
@@ -5118,6 +5357,7 @@ def launch_coregistration_gui(
     enforce_reference_layers_at_bottom()
     add_annotation_shape_layers(initial_state)
     sync_controls_to_active_dataset()
+    _refresh_if_toolbox_widgets()
     try:
         viewer.reset_view()
         startup_camera_state = {
