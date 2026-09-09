@@ -20,6 +20,7 @@ import dask.array as da
 import geopandas as gpd
 import pandas as pd
 import tifffile
+from anndata import AnnData
 from matplotlib.path import Path as MplPath
 from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
@@ -983,18 +984,11 @@ def list_coregistration_msi_datasets(zarr_path: str | Path) -> list[dict[str, An
     return [dict(spec) for spec in _infer_msi_dataset_specs(sdata)]
 
 
-def _resolve_msi_dataset_keys(
-    zarr_path: str | Path,
-    *,
-    msi_dataset: str | None = None,
-    table_key: str | None = None,
-    tic_key: str | None = None,
-) -> tuple[str | None, str | None]:
-    if not msi_dataset:
-        return table_key, tic_key
-
-    sdata = sd.read_zarr(Path(zarr_path).expanduser())
-    specs = _infer_msi_dataset_specs(sdata)
+def _select_msi_dataset_spec(
+    specs: Iterable[Mapping[str, Any]],
+    msi_dataset: str,
+) -> Mapping[str, Any]:
+    specs = list(specs)
     query = str(msi_dataset).strip()
     query_folded = query.casefold()
     query_sanitized = sanitize_name(query)
@@ -1007,7 +1001,7 @@ def _resolve_msi_dataset_keys(
             str(spec.get("tic_key", "")),
         ]
 
-    def matches_at_rank(rank: int) -> list[dict[str, Any]]:
+    def matches_at_rank(rank: int) -> list[Mapping[str, Any]]:
         matches = []
         for spec in specs:
             raw_values = selector_values(spec)
@@ -1025,7 +1019,7 @@ def _resolve_msi_dataset_keys(
                 matches.append(spec)
         return matches
 
-    matches: list[dict[str, Any]] = []
+    matches: list[Mapping[str, Any]] = []
     for rank in range(5):
         matches = matches_at_rank(rank)
         if matches:
@@ -1037,7 +1031,33 @@ def _resolve_msi_dataset_keys(
     if len(matches) > 1:
         labels = ", ".join(str(spec.get("display_name") or spec.get("table_key")) for spec in matches)
         raise ValueError(f"MSI dataset selector {msi_dataset!r} matched multiple datasets: {labels}")
-    selected = matches[0]
+    return matches[0]
+
+
+def get_msi_table(zarr_path: str | Path, msi_dataset: str) -> AnnData:
+    """Return an MSI AnnData table selected by display name, label, table key, or TIC key.
+
+    Matching is exact first, then case-insensitive, sanitized, and finally
+    substring-based. Ambiguous and missing selectors raise ``ValueError``.
+    The SpatialData store is read only once during this call.
+    """
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    selected = _select_msi_dataset_spec(_infer_msi_dataset_specs(sdata), msi_dataset)
+    return sdata.tables[str(selected["table_key"])]
+
+
+def _resolve_msi_dataset_keys(
+    zarr_path: str | Path,
+    *,
+    msi_dataset: str | None = None,
+    table_key: str | None = None,
+    tic_key: str | None = None,
+) -> tuple[str | None, str | None]:
+    if not msi_dataset:
+        return table_key, tic_key
+
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    selected = _select_msi_dataset_spec(_infer_msi_dataset_specs(sdata), msi_dataset)
     return str(selected["table_key"]), str(selected["tic_key"])
 
 

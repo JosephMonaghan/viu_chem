@@ -73,10 +73,13 @@ internal label, table key, or TIC image key:
 
 .. code-block:: python
 
-   from viu_chem.msi_coregistration import list_coregistration_msi_datasets
+   from viu_chem.msi_coregistration import get_msi_table, list_coregistration_msi_datasets
 
    for spec in list_coregistration_msi_datasets("sample.zarr"):
        print(spec["display_name"], spec["table_key"], spec["tic_key"])
+
+   positive = get_msi_table("sample.zarr", "nano-DESI (Positive)")
+   print(positive.X.shape, positive.obs.columns, positive.var["mz"].values)
 
 Launch the GUI
 --------------

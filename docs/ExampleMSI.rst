@@ -127,3 +127,38 @@ Notes
 ``tol`` and ``tolerance`` are interpreted as ppm values in these workflows.
 For publication figures, inspect the output scaling and consider exporting
 with ``uniform_scale=True`` when comparing the same ion across samples.
+
+K-means Clustering from SpatialData Zarr
+----------------------------------------
+
+MSI tables stored in a coregistration Zarr can be clustered by display name,
+dataset label, table key, or TIC key. The result uses the same dataframe format
+and plotting function as imzML clustering:
+
+.. code-block:: python
+
+   from viu_chem import msi_stats
+
+   clusters = msi_stats.kmeans_cluster_zarr(
+       "data/campaign.zarr",
+       msi_dataset="nano-DESI (Positive)",
+       n_clusters="auto",
+       tic_normalize=True,
+   )
+   figure, axes = msi_stats.plot_cluster_classification(clusters)
+
+   mz, cluster_spectra = msi_stats.mean_spectra_by_cluster_zarr(
+       clusters,
+       "data/campaign.zarr",
+       msi_dataset="nano-DESI (Positive)",
+   )
+   spectra_figure, spectra_axes = msi_stats.plot_mean_spectra_by_cluster(
+       mz,
+       cluster_spectra,
+   )
+
+Sparse ``AnnData.X`` matrices remain sparse during TIC normalization and model
+fitting. Multiple Zarr stores may be clustered together by passing a list of
+paths, but their selected tables must have identical m/z axes. Self-aligned
+datasets with different axes should be clustered separately or aligned to a
+common axis first.

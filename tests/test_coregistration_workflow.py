@@ -31,6 +31,7 @@ from viu_chem.msi_coregistration import (
     convert_input_to_zarr,
     delete_msi_dataset,
     embed_msi_dataset,
+    get_msi_table,
     import_geojson_annotations,
     list_coregistration_msi_datasets,
     rename_msi_dataset,
@@ -659,6 +660,33 @@ def test_embedding_another_msi_dataset_preserves_current_selection_contract(tmp_
         "shapes": result["pixel_shape_keys"],
     }
     assert {spec["table_key"] for spec in list_coregistration_msi_datasets(host)} == {"msi"}
+
+
+def test_get_msi_table_resolves_display_name_with_one_store_read(tmp_path: Path, monkeypatch):
+    host = _write_coregistration_store(tmp_path / "host.zarr")
+    source = _write_coregistration_store(
+        tmp_path / "source.zarr",
+        table_key="source",
+        tic_key="source_tic",
+        pixel_key="source_pixels",
+        include_reference=False,
+        include_roi=False,
+    )
+    embed_msi_dataset(host, source, dataset_label="nano-DESI (Positive)")
+    real_read_zarr = sd.read_zarr
+    read_count = 0
+
+    def counted_read_zarr(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        return real_read_zarr(*args, **kwargs)
+
+    monkeypatch.setattr("viu_chem.msi_coregistration.sd.read_zarr", counted_read_zarr)
+    table = get_msi_table(host, "NANO-desi (positive)")
+
+    assert table.uns["coregistration_display_name"] == "nano-DESI (Positive)"
+    np.testing.assert_array_equal(table.var["mz"].values, np.array([100.0, 200.0]))
+    assert read_count == 1
 
 
 def test_embedding_preserves_standard_spatialdata_table_region_relationship(tmp_path: Path):

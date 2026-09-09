@@ -4,7 +4,9 @@ from pyimzml import ImzMLParser
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances_argmin
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import re
@@ -21,6 +23,136 @@ def _normalize_imzml_paths(imzml_paths: str | Path | Sequence[str | Path]) -> li
     if not isinstance(imzml_paths, Sequence) or len(imzml_paths) == 0:
         raise ValueError("imzml_paths must be a path or a non-empty sequence of paths.")
     return [Path(path) for path in imzml_paths]
+
+
+def _normalize_zarr_paths(zarr_paths: str | Path | Sequence[str | Path]) -> list[Path]:
+    """Normalize one or more SpatialData Zarr paths into a non-empty list."""
+    if isinstance(zarr_paths, (str, Path)):
+        return [Path(zarr_paths)]
+    if not isinstance(zarr_paths, Sequence) or len(zarr_paths) == 0:
+        raise ValueError("zarr_paths must be a path or a non-empty sequence of paths.")
+    return [Path(path) for path in zarr_paths]
+
+
+def _validate_kmeans_options(
+    n_clusters: int | str,
+    min_cluster_fraction: float,
+    min_cluster_size: int,
+) -> None:
+    if isinstance(n_clusters, str) and n_clusters != "auto":
+        raise ValueError("n_clusters must be an integer >= 1 or 'auto'.")
+    if not isinstance(n_clusters, (int, str)) or isinstance(n_clusters, bool):
+        raise ValueError("n_clusters must be an integer >= 1 or 'auto'.")
+    if isinstance(n_clusters, int) and n_clusters < 1:
+        raise ValueError("n_clusters must be at least 1.")
+    if min_cluster_fraction < 0:
+        raise ValueError("min_cluster_fraction must be >= 0.")
+    if min_cluster_size < 1:
+        raise ValueError("min_cluster_size must be >= 1.")
+
+
+def _cluster_spectral_matrix(
+    data,
+    row_info: list[tuple],
+    *,
+    n_clusters: int | str,
+    tic_normalize: bool,
+    random_state: int | None,
+    n_init: int | str,
+    max_iter: int,
+    auto_k_min: int,
+    auto_k_max: int,
+    min_cluster_fraction: float,
+    min_cluster_size: int,
+) -> pd.DataFrame:
+    """Run the clustering shared by the imzML and Zarr loaders."""
+    _validate_kmeans_options(n_clusters, min_cluster_fraction, min_cluster_size)
+    n_pixels = data.shape[0]
+    if n_pixels < 1:
+        raise ValueError("No spectra found to cluster.")
+    if len(row_info) != n_pixels:
+        raise ValueError("Spectrum metadata does not match the number of spectra.")
+
+    if sparse.issparse(data):
+        data = data.tocsr().astype(float, copy=False)
+    else:
+        data = np.asarray(data, dtype=float)
+    if data.ndim != 2:
+        raise ValueError("Spectral data must be a two-dimensional pixels x m/z matrix.")
+    values = data.data if sparse.issparse(data) else data
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Spectral data contains NaN or infinite intensity values.")
+
+    # K-means is invariant to a uniform positive scale factor. Bounding the
+    # largest value prevents squared distances in k-means++ from overflowing.
+    max_abs_intensity = float(np.max(np.abs(values))) if values.size else 0.0
+    kmeans_input_scale = max(1.0, max_abs_intensity)
+    if kmeans_input_scale > 1.0:
+        data = data / kmeans_input_scale
+    if tic_normalize:
+        data = _tic_normalize_matrix(data)
+
+    auto_mode = n_clusters == "auto"
+    if auto_mode:
+        auto_k = int(round(np.sqrt(n_pixels)))
+        initial_k = min(max(auto_k_min, auto_k), auto_k_max, n_pixels)
+    else:
+        initial_k = min(int(n_clusters), n_pixels)
+
+    model = KMeans(
+        n_clusters=initial_k,
+        random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+    )
+    labels0 = model.fit_predict(data)
+
+    # In auto mode, reassign tiny clusters to the nearest retained centroid.
+    # pairwise_distances_argmin supports both dense and sparse input matrices.
+    if auto_mode:
+        counts = np.bincount(labels0, minlength=initial_k)
+        min_size_threshold = max(
+            min_cluster_size,
+            int(np.ceil(min_cluster_fraction * n_pixels)),
+        )
+        keep = np.where(counts >= min_size_threshold)[0]
+        if keep.size == 0:
+            keep = np.array([int(np.argmax(counts))], dtype=int)
+
+        drop = np.setdiff1d(np.arange(initial_k), keep, assume_unique=True)
+        labels_adj = labels0.copy()
+        if drop.size > 0:
+            dropped_mask = np.isin(labels_adj, drop)
+            if np.any(dropped_mask):
+                nearest_keep_idx = pairwise_distances_argmin(
+                    data[dropped_mask],
+                    model.cluster_centers_[keep],
+                    metric="euclidean",
+                )
+                labels_adj[dropped_mask] = keep[nearest_keep_idx]
+        unique_labels = np.sort(np.unique(labels_adj))
+        remap = {old: new for new, old in enumerate(unique_labels, start=1)}
+        labels = np.array([remap[val] for val in labels_adj], dtype=int)
+        final_k = len(unique_labels)
+    else:
+        labels = labels0 + 1
+        final_k = initial_k
+
+    df = pd.DataFrame(
+        row_info,
+        columns=["sample", "x", "y", "z", "pixel_size_x", "pixel_size_y"],
+    )
+    df["cluster"] = labels
+    df.attrs["tic_normalized"] = bool(tic_normalize)
+    df.attrs["k_requested"] = n_clusters
+    df.attrs["k_initial"] = int(initial_k)
+    df.attrs["k_final"] = int(final_k)
+    df.attrs["kmeans_input_scale"] = kmeans_input_scale
+    if auto_mode:
+        df.attrs["min_cluster_fraction"] = float(min_cluster_fraction)
+        df.attrs["min_cluster_size"] = int(min_cluster_size)
+        df.attrs["min_size_threshold_used"] = int(min_size_threshold)
+    return df
 
 
 def _validate_file_continuous(imzml) -> None:
@@ -256,15 +388,6 @@ def kmeans_cluster_imzml(
     :param min_cluster_fraction: Minimum fraction of total pixels a cluster must contain
     :param min_cluster_size: Minimum absolute pixel count a cluster must contain
     :return: Dataframe containing sample, coordinates, pixel sizes, and cluster labels"""
-    if isinstance(n_clusters, str) and n_clusters != "auto":
-        raise ValueError("n_clusters must be an integer >= 1 or 'auto'.")
-    if isinstance(n_clusters, int) and n_clusters < 1:
-        raise ValueError("n_clusters must be at least 1.")
-    if min_cluster_fraction < 0:
-        raise ValueError("min_cluster_fraction must be >= 0.")
-    if min_cluster_size < 1:
-        raise ValueError("min_cluster_size must be >= 1.")
-
     paths = _normalize_imzml_paths(imzml_paths)
     spectra_blocks: list[np.ndarray] = []
     row_info: list[tuple[str, int, int, int, float, float]] = []
@@ -279,10 +402,6 @@ def kmeans_cluster_imzml(
         local_mz, local_intensity = imzml.getspectrum(0)
         local_mz = np.asarray(local_mz)
         local_intensity = np.asarray(local_intensity, dtype=float)
-        if tic_normalize:
-            total = local_intensity.sum()
-            if total > 0:
-                local_intensity = local_intensity / total
         local_spectra = [local_intensity]
         x0, y0, z0 = imzml.coordinates[0]
         row_info.append((path.stem, x0, y0, z0, pixel_size_x, pixel_size_y))
@@ -295,10 +414,6 @@ def kmeans_cluster_imzml(
             if not np.array_equal(mz, local_mz):
                 raise TypeError(f"imzML file must be continuous (aligned m/z): {path}")
             intensity = np.asarray(intensity, dtype=float)
-            if tic_normalize:
-                total = intensity.sum()
-                if total > 0:
-                    intensity = intensity / total
             local_spectra.append(intensity)
             x, y, z = coord
             row_info.append((path.stem, x, y, z, pixel_size_x, pixel_size_y))
@@ -312,71 +427,217 @@ def kmeans_cluster_imzml(
 
         spectra_blocks.append(np.vstack(local_spectra))
 
-    data = np.vstack(spectra_blocks)
-    n_pixels = data.shape[0]
-    if n_pixels < 1:
-        raise ValueError("No spectra found to cluster.")
-
-    auto_mode = n_clusters == "auto"
-    if auto_mode:
-        auto_k = int(round(np.sqrt(n_pixels)))
-        initial_k = min(max(auto_k_min, auto_k), auto_k_max, n_pixels)
-    else:
-        initial_k = min(int(n_clusters), n_pixels)
-
-    model = KMeans(
-        n_clusters=initial_k,
+    return _cluster_spectral_matrix(
+        np.vstack(spectra_blocks),
+        row_info,
+        n_clusters=n_clusters,
+        tic_normalize=tic_normalize,
         random_state=random_state,
         n_init=n_init,
         max_iter=max_iter,
+        auto_k_min=auto_k_min,
+        auto_k_max=auto_k_max,
+        min_cluster_fraction=min_cluster_fraction,
+        min_cluster_size=min_cluster_size,
     )
-    labels0 = model.fit_predict(data)
 
-    # In auto mode, drop tiny clusters by reassigning their pixels to the nearest
-    # remaining centroid, then relabel to contiguous 1..k.
-    if auto_mode:
-        counts = np.bincount(labels0, minlength=initial_k)
-        min_size_threshold = max(min_cluster_size, int(np.ceil(min_cluster_fraction * n_pixels)))
-        keep = np.where(counts >= min_size_threshold)[0]
-        if keep.size == 0:
-            keep = np.array([int(np.argmax(counts))], dtype=int)
 
-        drop = np.setdiff1d(np.arange(initial_k), keep, assume_unique=True)
-        labels_adj = labels0.copy()
-        if drop.size > 0:
-            dropped_mask = np.isin(labels_adj, drop)
-            if np.any(dropped_mask):
-                kept_centers = model.cluster_centers_[keep]
-                distances = np.sum(
-                    (data[dropped_mask, None, :] - kept_centers[None, :, :]) ** 2,
-                    axis=2,
-                )
-                nearest_keep_idx = np.argmin(distances, axis=1)
-                labels_adj[dropped_mask] = keep[nearest_keep_idx]
-        unique_labels = np.sort(np.unique(labels_adj))
-        remap = {old: new for new, old in enumerate(unique_labels, start=1)}
-        labels = np.array([remap[val] for val in labels_adj], dtype=int)
-        final_k = len(unique_labels)
+def _load_zarr_msi_table(zarr_path: Path, msi_dataset: str):
+    """Load one selected table without requiring coregistration dependencies at import time."""
+    try:
+        from viu_chem.msi_coregistration import get_msi_table
+    except ImportError as exc:
+        raise ImportError(
+            "Zarr clustering requires the viu-chem coregistration dependencies."
+        ) from exc
+    return get_msi_table(zarr_path, msi_dataset)
+
+
+def _table_mz_axis(table) -> np.ndarray:
+    if "mz" in table.var:
+        mz_axis = np.asarray(table.var["mz"], dtype=float)
     else:
-        labels = labels0 + 1
-        final_k = initial_k
+        try:
+            mz_axis = np.asarray(table.var_names, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "The selected MSI table must provide its mass axis in var['mz'] "
+                "or as numeric var_names."
+            ) from exc
+    if mz_axis.ndim != 1 or mz_axis.size != table.n_vars:
+        raise ValueError("The MSI table m/z axis does not match its spectral matrix.")
+    return mz_axis
 
-    df = pd.DataFrame(
-        row_info,
-        columns=["sample", "x", "y", "z", "pixel_size_x", "pixel_size_y"],
-    )
-    df["cluster"] = labels
-    df.attrs["tic_normalized"] = bool(tic_normalize)
-    df.attrs["k_requested"] = n_clusters
-    df.attrs["k_initial"] = int(initial_k)
-    df.attrs["k_final"] = int(final_k)
-    if auto_mode:
-        df.attrs["min_cluster_fraction"] = float(min_cluster_fraction)
-        df.attrs["min_cluster_size"] = int(min_cluster_size)
-        df.attrs["min_size_threshold_used"] = int(
-            max(min_cluster_size, int(np.ceil(min_cluster_fraction * n_pixels)))
+
+def _axis_scale_from_obs(obs: pd.DataFrame, axis: str) -> float | None:
+    explicit_key = f"pixel_size_{axis}"
+    if explicit_key in obs:
+        values = pd.to_numeric(obs[explicit_key], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size:
+            return float(np.median(values))
+
+    spatial_key = f"spatial_{axis}"
+    if axis not in obs or spatial_key not in obs:
+        return None
+    coords = pd.DataFrame(
+        {
+            "grid": pd.to_numeric(obs[axis], errors="coerce"),
+            "spatial": pd.to_numeric(obs[spatial_key], errors="coerce"),
+        }
+    ).dropna()
+    if coords.empty:
+        return None
+    coords = coords.groupby("grid", as_index=False)["spatial"].median().sort_values("grid")
+    grid_diff = np.diff(coords["grid"].to_numpy(dtype=float))
+    spatial_diff = np.diff(coords["spatial"].to_numpy(dtype=float))
+    valid = np.isfinite(grid_diff) & np.isfinite(spatial_diff) & (grid_diff != 0)
+    scales = np.abs(spatial_diff[valid] / grid_diff[valid])
+    scales = scales[np.isfinite(scales) & (scales > 0)]
+    return float(np.median(scales)) if scales.size else None
+
+
+def _table_pixel_sizes(table) -> tuple[float, float]:
+    uns = getattr(table, "uns", {}) or {}
+
+    def _size(axis: str) -> float:
+        for key in (f"pixel_size_{axis}_um", f"pixel_size_{axis}"):
+            value = _to_float_or_none(uns.get(key))
+            if value is not None and value > 0:
+                return value
+        return _axis_scale_from_obs(table.obs, axis) or 1.0
+
+    return _size("x"), _size("y")
+
+
+def _table_spectral_matrix(table):
+    matrix = table.X
+    if hasattr(matrix, "to_memory"):
+        matrix = matrix.to_memory()
+    elif hasattr(matrix, "compute"):
+        matrix = matrix.compute()
+    if sparse.issparse(matrix):
+        return matrix.tocsr().astype(float, copy=False)
+    return np.asarray(matrix, dtype=float)
+
+
+def _tic_normalize_matrix(data):
+    """TIC-normalize dense or sparse rows while protecting sums from overflow."""
+    values = data.data if sparse.issparse(data) else data
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Spectral data contains NaN or infinite intensity values.")
+    max_abs_intensity = float(np.max(np.abs(values))) if values.size else 0.0
+    if max_abs_intensity > 1.0:
+        data = data / max_abs_intensity
+    row_sums = np.asarray(data.sum(axis=1)).reshape(-1)
+    inverse_tic = np.zeros_like(row_sums, dtype=float)
+    positive = row_sums > 0
+    inverse_tic[positive] = 1.0 / row_sums[positive]
+    if sparse.issparse(data):
+        return data.multiply(inverse_tic[:, None]).tocsr()
+    return data * inverse_tic[:, None]
+
+
+def kmeans_cluster_zarr(
+    zarr_paths: str | Path | Sequence[str | Path],
+    msi_dataset: str,
+    n_clusters: int | str,
+    tic_normalize: bool = True,
+    random_state: int | None = 42,
+    n_init: int | str = "auto",
+    max_iter: int = 300,
+    auto_k_min: int = 2,
+    auto_k_max: int = 10,
+    min_cluster_fraction: float = 0.01,
+    min_cluster_size: int = 25,
+) -> pd.DataFrame:
+    """Run k-means on an MSI table selected from one or more SpatialData Zarr stores.
+
+    The selected table must use the standard ``pixels x m/z`` AnnData layout,
+    with coordinates in ``obs['x']`` and ``obs['y']`` and the mass axis in
+    ``var['mz']``. Sparse spectral matrices remain sparse during stacking,
+    TIC normalization, and k-means fitting.
+
+    :param zarr_paths: One SpatialData Zarr path or a sequence of paths
+    :param msi_dataset: Display name, label, table key, or TIC key of the MSI dataset
+    :param n_clusters: Number of clusters to compute, or ``"auto"``
+    :param tic_normalize: Whether to TIC-normalize spectra before clustering
+    :param random_state: Random state passed to sklearn KMeans
+    :param n_init: Number of initializations for KMeans
+    :param max_iter: Maximum number of k-means iterations
+    :param auto_k_min: Minimum initial k when n_clusters is ``"auto"``
+    :param auto_k_max: Maximum initial k when n_clusters is ``"auto"``
+    :param min_cluster_fraction: Minimum fraction of pixels retained as a cluster
+    :param min_cluster_size: Minimum absolute pixel count retained as a cluster
+    :return: Dataframe containing sample, coordinates, pixel sizes, and cluster labels
+    """
+    _validate_kmeans_options(n_clusters, min_cluster_fraction, min_cluster_size)
+    paths = _normalize_zarr_paths(zarr_paths)
+    spectra_blocks = []
+    row_info: list[tuple] = []
+    reference_mz: np.ndarray | None = None
+
+    for path in paths:
+        table = _load_zarr_msi_table(path, msi_dataset)
+        if "x" not in table.obs or "y" not in table.obs:
+            raise ValueError(
+                f"MSI table {msi_dataset!r} in {path} must contain obs['x'] and obs['y']."
+            )
+
+        local_mz = _table_mz_axis(table)
+        if reference_mz is None:
+            reference_mz = local_mz
+        elif not np.array_equal(local_mz, reference_mz):
+            raise ValueError(
+                "All selected Zarr MSI tables must share the same m/z axis for "
+                "joint clustering. Run self-aligned datasets separately or align "
+                "them to a common axis first."
+            )
+
+        matrix = _table_spectral_matrix(table)
+        if matrix.shape != (table.n_obs, table.n_vars):
+            raise ValueError(f"Unexpected spectral matrix shape in {path}: {matrix.shape}")
+        spectra_blocks.append(matrix)
+
+        pixel_size_x, pixel_size_y = _table_pixel_sizes(table)
+        display_name = str(
+            table.uns.get("coregistration_display_name")
+            or table.uns.get("coregistration_dataset_label")
+            or msi_dataset
         )
-    return df
+        sample_name = display_name if len(paths) == 1 else f"{path.stem}: {display_name}"
+        x_values = table.obs["x"].to_numpy()
+        y_values = table.obs["y"].to_numpy()
+        z_values = table.obs["z"].to_numpy() if "z" in table.obs else np.ones(table.n_obs, dtype=int)
+        row_info.extend(
+            (sample_name, x, y, z, pixel_size_x, pixel_size_y)
+            for x, y, z in zip(x_values, y_values, z_values, strict=True)
+        )
+
+    if any(sparse.issparse(block) for block in spectra_blocks):
+        data = sparse.vstack(
+            [block if sparse.issparse(block) else sparse.csr_matrix(block) for block in spectra_blocks],
+            format="csr",
+        )
+    else:
+        data = np.vstack(spectra_blocks)
+
+    result = _cluster_spectral_matrix(
+        data,
+        row_info,
+        n_clusters=n_clusters,
+        tic_normalize=tic_normalize,
+        random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+        auto_k_min=auto_k_min,
+        auto_k_max=auto_k_max,
+        min_cluster_fraction=min_cluster_fraction,
+        min_cluster_size=min_cluster_size,
+    )
+    result.attrs["source_format"] = "zarr"
+    result.attrs["msi_dataset"] = str(msi_dataset)
+    return result
 
 
 def plot_cluster_classification(
@@ -385,7 +646,7 @@ def plot_cluster_classification(
     ncols: int = 3,
     figsize: tuple[float, float] | None = None,
 ):
-    """Plots pixel-wise cluster assignments from kmeans_cluster_imzml using imshow.
+    """Plot pixel-wise assignments from either k-means clustering function.
     
     :param cluster_df: Dataframe with x, y, cluster, and optional sample columns
     :param cmap: Matplotlib colormap name used for clusters
@@ -610,6 +871,131 @@ def mean_spectra_by_cluster(
     return reference_mz, mean_df
 
 
+def mean_spectra_by_cluster_zarr(
+    cluster_df: pd.DataFrame,
+    zarr_paths: str | Path | Sequence[str | Path],
+    msi_dataset: str,
+    tic_normalize: bool | None = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Compute mean cluster spectra from selected SpatialData Zarr MSI tables.
+
+    :param cluster_df: Output dataframe from :func:`kmeans_cluster_zarr`
+    :param zarr_paths: Zarr path or paths used to create ``cluster_df``
+    :param msi_dataset: Display name, label, table key, or TIC key of the MSI dataset
+    :param tic_normalize: Whether to TIC-normalize spectra before averaging; by
+        default, reuse the setting stored in ``cluster_df``
+    :return: Tuple of the m/z axis and a dataframe with one mean spectrum per cluster
+    """
+    required = {"sample", "x", "y", "cluster"}
+    if not required.issubset(cluster_df.columns):
+        missing = required - set(cluster_df.columns)
+        raise ValueError(f"cluster_df is missing required columns: {sorted(missing)}")
+    if cluster_df.empty:
+        raise ValueError("cluster_df is empty.")
+    if tic_normalize is None:
+        tic_normalize = bool(cluster_df.attrs.get("tic_normalized", True))
+
+    paths = _normalize_zarr_paths(zarr_paths)
+    sample_tables: dict[str, tuple[Path, object]] = {}
+    for path in paths:
+        table = _load_zarr_msi_table(path, msi_dataset)
+        if "x" not in table.obs or "y" not in table.obs:
+            raise ValueError(
+                f"MSI table {msi_dataset!r} in {path} must contain obs['x'] and obs['y']."
+            )
+        display_name = str(
+            table.uns.get("coregistration_display_name")
+            or table.uns.get("coregistration_dataset_label")
+            or msi_dataset
+        )
+        sample_name = display_name if len(paths) == 1 else f"{path.stem}: {display_name}"
+        if sample_name in sample_tables:
+            raise ValueError(f"Duplicate Zarr sample name detected: {sample_name!r}.")
+        sample_tables[sample_name] = (path, table)
+
+    cluster_rows = cluster_df.copy()
+    if "z" not in cluster_rows:
+        cluster_rows["z"] = 1
+
+    sums: dict[int, np.ndarray] = {}
+    counts: dict[int, int] = {}
+    reference_mz: np.ndarray | None = None
+
+    for sample_name in cluster_rows["sample"].astype(str).unique():
+        if sample_name not in sample_tables:
+            available = ", ".join(sample_tables)
+            raise ValueError(
+                f"Sample {sample_name!r} in cluster_df has no matching Zarr table. "
+                f"Available samples: {available}"
+            )
+        path, table = sample_tables[sample_name]
+        local_mz = _table_mz_axis(table)
+        if reference_mz is None:
+            reference_mz = local_mz
+        elif not np.array_equal(local_mz, reference_mz):
+            raise ValueError(
+                "All selected Zarr MSI tables must share the same m/z axis for averaging."
+            )
+
+        sample_rows = cluster_rows[cluster_rows["sample"].astype(str) == sample_name]
+        cluster_lookup = {
+            (int(row.x), int(row.y), int(row.z)): int(row.cluster)
+            for row in sample_rows.itertuples(index=False)
+        }
+        x_values = table.obs["x"].to_numpy()
+        y_values = table.obs["y"].to_numpy()
+        z_values = (
+            table.obs["z"].to_numpy()
+            if "z" in table.obs
+            else np.ones(table.n_obs, dtype=int)
+        )
+        matched_indices: list[int] = []
+        matched_clusters: list[int] = []
+        for idx, (x, y, z) in enumerate(zip(x_values, y_values, z_values, strict=True)):
+            cluster_label = cluster_lookup.get((int(x), int(y), int(z)))
+            if cluster_label is not None:
+                matched_indices.append(idx)
+                matched_clusters.append(cluster_label)
+
+        if not matched_indices:
+            continue
+        matrix = _table_spectral_matrix(table)[matched_indices]
+        values = matrix.data if sparse.issparse(matrix) else matrix
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Spectral data in {path} contains NaN or infinite values.")
+        if tic_normalize:
+            matrix = _tic_normalize_matrix(matrix)
+
+        matched_clusters_array = np.asarray(matched_clusters, dtype=int)
+        for cluster_label in np.unique(matched_clusters_array):
+            mask = matched_clusters_array == cluster_label
+            cluster_sum = np.asarray(matrix[mask].sum(axis=0)).reshape(-1)
+            if cluster_label not in sums:
+                sums[int(cluster_label)] = np.zeros(table.n_vars, dtype=float)
+                counts[int(cluster_label)] = 0
+            sums[int(cluster_label)] += cluster_sum
+            counts[int(cluster_label)] += int(np.count_nonzero(mask))
+
+    if reference_mz is None or not sums:
+        raise ValueError("No overlapping spectra found between cluster_df and Zarr tables.")
+
+    cluster_ids = sorted(sums)
+    mean_data = np.column_stack([sums[label] / counts[label] for label in cluster_ids])
+    mean_df = pd.DataFrame(mean_data, index=reference_mz, columns=cluster_ids)
+    mean_df.index.name = "mz"
+    mean_df.attrs["tic_normalized"] = bool(tic_normalize)
+    mean_df.attrs["source_format"] = "zarr"
+    mean_df.attrs["msi_dataset"] = str(msi_dataset)
+    mean_df.attrs["cluster_cmap"] = cluster_df.attrs.get("cluster_cmap", "tab20")
+    if "cluster_colors" in cluster_df.attrs:
+        mean_df.attrs["cluster_colors"] = {
+            int(key): value
+            for key, value in cluster_df.attrs["cluster_colors"].items()
+            if int(key) in cluster_ids
+        }
+    return reference_mz, mean_df
+
+
 def plot_mean_spectra_by_cluster(
     mz_axis: np.ndarray,
     mean_spectra_df: pd.DataFrame,
@@ -623,7 +1009,7 @@ def plot_mean_spectra_by_cluster(
     max_peak_labels: int = 8,
     min_rel_prominence: float = 0.05,
 ):
-    """Plots mean cluster spectra returned by mean_spectra_by_cluster.
+    """Plot mean spectra returned by either cluster-averaging function.
     
     :param mz_axis: m/z axis values
     :param mean_spectra_df: Mean spectra dataframe with cluster labels as columns
