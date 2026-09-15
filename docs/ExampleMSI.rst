@@ -162,3 +162,41 @@ fitting. Multiple Zarr stores may be clustered together by passing a list of
 paths, but their selected tables must have identical m/z axes. Self-aligned
 datasets with different axes should be clustered separately or aligned to a
 common axis first.
+
+UMAP Across an Aligned Zarr Campaign
+------------------------------------
+
+Pixel spectra from one Zarr or an aligned campaign can be embedded together.
+Every campaign table must already have exactly the same m/z axis;
+``umap_zarr`` never bins, interpolates, or aligns mass features.
+
+.. code-block:: python
+
+   from viu_chem import msi_stats
+
+   embedding = msi_stats.umap_zarr(
+       [
+           "data/control_1.zarr",
+           "data/control_2.zarr",
+           "data/treated_1.zarr",
+       ],
+       msi_dataset="nano-DESI (Positive)",
+       mz_range=(100.0, 1_000.0),
+       n_neighbors=15,
+       min_dist=0.1,
+       metric="cosine",
+   )
+
+   figure, axis = msi_stats.plot_umap(
+       embedding,
+       color_by="sample",
+       legend_outside=True,
+   )
+
+The returned dataframe includes ``UMAP_1``, ``UMAP_2``, the source path and
+sample name, pixel coordinates, and the other columns from each table's
+``obs`` metadata. Set ``color_by`` to any of those columns. By default,
+truncated SVD reduces the aligned spectral matrix to at most 50 components
+before UMAP; set ``svd_components=None`` to embed the spectra directly.
+``mz_range`` is inclusive and only selects columns from the existing aligned
+axis; it does not bin, interpolate, or realign the spectra.

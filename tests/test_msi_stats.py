@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import warnings
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
@@ -149,3 +150,112 @@ def test_kmeans_rescales_large_raw_intensities_without_overflow():
         )
 
     assert result.attrs["kmeans_input_scale"] == pytest.approx(1e200)
+
+
+def test_umap_zarr_combines_aligned_campaign_without_mass_alignment(monkeypatch):
+    tables = {"first.zarr": _msi_table(), "second.zarr": _msi_table()}
+    captured = {}
+
+    class FakeUMAP:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def fit_transform(self, matrix):
+            captured["shape"] = matrix.shape
+            captured["row_sums"] = np.asarray(matrix.sum(axis=1)).reshape(-1)
+            return np.column_stack(
+                [np.arange(matrix.shape[0]), -np.arange(matrix.shape[0])]
+            )
+
+    monkeypatch.setattr(
+        msi_stats,
+        "_load_zarr_msi_table",
+        lambda path, _dataset: tables[path.name],
+    )
+    monkeypatch.setattr(msi_stats, "_load_umap_class", lambda: FakeUMAP)
+
+    result = msi_stats.umap_zarr(
+        ["first.zarr", "second.zarr"],
+        "nano-DESI (Positive)",
+        svd_components=None,
+    )
+
+    assert captured["shape"] == (8, 3)
+    np.testing.assert_allclose(captured["row_sums"], np.ones(8))
+    assert result.shape[0] == 8
+    assert result["sample"].unique().tolist() == [
+        "first: nano-DESI (Positive)",
+        "second: nano-DESI (Positive)",
+    ]
+    assert {"pixel_id", "x", "y", "UMAP_1", "UMAP_2"}.issubset(result.columns)
+    assert result.attrs["mz_min"] == 100.0
+    assert result.attrs["mz_max"] == 300.0
+    assert result.attrs["n_mz_features"] == 3
+    assert "UMAP_1" in repr(result)
+    figure, axis = msi_stats.plot_umap(
+        result,
+        color_by="sample",
+        legend_outside=True,
+    )
+    assert axis.get_xlabel() == "UMAP 1"
+    assert figure.subplotpars.right == pytest.approx(0.72)
+    plt.close(figure)
+
+
+def test_umap_zarr_rejects_unaligned_campaign(monkeypatch):
+    tables = {
+        "first.zarr": _msi_table((100.0, 200.0, 300.0)),
+        "second.zarr": _msi_table((100.0, 200.1, 300.0)),
+    }
+    monkeypatch.setattr(
+        msi_stats,
+        "_load_zarr_msi_table",
+        lambda path, _dataset: tables[path.name],
+    )
+
+    with pytest.raises(ValueError, match="No mass-axis alignment"):
+        msi_stats.umap_zarr(
+            ["first.zarr", "second.zarr"],
+            "nano-DESI (Positive)",
+        )
+
+
+def test_umap_zarr_applies_inclusive_mz_feature_range(monkeypatch):
+    table = _msi_table()
+    captured = {}
+
+    class FakeUMAP:
+        def __init__(self, **_kwargs):
+            pass
+
+        def fit_transform(self, matrix):
+            captured["shape"] = matrix.shape
+            return np.zeros((matrix.shape[0], 2), dtype=float)
+
+    monkeypatch.setattr(msi_stats, "_load_zarr_msi_table", lambda *_args: table)
+    monkeypatch.setattr(msi_stats, "_load_umap_class", lambda: FakeUMAP)
+
+    result = msi_stats.umap_zarr(
+        "campaign.zarr",
+        "nano-DESI (Positive)",
+        mz_range=(100.0, 200.0),
+        svd_components=None,
+    )
+
+    assert captured["shape"] == (4, 2)
+    assert result.attrs["mz_range_requested"] == (100.0, 200.0)
+    assert result.attrs["mz_min"] == 100.0
+    assert result.attrs["mz_max"] == 200.0
+    assert result.attrs["n_mz_features"] == 2
+    assert result.attrs["n_source_mz_features"] == 3
+
+
+def test_umap_zarr_rejects_empty_mz_feature_range(monkeypatch):
+    monkeypatch.setattr(msi_stats, "_load_zarr_msi_table", lambda *_args: _msi_table())
+
+    with pytest.raises(ValueError, match="No m/z features"):
+        msi_stats.umap_zarr(
+            "campaign.zarr",
+            "nano-DESI (Positive)",
+            mz_range=(400.0, 500.0),
+        )

@@ -4516,6 +4516,29 @@ plot = ["plotly (<5.0)"]
 pynumpress = ["pynumpress (>=0.0.4)"]
 
 [[package]]
+name = "pynndescent"
+version = "0.6.0"
+description = "Nearest Neighbor Descent"
+optional = true
+python-versions = "*"
+groups = ["main"]
+markers = "extra == \"coregistration\""
+files = [
+    {file = "pynndescent-0.6.0-py3-none-any.whl", hash = "sha256:dc8c74844e4c7f5cbd1e0cd6909da86fdc789e6ff4997336e344779c3d5538ef"},
+    {file = "pynndescent-0.6.0.tar.gz", hash = "sha256:7ffde0fb5b400741e055a9f7d377e3702e02250616834231f6c209e39aac24f5"},
+]
+
+[package.dependencies]
+joblib = ">=0.11"
+llvmlite = ">=0.38"
+numba = ">=0.55.0"
+scikit-learn = ">=0.18"
+scipy = ">=1.0"
+
+[package.extras]
+testing = ["pytest"]
+
+[[package]]
 name = "pyogrio"
 version = "0.12.1"
 description = "Vectorized spatial vector file format I/O using GDAL/OGR"
@@ -6496,6 +6519,33 @@ files = [
 ]
 
 [[package]]
+name = "umap-learn"
+version = "0.5.12"
+description = "Uniform Manifold Approximation and Projection"
+optional = true
+python-versions = ">=3.9"
+groups = ["main"]
+markers = "extra == \"coregistration\""
+files = [
+    {file = "umap_learn-0.5.12-py3-none-any.whl", hash = "sha256:f2a85d2a2adcb52b541bed9b27a23ca169b56bb1b23283abeebfb8dfb8a42fe5"},
+    {file = "umap_learn-0.5.12.tar.gz", hash = "sha256:6aff02ecac5f2aad9f3c65ee518d7ae93e1a985ae38721fdcffceee4232c33c7"},
+]
+
+[package.dependencies]
+numba = ">=0.51.2"
+numpy = ">=1.23"
+pynndescent = ">=0.5"
+scikit-learn = ">=1.6"
+scipy = ">=1.3.1"
+tqdm = "*"
+
+[package.extras]
+parametric-umap = ["tensorflow (>=2.1)"]
+plot = ["bokeh", "colorcet", "dask", "datashader", "holoviews", "matplotlib", "pandas", "scikit-image", "seaborn"]
+tbb = ["tbb (>=2019.0)"]
+test = ["pytest"]
+
+[[package]]
 name = "universal-pathlib"
 version = "0.3.10"
 description = "pathlib api extended to use fsspec backends"
@@ -7164,9 +7214,9 @@ files = [
 ]
 
 [extras]
-coregistration = ["PyQt5", "QtPy", "anndata", "dask", "defusedxml", "geopandas", "imageio", "magicgui", "napari", "npe2", "ome-zarr", "pydantic", "shapely", "simpleitk", "spatialdata", "thyra", "tifffile", "xarray", "zarr"]
+coregistration = ["PyQt5", "QtPy", "anndata", "dask", "defusedxml", "geopandas", "imageio", "magicgui", "napari", "npe2", "ome-zarr", "pydantic", "shapely", "simpleitk", "spatialdata", "thyra", "tifffile", "umap-learn", "xarray", "zarr"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12, <3.14"
-content-hash = "7e6d6919e1d374c29c403326989a21af46fe971eb88156d18afa3b09de66088b"
+content-hash = "7ee07805c0206d353615317a9b6330eae625fa894b0fb7bbf2968aa50c6044cb"

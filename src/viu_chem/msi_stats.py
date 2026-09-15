@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import pairwise_distances_argmin
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -450,7 +451,13 @@ def _load_zarr_msi_table(zarr_path: Path, msi_dataset: str):
         raise ImportError(
             "Zarr clustering requires the viu-chem coregistration dependencies."
         ) from exc
-    return get_msi_table(zarr_path, msi_dataset)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The table is annotating .*not present in the SpatialData object\.",
+            category=UserWarning,
+        )
+        return get_msi_table(zarr_path, msi_dataset)
 
 
 def _table_mz_axis(table) -> np.ndarray:
@@ -519,6 +526,60 @@ def _table_spectral_matrix(table):
     if sparse.issparse(matrix):
         return matrix.tocsr().astype(float, copy=False)
     return np.asarray(matrix, dtype=float)
+
+
+def _zarr_sample_name(path: Path, table, n_paths: int, msi_dataset: str) -> str:
+    display_name = str(
+        table.uns.get("coregistration_display_name")
+        or table.uns.get("coregistration_dataset_label")
+        or msi_dataset
+    )
+    return display_name if n_paths == 1 else f"{path.stem}: {display_name}"
+
+
+def _load_umap_class():
+    try:
+        from umap import UMAP
+    except ImportError as exc:
+        import sys
+
+        loaded_module = sys.modules.get("umap")
+        resolved_path = getattr(loaded_module, "__file__", None)
+        location_hint = f" Module resolved to: {resolved_path}." if resolved_path else ""
+        raise ImportError(
+            "Could not import UMAP from umap-learn. "
+            f"Python interpreter: {sys.executable}.{location_hint} "
+            f"Original import error: {exc}. "
+            "Ensure umap-learn is installed in this interpreter and that the "
+            "script/current directory does not contain a file named `umap.py`."
+        ) from exc
+    return UMAP
+
+
+def _svd_for_umap(data, n_components: int, random_state: int | None):
+    """Reduce UMAP input and retry with ARPACK if randomized SVD is non-finite."""
+    randomized = TruncatedSVD(
+        n_components=n_components,
+        random_state=random_state,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        reduced = randomized.fit_transform(data)
+    runtime_warnings = [str(item.message) for item in caught]
+    if np.all(np.isfinite(reduced)):
+        return reduced, "randomized", runtime_warnings
+
+    arpack = TruncatedSVD(
+        n_components=n_components,
+        algorithm="arpack",
+        random_state=random_state,
+    )
+    reduced = arpack.fit_transform(data)
+    if not np.all(np.isfinite(reduced)):
+        raise ValueError(
+            "Both randomized and ARPACK truncated SVD produced non-finite values."
+        )
+    return reduced, "arpack", runtime_warnings
 
 
 def _tic_normalize_matrix(data):
@@ -638,6 +699,272 @@ def kmeans_cluster_zarr(
     result.attrs["source_format"] = "zarr"
     result.attrs["msi_dataset"] = str(msi_dataset)
     return result
+
+
+def umap_zarr(
+    zarr_paths: str | Path | Sequence[str | Path],
+    msi_dataset: str,
+    *,
+    mz_range: tuple[float, float] | None = None,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+    n_components: int = 2,
+    metric: str = "cosine",
+    tic_normalize: bool = True,
+    log_transform: bool = False,
+    svd_components: int | None = 50,
+    random_state: int | None = 42,
+) -> pd.DataFrame:
+    """Compute a pixel-level UMAP for one aligned Zarr or a campaign of Zarrs.
+
+    Campaign tables are required to have exactly identical m/z axes. This
+    function never bins, interpolates, or otherwise aligns mass features.
+    Sparse matrices remain sparse through loading and TIC normalization. By
+    default, truncated SVD reduces the aligned feature matrix before UMAP.
+
+    :param zarr_paths: One SpatialData Zarr path or a sequence of campaign paths
+    :param msi_dataset: Display name, label, table key, or TIC key to select
+    :param mz_range: Optional inclusive ``(minimum, maximum)`` m/z feature range
+    :param n_neighbors: UMAP local-neighborhood size
+    :param min_dist: UMAP minimum embedding distance
+    :param n_components: Number of UMAP dimensions
+    :param metric: Distance metric passed to UMAP
+    :param tic_normalize: Whether to TIC-normalize each pixel spectrum
+    :param log_transform: Whether to apply ``log1p`` after TIC normalization
+    :param svd_components: Truncated-SVD dimensions before UMAP, or ``None``
+        to run UMAP directly on the aligned spectra
+    :param random_state: Random seed for SVD and UMAP
+    :return: Dataframe containing UMAP coordinates and source ``obs`` metadata
+    """
+    paths = _normalize_zarr_paths(zarr_paths)
+    if mz_range is not None:
+        if len(mz_range) != 2:
+            raise ValueError("mz_range must contain exactly (minimum, maximum).")
+        mz_min, mz_max = float(mz_range[0]), float(mz_range[1])
+        if not np.all(np.isfinite([mz_min, mz_max])) or mz_min >= mz_max:
+            raise ValueError("mz_range must contain two finite increasing values.")
+    else:
+        mz_min = mz_max = None
+    if not isinstance(n_neighbors, int) or isinstance(n_neighbors, bool) or n_neighbors < 2:
+        raise ValueError("n_neighbors must be an integer of at least 2.")
+    if not isinstance(n_components, int) or isinstance(n_components, bool) or n_components < 1:
+        raise ValueError("n_components must be an integer of at least 1.")
+    if not np.isfinite(min_dist) or min_dist < 0:
+        raise ValueError("min_dist must be a finite value greater than or equal to zero.")
+    if svd_components is not None and (
+        not isinstance(svd_components, int)
+        or isinstance(svd_components, bool)
+        or svd_components < 1
+    ):
+        raise ValueError("svd_components must be a positive integer or None.")
+
+    spectra_blocks = []
+    metadata_blocks: list[pd.DataFrame] = []
+    reference_mz: np.ndarray | None = None
+    selected_mz: np.ndarray | None = None
+    mz_mask: np.ndarray | None = None
+    for path in paths:
+        table = _load_zarr_msi_table(path, msi_dataset)
+        local_mz = _table_mz_axis(table)
+        if not np.all(np.isfinite(local_mz)):
+            raise ValueError(f"The MSI m/z axis in {path} contains non-finite values.")
+        if reference_mz is None:
+            reference_mz = local_mz
+            if mz_range is None:
+                mz_mask = np.ones(reference_mz.size, dtype=bool)
+            else:
+                mz_mask = (reference_mz >= mz_min) & (reference_mz <= mz_max)
+            if not np.any(mz_mask):
+                raise ValueError(
+                    f"No m/z features fall inside the requested range {mz_range}."
+                )
+            selected_mz = reference_mz[mz_mask]
+        elif not np.array_equal(local_mz, reference_mz):
+            raise ValueError(
+                "All campaign Zarr MSI tables must already share exactly the same "
+                "m/z axis. No mass-axis alignment is performed by umap_zarr."
+            )
+
+        matrix = _table_spectral_matrix(table)
+        if matrix.shape != (table.n_obs, table.n_vars):
+            raise ValueError(f"Unexpected spectral matrix shape in {path}: {matrix.shape}")
+        spectra_blocks.append(matrix[:, mz_mask])
+
+        metadata = table.obs.reset_index(drop=True).copy()
+        for reserved in ("pixel_id", "sample", "source_path"):
+            if reserved in metadata:
+                metadata.rename(columns={reserved: f"obs_{reserved}"}, inplace=True)
+        metadata.insert(0, "pixel_id", table.obs.index.astype(str).to_numpy())
+        metadata.insert(
+            1,
+            "sample",
+            _zarr_sample_name(path, table, len(paths), msi_dataset),
+        )
+        metadata.insert(2, "source_path", str(path))
+        metadata_blocks.append(metadata)
+
+    if any(sparse.issparse(block) for block in spectra_blocks):
+        data = sparse.vstack(
+            [block if sparse.issparse(block) else sparse.csr_matrix(block) for block in spectra_blocks],
+            format="csr",
+        )
+    else:
+        data = np.vstack(spectra_blocks)
+    if data.shape[0] < 3:
+        raise ValueError("UMAP analysis requires at least three pixel spectra.")
+
+    values = data.data if sparse.issparse(data) else data
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Spectral data contains NaN or infinite intensity values.")
+    max_abs_intensity = float(np.max(np.abs(values))) if values.size else 0.0
+    input_scale = max(1.0, max_abs_intensity)
+    if input_scale > 1.0:
+        data = data / input_scale
+    if tic_normalize:
+        data = _tic_normalize_matrix(data)
+    if log_transform:
+        values = data.data if sparse.issparse(data) else data
+        if np.any(values < 0):
+            raise ValueError("log_transform requires non-negative intensity values.")
+        if sparse.issparse(data):
+            data = data.copy()
+            data.data = np.log1p(data.data)
+        else:
+            data = np.log1p(data)
+
+    effective_svd_components = None
+    svd_algorithm = None
+    svd_runtime_warnings: list[str] = []
+    if svd_components is not None:
+        effective_svd_components = min(
+            svd_components,
+            data.shape[0] - 1,
+            data.shape[1] - 1,
+        )
+        if effective_svd_components >= 1:
+            umap_input, svd_algorithm, svd_runtime_warnings = _svd_for_umap(
+                data,
+                effective_svd_components,
+                random_state,
+            )
+        else:
+            umap_input = data
+            effective_svd_components = None
+    else:
+        umap_input = data
+
+    effective_neighbors = min(n_neighbors, data.shape[0] - 1)
+    reducer = _load_umap_class()(
+        n_neighbors=effective_neighbors,
+        min_dist=float(min_dist),
+        n_components=n_components,
+        metric=metric,
+        random_state=random_state,
+        n_jobs=1 if random_state is not None else -1,
+    )
+    embedding = np.asarray(reducer.fit_transform(umap_input), dtype=float)
+    if embedding.shape != (data.shape[0], n_components):
+        raise ValueError(f"UMAP returned an unexpected embedding shape: {embedding.shape}")
+    if not np.all(np.isfinite(embedding)):
+        raise ValueError("UMAP returned NaN or infinite embedding coordinates.")
+
+    result = pd.concat(metadata_blocks, ignore_index=True)
+    for index in range(n_components):
+        result[f"UMAP_{index + 1}"] = embedding[:, index]
+    result.attrs["source_format"] = "zarr"
+    result.attrs["msi_dataset"] = str(msi_dataset)
+    result.attrs["tic_normalized"] = bool(tic_normalize)
+    result.attrs["log_transformed"] = bool(log_transform)
+    result.attrs["metric"] = str(metric)
+    result.attrs["n_neighbors"] = int(effective_neighbors)
+    result.attrs["min_dist"] = float(min_dist)
+    result.attrs["n_components"] = int(n_components)
+    result.attrs["svd_components"] = effective_svd_components
+    result.attrs["svd_algorithm"] = svd_algorithm
+    result.attrs["svd_runtime_warnings"] = svd_runtime_warnings
+    result.attrs["input_scale"] = input_scale
+    result.attrs["mz_range_requested"] = mz_range
+    result.attrs["mz_min"] = float(selected_mz[0])
+    result.attrs["mz_max"] = float(selected_mz[-1])
+    result.attrs["n_mz_features"] = int(selected_mz.size)
+    result.attrs["source_mz_min"] = float(reference_mz[0])
+    result.attrs["source_mz_max"] = float(reference_mz[-1])
+    result.attrs["n_source_mz_features"] = int(reference_mz.size)
+    return result
+
+
+def plot_umap(
+    umap_df: pd.DataFrame,
+    color_by: str | None = "sample",
+    *,
+    ax=None,
+    cmap: str = "viridis",
+    dot_size: float = 4.0,
+    alpha: float = 0.8,
+    legend_outside: bool = False,
+):
+    """Plot the first two dimensions returned by :func:`umap_zarr`.
+
+    :param umap_df: Dataframe returned by :func:`umap_zarr`
+    :param color_by: Numeric or categorical column used to color pixels
+    :param ax: Optional matplotlib axis
+    :param cmap: Matplotlib colormap name
+    :param dot_size: Scatter-point size
+    :param alpha: Scatter-point opacity
+    :param legend_outside: Place a categorical legend in a right-side margin
+    :return: Matplotlib figure and axis
+    """
+    required = {"UMAP_1", "UMAP_2"}
+    if not required.issubset(umap_df):
+        raise ValueError("umap_df must contain UMAP_1 and UMAP_2 columns.")
+    if color_by is not None and color_by not in umap_df:
+        raise ValueError(f"UMAP color column not found: {color_by!r}")
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig = ax.figure
+
+    if color_by is None:
+        ax.scatter(umap_df["UMAP_1"], umap_df["UMAP_2"], s=dot_size, alpha=alpha)
+    elif pd.api.types.is_numeric_dtype(umap_df[color_by]):
+        points = ax.scatter(
+            umap_df["UMAP_1"],
+            umap_df["UMAP_2"],
+            c=umap_df[color_by],
+            cmap=cmap,
+            s=dot_size,
+            alpha=alpha,
+        )
+        fig.colorbar(points, ax=ax, label=color_by)
+    else:
+        groups = list(pd.unique(umap_df[color_by].astype(str)))
+        colors = plt.get_cmap(cmap, len(groups))
+        for index, group in enumerate(groups):
+            mask = umap_df[color_by].astype(str) == group
+            ax.scatter(
+                umap_df.loc[mask, "UMAP_1"],
+                umap_df.loc[mask, "UMAP_2"],
+                color=colors(index),
+                label=group,
+                s=dot_size,
+                alpha=alpha,
+            )
+        if legend_outside:
+            ax.legend(
+                title=color_by,
+                markerscale=2,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                borderaxespad=0,
+            )
+            # Reserve figure space so the side legend does not cover the embedding.
+            fig.subplots_adjust(right=0.72)
+        else:
+            ax.legend(title=color_by, markerscale=2)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.set_title("MSI UMAP")
+    return fig, ax
 
 
 def plot_cluster_classification(
