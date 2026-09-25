@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import pairwise_distances_argmin
 import matplotlib.pyplot as plt
@@ -106,7 +106,12 @@ def _cluster_spectral_matrix(
         n_init=n_init,
         max_iter=max_iter,
     )
-    labels0 = model.fit_predict(data)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        labels0 = model.fit_predict(data)
+    kmeans_runtime_warnings = [str(item.message) for item in caught]
+    if not np.all(np.isfinite(model.cluster_centers_)):
+        raise ValueError("KMeans produced NaN or infinite cluster centers.")
 
     # In auto mode, reassign tiny clusters to the nearest retained centroid.
     # pairwise_distances_argmin supports both dense and sparse input matrices.
@@ -149,6 +154,7 @@ def _cluster_spectral_matrix(
     df.attrs["k_initial"] = int(initial_k)
     df.attrs["k_final"] = int(final_k)
     df.attrs["kmeans_input_scale"] = kmeans_input_scale
+    df.attrs["kmeans_runtime_warnings"] = kmeans_runtime_warnings
     if auto_mode:
         df.attrs["min_cluster_fraction"] = float(min_cluster_fraction)
         df.attrs["min_cluster_size"] = int(min_cluster_size)
@@ -460,6 +466,91 @@ def _load_zarr_msi_table(zarr_path: Path, msi_dataset: str):
         return get_msi_table(zarr_path, msi_dataset)
 
 
+def _load_zarr_msi_table_lazy(zarr_path: Path, msi_dataset: str):
+    """Select an MSI AnnData table while leaving its spectral matrix lazy."""
+    try:
+        import zarr
+        from anndata.experimental import read_lazy
+    except ImportError as exc:
+        raise ImportError(
+            "Out-of-core Zarr clustering requires the coregistration dependencies "
+            "and anndata.experimental.read_lazy."
+        ) from exc
+
+    root = zarr.open_group(str(Path(zarr_path).expanduser()), mode="r")
+    if "tables" not in root:
+        raise ValueError(f"SpatialData Zarr contains no tables: {zarr_path}")
+
+    candidates = []
+    for table_key in root["tables"].keys():
+        table = read_lazy(root["tables"][table_key])
+        uns = getattr(table, "uns", {}) or {}
+        label = str(uns.get("coregistration_dataset_label") or table_key)
+        display_name = str(uns.get("coregistration_display_name") or label)
+        tic_key = str(uns.get("coregistration_tic_key") or f"{label}_tic")
+        candidates.append((table, [display_name, label, str(table_key), tic_key]))
+
+    query = str(msi_dataset).strip()
+    query_folded = query.casefold()
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^0-9a-z]+", "_", value.casefold()).strip("_")
+
+    query_normalized = normalized(query)
+    matches = []
+    for rank in range(5):
+        matches = []
+        for table, values in candidates:
+            folded = [value.casefold() for value in values]
+            safe = [normalized(value) for value in values]
+            if rank == 0 and query in values:
+                matches.append(table)
+            elif rank == 1 and query_folded in folded:
+                matches.append(table)
+            elif rank == 2 and query_normalized in safe:
+                matches.append(table)
+            elif rank == 3 and query_folded and any(query_folded in value for value in folded):
+                matches.append(table)
+            elif rank == 4 and query_normalized and any(
+                query_normalized in value for value in safe
+            ):
+                matches.append(table)
+        if matches:
+            break
+
+    if not matches:
+        available = ", ".join(values[0] for _table, values in candidates)
+        raise ValueError(
+            f"No MSI dataset matched {msi_dataset!r}. Available datasets: {available}"
+        )
+    if len(matches) > 1:
+        raise ValueError(f"MSI dataset selector {msi_dataset!r} matched multiple tables.")
+    return matches[0]
+
+
+def _obs_to_memory(table) -> pd.DataFrame:
+    obs = table.obs.to_memory() if hasattr(table.obs, "to_memory") else table.obs
+    return pd.DataFrame(obs).copy()
+
+
+def _computed_spectral_batch(lazy_matrix, start: int, stop: int):
+    block = lazy_matrix[start:stop, :]
+    if hasattr(block, "compute"):
+        block = block.compute()
+    if hasattr(block, "to_memory"):
+        block = block.to_memory()
+    if sparse.issparse(block):
+        block = block.tocsr().astype(float, copy=False)
+    else:
+        block = np.asarray(block, dtype=float)
+    if block.ndim != 2:
+        raise ValueError("Spectral data must be a two-dimensional pixels x m/z matrix.")
+    values = block.data if sparse.issparse(block) else block
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Spectral data contains NaN or infinite intensity values.")
+    return block
+
+
 def _table_mz_axis(table) -> np.ndarray:
     if "mz" in table.var:
         mz_axis = np.asarray(table.var["mz"], dtype=float)
@@ -474,6 +565,40 @@ def _table_mz_axis(table) -> np.ndarray:
     if mz_axis.ndim != 1 or mz_axis.size != table.n_vars:
         raise ValueError("The MSI table m/z axis does not match its spectral matrix.")
     return mz_axis
+
+
+def _deduplicate_mz_axis(
+    mz_axis: np.ndarray,
+) -> tuple[np.ndarray, sparse.csr_matrix | None, int]:
+    """Build a sum-reduction for exact duplicate m/z columns.
+
+    Newer Thyra releases store a unique common mass axis. Older stores can
+    contain repeated columns for the same exact m/z value. Summing those
+    columns matches Thyra's current many-peaks-to-one-bin accumulation without
+    introducing tolerance-based mass alignment.
+    """
+    mz_axis = np.asarray(mz_axis, dtype=float)
+    if not np.all(np.isfinite(mz_axis)):
+        raise ValueError("The MSI m/z axis contains non-finite values.")
+    unique_mz, inverse = np.unique(mz_axis, return_inverse=True)
+    duplicates_removed = int(mz_axis.size - unique_mz.size)
+    if duplicates_removed == 0:
+        return mz_axis, None, 0
+    reducer = sparse.csr_matrix(
+        (
+            np.ones(mz_axis.size, dtype=float),
+            (np.arange(mz_axis.size), inverse),
+        ),
+        shape=(mz_axis.size, unique_mz.size),
+    )
+    return unique_mz, reducer, duplicates_removed
+
+
+def _collapse_duplicate_mz_columns(matrix, reducer: sparse.csr_matrix | None):
+    if reducer is None:
+        return matrix
+    collapsed = matrix @ reducer
+    return collapsed.tocsr() if sparse.issparse(collapsed) else np.asarray(collapsed)
 
 
 def _axis_scale_from_obs(obs: pd.DataFrame, axis: str) -> float | None:
@@ -505,14 +630,21 @@ def _axis_scale_from_obs(obs: pd.DataFrame, axis: str) -> float | None:
 
 
 def _table_pixel_sizes(table) -> tuple[float, float]:
-    uns = getattr(table, "uns", {}) or {}
+    return _pixel_sizes_from_metadata(table.obs, getattr(table, "uns", {}) or {})
+
+
+def _pixel_sizes_from_metadata(
+    obs: pd.DataFrame,
+    uns,
+) -> tuple[float, float]:
+    """Read pixel sizes from table metadata or physical coordinate columns."""
 
     def _size(axis: str) -> float:
         for key in (f"pixel_size_{axis}_um", f"pixel_size_{axis}"):
             value = _to_float_or_none(uns.get(key))
             if value is not None and value > 0:
                 return value
-        return _axis_scale_from_obs(table.obs, axis) or 1.0
+        return _axis_scale_from_obs(obs, axis) or 1.0
 
     return _size("x"), _size("y")
 
@@ -599,6 +731,258 @@ def _tic_normalize_matrix(data):
     return data * inverse_tic[:, None]
 
 
+def _stack_spectral_blocks(blocks: list):
+    if any(sparse.issparse(block) for block in blocks):
+        return sparse.vstack(
+            [block if sparse.issparse(block) else sparse.csr_matrix(block) for block in blocks],
+            format="csr",
+        )
+    return np.vstack(blocks)
+
+
+def _progress_batches(iterable, *, enabled: bool, total: int, description: str):
+    """Optionally decorate a batch iterator with a terminal/notebook progress bar."""
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as exc:
+        raise ImportError(
+            "K-means progress bars require tqdm. Install viu-chem with the "
+            "coregistration extra or install `tqdm` directly."
+        ) from exc
+    return tqdm(iterable, total=total, desc=description, unit="batch")
+
+
+def _kmeans_cluster_zarr_minibatch(
+    paths: list[Path],
+    msi_dataset: str,
+    *,
+    n_clusters: int | str,
+    tic_normalize: bool,
+    random_state: int | None,
+    n_init: int | str,
+    max_iter: int,
+    auto_k_min: int,
+    auto_k_max: int,
+    min_cluster_fraction: float,
+    min_cluster_size: int,
+    batch_size: int,
+    minibatch_epochs: int,
+    reassignment_ratio: float,
+    show_progress: bool,
+) -> pd.DataFrame:
+    """Stream lazy Zarr tables through MiniBatchKMeans and prediction passes."""
+    sources = []
+    row_info: list[tuple] = []
+    reference_mz: np.ndarray | None = None
+    n_pixels = 0
+    duplicate_columns_by_source: dict[str, int] = {}
+
+    for path in paths:
+        table = _load_zarr_msi_table_lazy(path, msi_dataset)
+        obs = _obs_to_memory(table)
+        if "x" not in obs or "y" not in obs:
+            raise ValueError(
+                f"MSI table {msi_dataset!r} in {path} must contain obs['x'] and obs['y']."
+            )
+        local_mz, mz_reducer, duplicate_count = _deduplicate_mz_axis(
+            _table_mz_axis(table)
+        )
+        duplicate_columns_by_source[str(path)] = duplicate_count
+        if reference_mz is None:
+            reference_mz = local_mz
+        elif not np.array_equal(local_mz, reference_mz):
+            raise ValueError(
+                "All selected Zarr MSI tables must share a common axis of m/z values after "
+                "collapsing exact duplicate columns for joint clustering."
+            )
+
+        matrix = table.X
+        if matrix.shape != (table.n_obs, table.n_vars):
+            raise ValueError(f"Unexpected spectral matrix shape in {path}: {matrix.shape}")
+        offset = n_pixels
+        sources.append((matrix, int(table.n_obs), offset, mz_reducer))
+        n_pixels += int(table.n_obs)
+
+        pixel_size_x, pixel_size_y = _pixel_sizes_from_metadata(obs, table.uns)
+        sample_name = _zarr_sample_name(path, table, len(paths), msi_dataset)
+        x_values = obs["x"].to_numpy()
+        y_values = obs["y"].to_numpy()
+        z_values = obs["z"].to_numpy() if "z" in obs else np.ones(table.n_obs, dtype=int)
+        row_info.extend(
+            (sample_name, x, y, z, pixel_size_x, pixel_size_y)
+            for x, y, z in zip(x_values, y_values, z_values, strict=True)
+        )
+
+    if n_pixels < 1:
+        raise ValueError("No spectra found to cluster.")
+    auto_mode = n_clusters == "auto"
+    if auto_mode:
+        auto_k = int(round(np.sqrt(n_pixels)))
+        initial_k = min(max(auto_k_min, auto_k), auto_k_max, n_pixels)
+    else:
+        initial_k = min(int(n_clusters), n_pixels)
+    effective_batch_size = max(batch_size, initial_k)
+    batches_per_pass = sum(
+        (source_rows + effective_batch_size - 1) // effective_batch_size
+        for _matrix, source_rows, _offset, _mz_reducer in sources
+    )
+
+    def iter_raw_batches():
+        for matrix, source_rows, offset, mz_reducer in sources:
+            for start in range(0, source_rows, effective_batch_size):
+                block = _computed_spectral_batch(
+                    matrix,
+                    start,
+                    min(start + effective_batch_size, source_rows),
+                )
+                block = _collapse_duplicate_mz_columns(block, mz_reducer)
+                yield offset + start, block
+
+    input_scale = 1.0
+    if not tic_normalize:
+        raw_batches = _progress_batches(
+            iter_raw_batches(),
+            enabled=show_progress,
+            total=batches_per_pass,
+            description="Scanning intensity scale",
+        )
+        for _offset, block in raw_batches:
+            values = block.data if sparse.issparse(block) else block
+            if values.size:
+                input_scale = max(input_scale, float(np.max(np.abs(values))))
+
+    def iter_prepared_batches():
+        for offset, block in iter_raw_batches():
+            if input_scale > 1.0:
+                block = block / input_scale
+            if tic_normalize:
+                block = _tic_normalize_matrix(block)
+            yield offset, block
+
+    def iter_fitting_batches():
+        for _epoch in range(minibatch_epochs):
+            yield from iter_prepared_batches()
+
+    model = MiniBatchKMeans(
+        n_clusters=initial_k,
+        random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+        batch_size=effective_batch_size,
+        compute_labels=False,
+        reassignment_ratio=reassignment_ratio,
+    )
+    initialized = False
+    pending: list = []
+    pending_rows = 0
+    batches_fitted = 0
+    kmeans_runtime_warnings: list[str] = []
+    fitting_batches = _progress_batches(
+        iter_fitting_batches(),
+        enabled=show_progress,
+        total=batches_per_pass * minibatch_epochs,
+        description="Fitting MiniBatchKMeans",
+    )
+    for _offset, block in fitting_batches:
+        if not initialized:
+            pending.append(block)
+            pending_rows += block.shape[0]
+            if pending_rows < initial_k:
+                continue
+            block = _stack_spectral_blocks(pending)
+            pending = []
+            initialized = True
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            model.partial_fit(block)
+        kmeans_runtime_warnings.extend(str(item.message) for item in caught)
+        if not np.all(np.isfinite(model.cluster_centers_)):
+            raise ValueError("MiniBatchKMeans produced NaN or infinite cluster centers.")
+        batches_fitted += 1
+    if not initialized:
+        raise ValueError("Not enough spectra to initialize MiniBatchKMeans.")
+
+    labels0 = np.empty(n_pixels, dtype=int)
+    prediction_batches = _progress_batches(
+        iter_prepared_batches(),
+        enabled=show_progress,
+        total=batches_per_pass,
+        description="Assigning clusters",
+    )
+    for offset, block in prediction_batches:
+        labels0[offset : offset + block.shape[0]] = model.predict(block)
+
+    extra_reassignment_pass = False
+    if auto_mode:
+        counts = np.bincount(labels0, minlength=initial_k)
+        min_size_threshold = max(
+            min_cluster_size,
+            int(np.ceil(min_cluster_fraction * n_pixels)),
+        )
+        keep = np.where(counts >= min_size_threshold)[0]
+        if keep.size == 0:
+            keep = np.array([int(np.argmax(counts))], dtype=int)
+        drop = np.setdiff1d(np.arange(initial_k), keep, assume_unique=True)
+        labels_adj = labels0.copy()
+        if drop.size > 0:
+            extra_reassignment_pass = True
+            reassignment_batches = _progress_batches(
+                iter_prepared_batches(),
+                enabled=show_progress,
+                total=batches_per_pass,
+                description="Reassigning small clusters",
+            )
+            for offset, block in reassignment_batches:
+                local_labels = labels_adj[offset : offset + block.shape[0]]
+                dropped_mask = np.isin(local_labels, drop)
+                if np.any(dropped_mask):
+                    nearest_keep_idx = pairwise_distances_argmin(
+                        block[dropped_mask],
+                        model.cluster_centers_[keep],
+                        metric="euclidean",
+                    )
+                    local_labels[dropped_mask] = keep[nearest_keep_idx]
+        unique_labels = np.sort(np.unique(labels_adj))
+        remap = {old: new for new, old in enumerate(unique_labels, start=1)}
+        labels = np.array([remap[value] for value in labels_adj], dtype=int)
+        final_k = len(unique_labels)
+    else:
+        labels = labels0 + 1
+        final_k = initial_k
+
+    result = pd.DataFrame(
+        row_info,
+        columns=["sample", "x", "y", "z", "pixel_size_x", "pixel_size_y"],
+    )
+    result["cluster"] = labels
+    result.attrs["tic_normalized"] = bool(tic_normalize)
+    result.attrs["k_requested"] = n_clusters
+    result.attrs["k_initial"] = int(initial_k)
+    result.attrs["k_final"] = int(final_k)
+    result.attrs["kmeans_input_scale"] = input_scale if not tic_normalize else None
+    result.attrs["algorithm"] = "minibatch"
+    result.attrs["out_of_core"] = True
+    result.attrs["batch_size"] = int(effective_batch_size)
+    result.attrs["minibatch_epochs"] = int(minibatch_epochs)
+    result.attrs["batches_fitted"] = int(batches_fitted)
+    result.attrs["kmeans_runtime_warnings"] = kmeans_runtime_warnings
+    result.attrs["n_mz_features"] = int(reference_mz.size)
+    result.attrs["duplicate_mz_columns_collapsed"] = int(
+        sum(duplicate_columns_by_source.values())
+    )
+    result.attrs["duplicate_mz_columns_by_source"] = duplicate_columns_by_source
+    result.attrs["spectral_passes"] = int(
+        minibatch_epochs + 1 + (not tic_normalize) + extra_reassignment_pass
+    )
+    if auto_mode:
+        result.attrs["min_cluster_fraction"] = float(min_cluster_fraction)
+        result.attrs["min_cluster_size"] = int(min_cluster_size)
+        result.attrs["min_size_threshold_used"] = int(min_size_threshold)
+    return result
+
+
 def kmeans_cluster_zarr(
     zarr_paths: str | Path | Sequence[str | Path],
     msi_dataset: str,
@@ -611,13 +995,18 @@ def kmeans_cluster_zarr(
     auto_k_max: int = 10,
     min_cluster_fraction: float = 0.01,
     min_cluster_size: int = 25,
+    algorithm: str = "kmeans",
+    batch_size: int = 1024,
+    minibatch_epochs: int = 1,
+    reassignment_ratio: float = 0.01,
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     """Run k-means on an MSI table selected from one or more SpatialData Zarr stores.
 
     The selected table must use the standard ``pixels x m/z`` AnnData layout,
     with coordinates in ``obs['x']`` and ``obs['y']`` and the mass axis in
-    ``var['mz']``. Sparse spectral matrices remain sparse during stacking,
-    TIC normalization, and k-means fitting.
+    ``var['mz']``. Use ``algorithm="minibatch"`` to read spectra from Zarr in
+    bounded row batches instead of materializing the complete spectral matrix.
 
     :param zarr_paths: One SpatialData Zarr path or a sequence of paths
     :param msi_dataset: Display name, label, table key, or TIC key of the MSI dataset
@@ -630,13 +1019,58 @@ def kmeans_cluster_zarr(
     :param auto_k_max: Maximum initial k when n_clusters is ``"auto"``
     :param min_cluster_fraction: Minimum fraction of pixels retained as a cluster
     :param min_cluster_size: Minimum absolute pixel count retained as a cluster
+    :param algorithm: ``"kmeans"`` for the original in-memory workflow or
+        ``"minibatch"`` for out-of-core Zarr streaming
+    :param batch_size: Target row batch size for out-of-core loading; raised to
+        ``n_clusters`` when needed to initialize the model
+    :param minibatch_epochs: Number of complete fitting passes over lazy spectra
+    :param reassignment_ratio: MiniBatchKMeans low-count center reassignment ratio
+    :param show_progress: Display progress bars for out-of-core spectral passes
     :return: Dataframe containing sample, coordinates, pixel sizes, and cluster labels
     """
     _validate_kmeans_options(n_clusters, min_cluster_fraction, min_cluster_size)
+    algorithm = str(algorithm).strip().lower()
+    if algorithm not in {"kmeans", "minibatch"}:
+        raise ValueError("algorithm must be 'kmeans' or 'minibatch'.")
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer.")
+    if (
+        not isinstance(minibatch_epochs, int)
+        or isinstance(minibatch_epochs, bool)
+        or minibatch_epochs < 1
+    ):
+        raise ValueError("minibatch_epochs must be a positive integer.")
+    if not np.isfinite(reassignment_ratio) or not 0 <= reassignment_ratio <= 1:
+        raise ValueError("reassignment_ratio must be between 0 and 1.")
+    if not isinstance(show_progress, bool):
+        raise ValueError("show_progress must be a boolean.")
     paths = _normalize_zarr_paths(zarr_paths)
+    if algorithm == "minibatch":
+        result = _kmeans_cluster_zarr_minibatch(
+            paths,
+            msi_dataset,
+            n_clusters=n_clusters,
+            tic_normalize=tic_normalize,
+            random_state=random_state,
+            n_init=n_init,
+            max_iter=max_iter,
+            auto_k_min=auto_k_min,
+            auto_k_max=auto_k_max,
+            min_cluster_fraction=min_cluster_fraction,
+            min_cluster_size=min_cluster_size,
+            batch_size=batch_size,
+            minibatch_epochs=minibatch_epochs,
+            reassignment_ratio=reassignment_ratio,
+            show_progress=show_progress,
+        )
+        result.attrs["source_format"] = "zarr"
+        result.attrs["msi_dataset"] = str(msi_dataset)
+        return result
+
     spectra_blocks = []
     row_info: list[tuple] = []
     reference_mz: np.ndarray | None = None
+    duplicate_columns_by_source: dict[str, int] = {}
 
     for path in paths:
         table = _load_zarr_msi_table(path, msi_dataset)
@@ -645,20 +1079,23 @@ def kmeans_cluster_zarr(
                 f"MSI table {msi_dataset!r} in {path} must contain obs['x'] and obs['y']."
             )
 
-        local_mz = _table_mz_axis(table)
+        local_mz, mz_reducer, duplicate_count = _deduplicate_mz_axis(
+            _table_mz_axis(table)
+        )
+        duplicate_columns_by_source[str(path)] = duplicate_count
         if reference_mz is None:
             reference_mz = local_mz
         elif not np.array_equal(local_mz, reference_mz):
             raise ValueError(
-                "All selected Zarr MSI tables must share the same m/z axis for "
-                "joint clustering. Run self-aligned datasets separately or align "
-                "them to a common axis first."
+                "All selected Zarr MSI tables must share a common axis of m/z values after "
+                "collapsing exact duplicate columns for joint clustering. Run "
+                "genuinely different axes separately or align them first."
             )
 
         matrix = _table_spectral_matrix(table)
         if matrix.shape != (table.n_obs, table.n_vars):
             raise ValueError(f"Unexpected spectral matrix shape in {path}: {matrix.shape}")
-        spectra_blocks.append(matrix)
+        spectra_blocks.append(_collapse_duplicate_mz_columns(matrix, mz_reducer))
 
         pixel_size_x, pixel_size_y = _table_pixel_sizes(table)
         display_name = str(
@@ -698,6 +1135,13 @@ def kmeans_cluster_zarr(
     )
     result.attrs["source_format"] = "zarr"
     result.attrs["msi_dataset"] = str(msi_dataset)
+    result.attrs["algorithm"] = "kmeans"
+    result.attrs["out_of_core"] = False
+    result.attrs["n_mz_features"] = int(reference_mz.size)
+    result.attrs["duplicate_mz_columns_collapsed"] = int(
+        sum(duplicate_columns_by_source.values())
+    )
+    result.attrs["duplicate_mz_columns_by_source"] = duplicate_columns_by_source
     return result
 
 
@@ -717,10 +1161,12 @@ def umap_zarr(
 ) -> pd.DataFrame:
     """Compute a pixel-level UMAP for one aligned Zarr or a campaign of Zarrs.
 
-    Campaign tables are required to have exactly identical m/z axes. This
-    function never bins, interpolates, or otherwise aligns mass features.
-    Sparse matrices remain sparse through loading and TIC normalization. By
-    default, truncated SVD reduces the aligned feature matrix before UMAP.
+    Campaign tables are required to have identical m/z axes after exact
+    duplicate values are collapsed by summing their intensity columns. This
+    function never bins, interpolates, or otherwise aligns distinct mass
+    features. Sparse matrices remain sparse through loading and TIC
+    normalization. By default, truncated SVD reduces the aligned feature
+    matrix before UMAP.
 
     :param zarr_paths: One SpatialData Zarr path or a sequence of campaign paths
     :param msi_dataset: Display name, label, table key, or TIC key to select
@@ -763,11 +1209,13 @@ def umap_zarr(
     reference_mz: np.ndarray | None = None
     selected_mz: np.ndarray | None = None
     mz_mask: np.ndarray | None = None
+    duplicate_columns_by_source: dict[str, int] = {}
     for path in paths:
         table = _load_zarr_msi_table(path, msi_dataset)
-        local_mz = _table_mz_axis(table)
-        if not np.all(np.isfinite(local_mz)):
-            raise ValueError(f"The MSI m/z axis in {path} contains non-finite values.")
+        local_mz, mz_reducer, duplicate_count = _deduplicate_mz_axis(
+            _table_mz_axis(table)
+        )
+        duplicate_columns_by_source[str(path)] = duplicate_count
         if reference_mz is None:
             reference_mz = local_mz
             if mz_range is None:
@@ -781,13 +1229,15 @@ def umap_zarr(
             selected_mz = reference_mz[mz_mask]
         elif not np.array_equal(local_mz, reference_mz):
             raise ValueError(
-                "All campaign Zarr MSI tables must already share exactly the same "
-                "m/z axis. No mass-axis alignment is performed by umap_zarr."
+                "All campaign Zarr MSI tables must share exactly the same m/z axis "
+                "after collapsing exact duplicate columns. No mass-axis alignment "
+                "is performed by umap_zarr."
             )
 
         matrix = _table_spectral_matrix(table)
         if matrix.shape != (table.n_obs, table.n_vars):
             raise ValueError(f"Unexpected spectral matrix shape in {path}: {matrix.shape}")
+        matrix = _collapse_duplicate_mz_columns(matrix, mz_reducer)
         spectra_blocks.append(matrix[:, mz_mask])
 
         metadata = table.obs.reset_index(drop=True).copy()
@@ -890,6 +1340,10 @@ def umap_zarr(
     result.attrs["source_mz_min"] = float(reference_mz[0])
     result.attrs["source_mz_max"] = float(reference_mz[-1])
     result.attrs["n_source_mz_features"] = int(reference_mz.size)
+    result.attrs["duplicate_mz_columns_collapsed"] = int(
+        sum(duplicate_columns_by_source.values())
+    )
+    result.attrs["duplicate_mz_columns_by_source"] = duplicate_columns_by_source
     return result
 
 

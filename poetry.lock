@@ -7214,9 +7214,9 @@ files = [
 ]
 
 [extras]
-coregistration = ["PyQt5", "QtPy", "anndata", "dask", "defusedxml", "geopandas", "imageio", "magicgui", "napari", "npe2", "ome-zarr", "pydantic", "shapely", "simpleitk", "spatialdata", "thyra", "tifffile", "umap-learn", "xarray", "zarr"]
+coregistration = ["PyQt5", "QtPy", "anndata", "dask", "defusedxml", "geopandas", "imageio", "magicgui", "napari", "npe2", "ome-zarr", "pydantic", "shapely", "simpleitk", "spatialdata", "thyra", "tifffile", "tqdm", "umap-learn", "xarray", "zarr"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12, <3.14"
-content-hash = "7ee07805c0206d353615317a9b6330eae625fa894b0fb7bbf2968aa50c6044cb"
+content-hash = "4cdc57b3982cd9de9b2781692ad5e0a132931fb95c3a9b4ce97deea06faf7111"

@@ -163,6 +163,36 @@ paths, but their selected tables must have identical m/z axes. Self-aligned
 datasets with different axes should be clustered separately or aligned to a
 common axis first.
 
+Exact duplicate m/z columns produced by older Thyra versions are collapsed by
+summing their intensities before campaign K-means or UMAP. This allows those
+stores to be combined with newer Thyra stores that already removed the same
+duplicates. Distinct or merely nearby m/z values are never merged, so truly
+different mass axes still raise an error.
+
+For datasets that should not be materialized completely in memory, use the
+out-of-core mini-batch workflow:
+
+.. code-block:: python
+
+   clusters = msi_stats.kmeans_cluster_zarr(
+       ["data/control_1.zarr", "data/treated_1.zarr"],
+       msi_dataset="nano-DESI (Positive)",
+       n_clusters=8,
+       algorithm="minibatch",
+       batch_size=2_048,
+       minibatch_epochs=2,
+       show_progress=True,
+   )
+
+This lazily reads one row batch at a time for fitting and makes a second
+streaming pass to assign final labels. ``n_clusters="auto"`` is also supported;
+if tiny clusters need reassignment, that cleanup uses one additional streaming
+pass. The returned dataframe records the effective batch size, pass count, and
+number of fitted batches in ``attrs``. The effective batch size is raised to
+the cluster count if necessary for model initialization. Thyra's CSC table
+layout remains memory-bounded here, although CSR-written tables provide more
+efficient row access.
+
 UMAP Across an Aligned Zarr Campaign
 ------------------------------------
 

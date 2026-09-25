@@ -48,6 +48,7 @@ If the zarr already exists, you can add data incrementally:
        "sample.zarr",
        "negative_mode.imzML",
        dataset_label="nanoDESI Negative",
+       skip_resampling=True,
    )
 
    import_geojson_annotations(
@@ -57,6 +58,12 @@ If the zarr already exists, you can add data incrementally:
        object_mode="annotations_only",
        annotation_pyramid_level=4,
    )
+
+Set ``skip_resampling=True`` only when the imzML spectra already share the m/z
+axis you want to retain. The default is ``False``, so Thyra continues to choose
+an automatic resampling configuration for unaligned inputs. The **Add MSI
+Dataset** tool exposes the same option as an unchecked checkbox. Existing Zarr
+inputs are copied directly and are never resampled.
 
 QPTIFF and OME-TIFF reference images are imported as chunked multiscale
 images by default. Napari then selects a pyramid level as the view is zoomed,

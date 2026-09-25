@@ -136,7 +136,11 @@ def _run_with_busy_dialog(title: str, message: str, func):
         _close_busy_dialog(dialog)
 
 
-def _pick_input_or_convert(default_zarr_path: str | Path | None = None) -> Path:
+def _pick_input_or_convert(
+    default_zarr_path: str | Path | None = None,
+    *,
+    skip_resampling: bool = False,
+) -> Path:
 
     _ensure_qapplication(QApplication)
 
@@ -181,7 +185,7 @@ def _pick_input_or_convert(default_zarr_path: str | Path | None = None) -> Path:
         )
         if not out:
             raise SystemExit("No output zarr selected.")
-        return convert_input_to_zarr(src, out)
+        return convert_input_to_zarr(src, out, resample=not skip_resampling)
 
     raise SystemExit("No input selected.")
 
@@ -191,13 +195,18 @@ def launch_coregistration_gui(
     *,
     input_path: str | Path | None = None,
     registered_cs: str = "registered",
+    skip_resampling: bool = False,
 ):
 
     if zarr_path is None:
         if input_path is not None:
-            zarr_path = prepare_coregistration_zarr(input_path=input_path, registered_cs=registered_cs)
+            zarr_path = prepare_coregistration_zarr(
+                input_path=input_path,
+                registered_cs=registered_cs,
+                skip_resampling=skip_resampling,
+            )
         else:
-            zarr_path = _pick_input_or_convert()
+            zarr_path = _pick_input_or_convert(skip_resampling=skip_resampling)
 
     host_zarr_path = Path(zarr_path).expanduser()
     dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs)
@@ -4706,13 +4715,23 @@ def launch_coregistration_gui(
         active_dataset_label = label
         sync_controls_to_active_dataset()
 
-    @magicgui(call_button="Add MSI Dataset")
-    def add_msi_dataset():
-        picked_path = _pick_input_or_convert()
+    @magicgui(
+        skip_resampling={
+            "label": "Input already m/z-aligned (skip Thyra resampling)",
+        },
+        call_button="Add MSI Dataset",
+    )
+    def add_msi_dataset(skip_resampling: bool = False):
+        picked_path = _pick_input_or_convert(skip_resampling=skip_resampling)
         embedded = _run_with_busy_dialog(
             "Add MSI Dataset",
             "Importing MSI dataset...\nThis can take a little while.",
-            lambda: embed_msi_dataset(host_zarr_path, picked_path, registered_cs=registered_cs),
+            lambda: embed_msi_dataset(
+                host_zarr_path,
+                picked_path,
+                registered_cs=registered_cs,
+                skip_resampling=skip_resampling,
+            ),
         )
         new_dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs, table_key=embedded["table_key"], tic_key=embedded["tic_key"])
         state = add_dataset_to_view(new_dataset, str(new_dataset.display_name))

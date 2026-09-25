@@ -39,6 +39,19 @@ def _msi_table(mz=(100.0, 200.0, 300.0)):
     )
 
 
+def _msi_table_with_duplicate_mz():
+    table = _msi_table()
+    middle = table.X[:, 1]
+    table.X = sparse.hstack(
+        [table.X[:, 0], middle * 0.25, middle * 0.75, table.X[:, 2]],
+        format="csc",
+    )
+    table.var = pd.DataFrame({"mz": [100.0, 200.0, 200.0, 300.0]})
+    table.var_names = pd.Index(["100.0", "200.0-a", "200.0-b", "300.0"])
+    table.n_vars = 4
+    return table
+
+
 def test_kmeans_cluster_zarr_uses_named_sparse_table(monkeypatch):
     table = _msi_table()
     calls = []
@@ -87,6 +100,37 @@ def test_kmeans_cluster_zarr_rejects_different_self_aligned_axes(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("algorithm", ["kmeans", "minibatch"])
+def test_kmeans_cluster_zarr_collapses_legacy_duplicate_mz_columns(
+    monkeypatch,
+    algorithm,
+):
+    tables = {
+        "old.zarr": _msi_table_with_duplicate_mz(),
+        "new.zarr": _msi_table(),
+    }
+    loader = lambda path, _dataset: tables[path.name]
+    monkeypatch.setattr(msi_stats, "_load_zarr_msi_table", loader)
+    monkeypatch.setattr(msi_stats, "_load_zarr_msi_table_lazy", loader)
+
+    result = msi_stats.kmeans_cluster_zarr(
+        ["old.zarr", "new.zarr"],
+        "nano-DESI (Positive)",
+        n_clusters=2,
+        algorithm=algorithm,
+        batch_size=4,
+        min_cluster_size=1,
+    )
+
+    assert result.shape[0] == 8
+    assert result.attrs["n_mz_features"] == 3
+    assert result.attrs["duplicate_mz_columns_collapsed"] == 1
+    assert result.attrs["duplicate_mz_columns_by_source"] == {
+        "old.zarr": 1,
+        "new.zarr": 0,
+    }
+
+
 def test_kmeans_cluster_zarr_requires_pixel_coordinates(monkeypatch):
     table = _msi_table()
     table.obs = table.obs.drop(columns="x")
@@ -98,6 +142,75 @@ def test_kmeans_cluster_zarr_requires_pixel_coordinates(monkeypatch):
             "nano-DESI (Positive)",
             n_clusters=2,
         )
+
+
+def test_kmeans_cluster_zarr_minibatch_streams_spectral_rows(monkeypatch):
+    matrix = sparse.csc_matrix(
+        [
+            [10.0, 1.0, 0.0],
+            [0.0, 1.0, 10.0],
+            [9.0, 1.0, 0.0],
+            [0.0, 1.0, 9.0],
+        ]
+    )
+    requested_rows = []
+    progress_stages = []
+
+    class ComputableBlock:
+        def __init__(self, value):
+            self.value = value
+
+        def compute(self):
+            return self.value
+
+    class LazyMatrix:
+        shape = matrix.shape
+
+        def __getitem__(self, key):
+            row_slice, column_slice = key
+            requested_rows.append((row_slice.start, row_slice.stop))
+            return ComputableBlock(matrix[row_slice, column_slice])
+
+    table = _msi_table()
+    table.X = LazyMatrix()
+    monkeypatch.setattr(msi_stats, "_load_zarr_msi_table_lazy", lambda *_args: table)
+    monkeypatch.setattr(
+        msi_stats,
+        "_load_zarr_msi_table",
+        lambda *_args: pytest.fail("in-memory table loader was used"),
+    )
+    def fake_progress(iterable, *, enabled, total, description):
+        assert enabled is True
+        progress_stages.append((description, total))
+        return iterable
+
+    monkeypatch.setattr(msi_stats, "_progress_batches", fake_progress)
+
+    result = msi_stats.kmeans_cluster_zarr(
+        "campaign.zarr",
+        "nano-DESI (Positive)",
+        n_clusters=2,
+        algorithm="minibatch",
+        batch_size=2,
+        minibatch_epochs=2,
+        min_cluster_size=1,
+        show_progress=True,
+    )
+
+    assert result.loc[0, "cluster"] == result.loc[2, "cluster"]
+    assert result.loc[1, "cluster"] == result.loc[3, "cluster"]
+    assert result.loc[0, "cluster"] != result.loc[1, "cluster"]
+    assert max(stop - start for start, stop in requested_rows) == 2
+    assert result.attrs["algorithm"] == "minibatch"
+    assert result.attrs["out_of_core"] is True
+    assert result.attrs["batch_size"] == 2
+    assert result.attrs["minibatch_epochs"] == 2
+    assert result.attrs["spectral_passes"] == 3
+    assert "kmeans_runtime_warnings" in result.attrs
+    assert progress_stages == [
+        ("Fitting MiniBatchKMeans", 4),
+        ("Assigning clusters", 2),
+    ]
 
 
 def test_mean_spectra_by_cluster_zarr_reuses_cluster_assignments(monkeypatch):
@@ -218,6 +331,41 @@ def test_umap_zarr_rejects_unaligned_campaign(monkeypatch):
             ["first.zarr", "second.zarr"],
             "nano-DESI (Positive)",
         )
+
+
+def test_umap_zarr_collapses_legacy_duplicate_mz_columns(monkeypatch):
+    tables = {
+        "old.zarr": _msi_table_with_duplicate_mz(),
+        "new.zarr": _msi_table(),
+    }
+    captured = {}
+
+    class FakeUMAP:
+        def __init__(self, **_kwargs):
+            pass
+
+        def fit_transform(self, matrix):
+            captured["matrix"] = matrix.toarray() if sparse.issparse(matrix) else matrix
+            return np.zeros((matrix.shape[0], 2), dtype=float)
+
+    monkeypatch.setattr(
+        msi_stats,
+        "_load_zarr_msi_table",
+        lambda path, _dataset: tables[path.name],
+    )
+    monkeypatch.setattr(msi_stats, "_load_umap_class", lambda: FakeUMAP)
+
+    result = msi_stats.umap_zarr(
+        ["old.zarr", "new.zarr"],
+        "nano-DESI (Positive)",
+        tic_normalize=False,
+        svd_components=None,
+    )
+
+    assert captured["matrix"].shape == (8, 3)
+    np.testing.assert_allclose(captured["matrix"][:4], captured["matrix"][4:])
+    assert result.attrs["duplicate_mz_columns_collapsed"] == 1
+    assert result.attrs["n_source_mz_features"] == 3
 
 
 def test_umap_zarr_applies_inclusive_mz_feature_range(monkeypatch):

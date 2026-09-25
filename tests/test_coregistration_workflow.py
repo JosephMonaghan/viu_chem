@@ -662,6 +662,35 @@ def test_embedding_another_msi_dataset_preserves_current_selection_contract(tmp_
     assert {spec["table_key"] for spec in list_coregistration_msi_datasets(host)} == {"msi"}
 
 
+def test_embedding_aligned_imzml_can_skip_thyra_resampling(tmp_path: Path):
+    host = _write_coregistration_store(tmp_path / "host.zarr")
+    converter_calls = []
+
+    def converter(**kwargs):
+        converter_calls.append(kwargs)
+        _write_coregistration_store(
+            Path(kwargs["output_path"]),
+            table_key="source",
+            tic_key="source_tic",
+            pixel_key="source_pixels",
+            include_reference=False,
+            include_roi=False,
+        )
+        return True
+
+    result = embed_msi_dataset(
+        host,
+        tmp_path / "aligned.imzML",
+        dataset_label="Aligned MSI",
+        converter=converter,
+        skip_resampling=True,
+    )
+
+    assert "resampling_config" not in converter_calls[0]
+    assert result["table_key"] == "aligned_msi"
+    assert result["tic_key"] == "aligned_msi_tic"
+
+
 def test_get_msi_table_resolves_display_name_with_one_store_read(tmp_path: Path, monkeypatch):
     host = _write_coregistration_store(tmp_path / "host.zarr")
     source = _write_coregistration_store(

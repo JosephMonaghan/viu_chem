@@ -881,9 +881,10 @@ def convert_input_to_zarr(
     while its Python API requires a non-``None`` ``resampling_config`` to do
     so.  Match the CLI here because a raw union axis for unaligned centroid
     spectra can contain millions of columns and makes interactive ion lookup
-    unnecessarily expensive.  Pass ``resample=False`` to preserve the raw
-    union axis, or provide ``resampling_config`` to override Thyra's automatic
-    method, axis type, or bin width.
+    unnecessarily expensive. Pass ``resample=False`` to preserve the source
+    mass coordinates (or their union for genuinely unaligned spectra), or
+    provide ``resampling_config`` to override Thyra's automatic method, axis
+    type, or bin width.
     """
     src = Path(input_path).expanduser()
     dst = Path(output_path).expanduser() if output_path is not None else _infer_default_zarr_path(src)
@@ -1090,7 +1091,14 @@ def embed_msi_dataset(
     dataset_label: str | None = None,
     registered_cs: str = "registered",
     converter: Any | None = None,
+    skip_resampling: bool = False,
 ) -> dict[str, Any]:
+    """Add an MSI dataset to a coregistration store.
+
+    Set ``skip_resampling=True`` for an imzML whose spectra already share the
+    desired m/z axis. Existing Zarr inputs are copied directly and therefore
+    do not pass through Thyra regardless of this option.
+    """
 
     host_zarr = Path(host_zarr_path).expanduser()
     src = Path(source_path).expanduser()
@@ -1100,7 +1108,12 @@ def embed_msi_dataset(
         source_zarr = src
     else:
         cleanup_dir = tempfile.TemporaryDirectory(prefix="viu_chem_coreg_")
-        source_zarr = convert_input_to_zarr(src, Path(cleanup_dir.name) / f"{src.stem}.zarr", converter=converter)
+        source_zarr = convert_input_to_zarr(
+            src,
+            Path(cleanup_dir.name) / f"{src.stem}.zarr",
+            converter=converter,
+            resample=not skip_resampling,
+        )
 
     try:
         host_sdata = sd.read_zarr(host_zarr)
@@ -3605,17 +3618,32 @@ def prepare_coregistration_zarr(
     annotation_paths: Iterable[str | Path] | None = None,
     registered_cs: str = "registered",
     converter: Any | None = None,
+    skip_resampling: bool = False,
 ) -> Path:
+    """Create or augment a coregistration store from an MSI input.
+
+    Set ``skip_resampling=True`` when the input already uses the exact aligned
+    m/z axis that should be stored.
+    """
     if zarr_path is None:
         if input_path is None:
             raise ValueError("Provide either `zarr_path` or `input_path`.")
-        zarr = convert_input_to_zarr(input_path, converter=converter)
+        zarr = convert_input_to_zarr(
+            input_path,
+            converter=converter,
+            resample=not skip_resampling,
+        )
     else:
         zarr = Path(zarr_path).expanduser()
         if not zarr.exists():
             if input_path is None:
                 raise FileNotFoundError(f"Zarr path does not exist: {zarr}")
-            zarr = convert_input_to_zarr(input_path, zarr, converter=converter)
+            zarr = convert_input_to_zarr(
+                input_path,
+                zarr,
+                converter=converter,
+                resample=not skip_resampling,
+            )
 
     if optical_image_path is not None:
         add_reference_image(zarr, optical_image_path, key="optical", registered_cs=registered_cs)
@@ -3648,6 +3676,7 @@ def prepare_coregistration_batch(
                 annotation_paths=job.get("annotation_paths"),
                 registered_cs=job.get("registered_cs", registered_cs),
                 converter=converter,
+                skip_resampling=job.get("skip_resampling", False),
             )
         )
     return outputs
