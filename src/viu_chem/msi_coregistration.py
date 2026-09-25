@@ -13,6 +13,7 @@ from spatialdata.transformations import (
     Affine,
     Identity,
     get_transformation,
+    remove_transformation,
     set_transformation,
 )
 import imageio.v3 as iio
@@ -364,12 +365,12 @@ def _pixel_size_from_tiff_page(page) -> tuple[float, float] | None:
     return float(unit_um / x_res), float(unit_um / y_res)
 
 
-def _read_tiff_fullres_pixel_size_um(path: Path) -> tuple[float, float] | None:
+def _read_tiff_fullres_pixel_size_um(path: Path, *, series_index: int = 0) -> tuple[float, float] | None:
     try:
         with tifffile.TiffFile(path) as tf:
             pages = []
             try:
-                series = tf.series[0]
+                series = tf.series[int(series_index)]
                 levels = list(getattr(series, "levels", []) or [series])
                 pages.append(levels[0].pages[0])
             except Exception:
@@ -411,11 +412,33 @@ def _annotation_scale_from_pyramid_level(
     return fallback, fallback
 
 
-def _read_qptiff_image(path: Path, *, level: int = 0) -> tuple[np.ndarray, dict[str, Any]]:
+def _select_tiff_series(path: Path, series_index: int | None = None) -> int:
+    """Select an XY TIFF series, preferring the largest scene for slide scans."""
     with tifffile.TiffFile(path) as tf:
         if not tf.series:
             raise ValueError(f"No TIFF series found in {path}")
-        series = tf.series[0]
+        if series_index is not None and int(series_index) >= 0:
+            selected = int(series_index)
+            if selected >= len(tf.series):
+                raise ValueError(f"Requested TIFF series {selected} not available; found 0..{len(tf.series) - 1}")
+            return selected
+        candidates: list[tuple[int, int]] = []
+        for idx, series in enumerate(tf.series):
+            axes = str(getattr(series, "axes", ""))
+            shape = tuple(int(v) for v in getattr(series, "shape", ()))
+            if "X" not in axes or "Y" not in axes or len(shape) != len(axes):
+                continue
+            candidates.append((shape[axes.index("X")] * shape[axes.index("Y")], idx))
+        if not candidates:
+            raise ValueError(f"No 2D image series with X and Y axes found in {path}")
+        return max(candidates)[1]
+
+
+def _read_qptiff_image(path: Path, *, level: int = 0, series_index: int = 0) -> tuple[np.ndarray, dict[str, Any]]:
+    with tifffile.TiffFile(path) as tf:
+        if not tf.series:
+            raise ValueError(f"No TIFF series found in {path}")
+        series = tf.series[int(series_index)]
         levels = list(getattr(series, "levels", []) or [series])
         if level < 0 or level >= len(levels):
             raise ValueError(f"Requested qptiff level {level} not available; found 0..{len(levels) - 1}")
@@ -444,6 +467,7 @@ def _read_qptiff_image(path: Path, *, level: int = 0) -> tuple[np.ndarray, dict[
             "image_to_fullres_scale_x": image_to_fullres_scale_x,
             "image_to_fullres_scale_y": image_to_fullres_scale_y,
             "image_source": "qptiff_pyramid",
+            "tiff_series": int(series_index),
         }
         meta.update(display_meta)
         if channel_names:
@@ -454,15 +478,15 @@ def _read_qptiff_image(path: Path, *, level: int = 0) -> tuple[np.ndarray, dict[
 
 def _is_pyramidal_tiff_path(path: Path) -> bool:
     name = path.name.lower()
-    return name.endswith((".qptiff", ".ome.tif", ".ome.tiff"))
+    return name.endswith((".qptiff", ".ome.tif", ".ome.tiff", ".scn", ".svs", ".ndpi"))
 
 
-def _read_qptiff_pyramid(path: Path) -> tuple[DataTree, dict[str, Any], Any]:
+def _read_qptiff_pyramid(path: Path, *, series_index: int = 0) -> tuple[DataTree, dict[str, Any], Any]:
     """Open a QPTIFF pyramid lazily and convert its native levels to SpatialData."""
     with tifffile.TiffFile(path) as tf:
         if not tf.series:
             raise ValueError(f"No TIFF series found in {path}")
-        series = tf.series[0]
+        series = tf.series[int(series_index)]
         levels = list(getattr(series, "levels", []) or [series])
         axes = str(getattr(series, "axes", ""))
         level_shapes = [tuple(int(v) for v in level.shape) for level in levels]
@@ -472,7 +496,7 @@ def _read_qptiff_pyramid(path: Path) -> tuple[DataTree, dict[str, Any], Any]:
         channel_count = int(display_meta.get("source_channels", 0))
         channel_names, channel_colors = _extract_qptiff_channel_metadata(tf, channel_count) if channel_count else ([], [])
 
-    store = tifffile.imread(path, series=0, aszarr=True)
+    store = tifffile.imread(path, series=int(series_index), aszarr=True)
     try:
         root = zarr.open(store, mode="r")
         if len(level_shapes) == 1 and hasattr(root, "shape"):
@@ -513,6 +537,7 @@ def _read_qptiff_pyramid(path: Path) -> tuple[DataTree, dict[str, Any], Any]:
         "image_to_fullres_scale_x": 1.0,
         "image_to_fullres_scale_y": 1.0,
         "image_source": "qptiff_pyramid_multiscale",
+        "tiff_series": int(series_index),
         "pyramid_level_shapes_yx": [
             [int(shape[y_idx]), int(shape[x_idx])] for shape in level_shapes
         ],
@@ -1612,13 +1637,28 @@ def add_reference_image(
     key: str,
     registered_cs: str = "registered",
     qptiff_level: int | None = None,
+    tiff_series: int | None = None,
+    align_to: str | None = None,
+    image_type: str = "reference",
 ) -> CoregistrationDataset:
-    if key not in {"optical", "hne"}:
-        raise ValueError("Reference image `key` must be either 'optical' or 'hne'.")
-
     host_zarr_path = Path(zarr_path).expanduser()
     dataset = CoregistrationDataset(host_zarr_path, registered_cs=registered_cs)
+    key = sanitize_name(key)
+    if not key:
+        raise ValueError("Reference image `key` must contain at least one letter or number.")
+    if key in {str(spec["tic_key"]) for spec in _infer_msi_dataset_specs(dataset.sdata)}:
+        raise ValueError(f"Reference image key {key!r} conflicts with an MSI image.")
+    if align_to is not None and align_to not in dataset.sdata.images:
+        raise ValueError(f"Reference anchor image not found: {align_to}")
     saved_display_settings: dict[str, Any] = {}
+    saved_registered_transform = None
+    if key in dataset.sdata.images:
+        try:
+            saved_registered_transform = get_transformation(
+                dataset.sdata.images[key], to_coordinate_system=registered_cs
+            )
+        except Exception:
+            pass
     try:
         root = zarr.open_group(host_zarr_path, mode="r", use_consolidated=False)
         if "images" in root and key in root["images"]:
@@ -1630,10 +1670,13 @@ def add_reference_image(
     source_path = Path(image_path).expanduser()
     qptiff_meta: dict[str, Any] = {}
     pyramid_store = None
+    selected_series = _select_tiff_series(source_path, tiff_series) if _is_pyramidal_tiff_path(source_path) else 0
     if _is_pyramidal_tiff_path(source_path) and qptiff_level is None:
-        element, qptiff_meta, pyramid_store = _read_qptiff_pyramid(source_path)
+        element, qptiff_meta, pyramid_store = _read_qptiff_pyramid(source_path, series_index=selected_series)
     elif _is_pyramidal_tiff_path(source_path):
-        img, qptiff_meta = _read_qptiff_image(source_path, level=int(qptiff_level))
+        img, qptiff_meta = _read_qptiff_image(
+            source_path, level=int(qptiff_level), series_index=selected_series
+        )
         element = _parse_image_to_spatial(img, channel_names=qptiff_meta.get("channel_names"))
     else:
         img = iio.imread(source_path)
@@ -1642,7 +1685,7 @@ def add_reference_image(
     px_um_x = 2.54
     px_um_y = 2.54
     pixel_size_source = "fallback_10000dpi"
-    tiff_pixel_size = _read_tiff_fullres_pixel_size_um(source_path)
+    tiff_pixel_size = _read_tiff_fullres_pixel_size_um(source_path, series_index=selected_series)
     if tiff_pixel_size is not None:
         px_um_x, px_um_y = tiff_pixel_size
         pixel_size_source = "tifffile_metadata"
@@ -1672,6 +1715,9 @@ def add_reference_image(
     element.attrs["pixel_size_y_um"] = float(px_um_y)
     element.attrs["pixel_size_source"] = pixel_size_source
     element.attrs["source_path"] = str(source_path)
+    element.attrs["image_type"] = str(image_type)
+    element.attrs["common_coordinate_system"] = str(registered_cs)
+    element.attrs["alignment_anchor"] = str(align_to or "")
     if saved_display_settings:
         element.attrs["if_display_settings"] = saved_display_settings
     for attr_key, attr_value in qptiff_meta.items():
@@ -1680,7 +1726,28 @@ def add_reference_image(
         element.attrs[attr_key] = attr_value
 
     set_transformation(element, Identity(), to_coordinate_system="global")
-    set_transformation(element, Identity(), to_coordinate_system=registered_cs)
+    registered_transform = saved_registered_transform
+    if registered_transform is None and align_to is not None:
+        anchor = dataset.sdata.images[align_to]
+        anchor_transform = _xy_matrix_from_transform(
+            get_transformation(anchor, to_coordinate_system=registered_cs)
+        )
+        anchor_attrs = getattr(anchor, "attrs", {})
+        anchor_px_x = float(anchor_attrs.get("pixel_size_x_um", px_um_x))
+        anchor_px_y = float(anchor_attrs.get("pixel_size_y_um", px_um_y))
+        initial_xy = anchor_transform @ np.diag(
+            [float(px_um_x) / anchor_px_x, float(px_um_y) / anchor_px_y, 1.0]
+        )
+        registered_transform = Affine(
+            initial_xy,
+            input_axes=("x", "y"),
+            output_axes=("x", "y"),
+        )
+    set_transformation(
+        element,
+        registered_transform if registered_transform is not None else Identity(),
+        to_coordinate_system=registered_cs,
+    )
     try:
         _write_element_to_existing_store(
             host_zarr_path,
@@ -1698,6 +1765,9 @@ def add_reference_image(
         "pixel_size_y_um": float(px_um_y),
         "pixel_size_source": pixel_size_source,
         "source_path": str(source_path),
+        "image_type": str(image_type),
+        "common_coordinate_system": str(registered_cs),
+        "alignment_anchor": str(align_to or ""),
         **qptiff_meta,
     }
     if saved_display_settings:
@@ -1708,6 +1778,117 @@ def add_reference_image(
     dataset.sdata = sd.read_zarr(host_zarr_path)
     _attach_stored_image_attrs(dataset.sdata, host_zarr_path)
     return dataset
+
+
+def set_reference_image_as_coordinate_system_anchor(
+    zarr_path: str | Path,
+    reference_key: str,
+    *,
+    coordinate_system: str = "registered",
+) -> None:
+    """Rebase a common coordinate system so ``reference_key`` becomes identity.
+
+    Every element already mapped into the coordinate system is composed with
+    the inverse anchor transform, preserving all relative alignments.
+    """
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    if reference_key not in sdata.images:
+        raise KeyError(f"Reference image not found: {reference_key}")
+    anchor_xy = _xy_matrix_from_transform(
+        get_transformation(sdata.images[reference_key], to_coordinate_system=coordinate_system)
+    )
+    inverse_anchor = np.linalg.inv(anchor_xy)
+    updated: list[str] = []
+    for collection_name in ("images", "labels", "points", "shapes"):
+        collection = getattr(sdata, collection_name)
+        for element_name, element in collection.items():
+            try:
+                current_xy = _xy_matrix_from_transform(
+                    get_transformation(element, to_coordinate_system=coordinate_system)
+                )
+            except Exception:
+                continue
+            rebased = inverse_anchor @ current_xy
+            set_transformation(
+                element,
+                Affine(rebased, input_axes=("x", "y"), output_axes=("x", "y")),
+                to_coordinate_system=coordinate_system,
+            )
+            sdata.write_transformations(element_name)
+            updated.append(element_name)
+    if not updated:
+        raise ValueError(f"No elements are mapped to coordinate system {coordinate_system!r}.")
+    sdata.write_metadata(consolidate_metadata=True)
+
+
+def rename_coordinate_system(
+    zarr_path: str | Path,
+    old_name: str,
+    new_name: str,
+    *,
+    keep_old: bool = False,
+    overwrite: bool = False,
+) -> int:
+    """Rename a SpatialData coordinate system without changing alignment."""
+    old_name = str(old_name).strip()
+    new_name = sanitize_name(new_name)
+    if not old_name or not new_name:
+        raise ValueError("Both old and new coordinate-system names are required.")
+    if old_name == new_name:
+        return 0
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    if old_name not in sdata.coordinate_systems:
+        raise KeyError(f"Coordinate system not found: {old_name}")
+    changed: list[str] = []
+    for _element_type, element_name, element in sdata.gen_spatial_elements():
+        transformations = get_transformation(element, get_all=True)
+        if old_name not in transformations:
+            continue
+        if new_name in transformations and not overwrite:
+            raise ValueError(
+                f"Element {element_name!r} already maps to coordinate system {new_name!r}."
+            )
+        set_transformation(element, transformations[old_name], to_coordinate_system=new_name)
+        if not keep_old:
+            remove_transformation(element, to_coordinate_system=old_name)
+        changed.append(element_name)
+    if not changed:
+        raise ValueError(f"No elements map to coordinate system {old_name!r}.")
+    for element_name in changed:
+        sdata.write_transformations(element_name)
+    sdata.write_metadata(consolidate_metadata=True)
+
+    root = zarr.open_group(Path(zarr_path).expanduser(), mode="r+", use_consolidated=False)
+    if "images" in root:
+        for image_group in root["images"].groups():
+            group = image_group[1]
+            if group.attrs.get("common_coordinate_system") == old_name:
+                group.attrs["common_coordinate_system"] = new_name
+    zarr.consolidate_metadata(Path(zarr_path).expanduser())
+    return len(changed)
+
+
+def save_reference_registration(
+    zarr_path: str | Path,
+    reference_key: str,
+    transform_xy: np.ndarray,
+    *,
+    coordinate_system: str = "registered",
+) -> None:
+    """Persist one reference image affine into a SpatialData coordinate system."""
+    matrix = np.asarray(transform_xy, dtype=float)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("Reference registration must be a finite 3 x 3 affine matrix.")
+    sdata = sd.read_zarr(Path(zarr_path).expanduser())
+    if reference_key not in sdata.images:
+        raise KeyError(f"Reference image not found: {reference_key}")
+    set_transformation(
+        sdata.images[reference_key],
+        Affine(matrix, input_axes=("x", "y"), output_axes=("x", "y")),
+        to_coordinate_system=coordinate_system,
+    )
+    sdata.write_transformations(reference_key)
+    sdata.write_metadata(consolidate_metadata=True)
 
 
 def import_geojson_annotations(

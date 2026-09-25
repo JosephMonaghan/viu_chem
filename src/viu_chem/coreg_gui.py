@@ -83,9 +83,12 @@ from .msi_coregistration import (
     prepare_coregistration_zarr,
     prepare_ion_for_display,
     rename_msi_dataset,
+    rename_coordinate_system,
     rescale_registration_between_pyramid_levels,
     sanitize_name,
     save_coregistration,
+    save_reference_registration,
+    set_reference_image_as_coordinate_system_anchor,
     sitk_affine_from_fixed_to_moving_matrix,
     sitk_transform_to_homogeneous_matrix,
     transform_geojson_annotations,
@@ -950,6 +953,17 @@ def launch_coregistration_gui(
             )
             _apply_reference_layer_gamma(layer, float(metadata.get("reference_gamma", 1.0)))
             reference_layers[key] = [layer]
+        try:
+            reference_xy = _api._xy_matrix_from_transform(
+                get_transformation(image, to_coordinate_system=registered_cs)
+            )
+            reference_yx = xy_to_yx_matrix(reference_xy)
+            for layer in _reference_layer_list(key):
+                layer.affine = reference_yx
+                layer.scale = (1.0, 1.0)
+                layer.translate = (0.0, 0.0)
+        except Exception:
+            pass
         enforce_reference_layers_at_bottom()
         _refresh_if_toolbox_widgets(preferred_layer_name=str(_reference_layer_list(key)[0].name))
 
@@ -4052,6 +4066,104 @@ def launch_coregistration_gui(
         if str(target_state["id"]) == str(active_dataset_label):
             sync_controls_to_active_dataset()
 
+    reference_alignment_state: dict[str, Any] = {
+        "moving_key": None,
+        "moving_layer": None,
+        "previous_display": {},
+    }
+
+    @magicgui(
+        moving_image={"widget_type": "ComboBox", "choices": ["(none)"]},
+        fixed_image={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Start Reference Alignment",
+    )
+    def reference_alignment_widget(moving_image: str = "(none)", fixed_image: str = "(none)"):
+        moving_key = str(moving_image)
+        fixed_key = str(fixed_image)
+        if moving_key == fixed_key or moving_key not in reference_layers or fixed_key not in reference_layers:
+            QMessageBox.warning(None, "Reference Alignment", "Choose different moving and fixed images.")
+            return
+        moving_layers = _reference_layer_list(moving_key)
+        fixed_layers = _reference_layer_list(fixed_key)
+        reference_alignment_state["previous_display"] = {
+            id(layer): (bool(layer.visible), float(layer.opacity))
+            for layer in _reference_channel_layers()
+        }
+        for layer in _reference_channel_layers():
+            layer.visible = layer in moving_layers or layer in fixed_layers
+        for layer in fixed_layers:
+            layer.opacity = 1.0
+        for idx, layer in enumerate(moving_layers):
+            layer.visible = idx == 0
+            layer.opacity = 0.55
+
+        # Reorder only the selected pair: fixed below, translucent moving above.
+        for target_index, layer in enumerate([*fixed_layers, *moving_layers]):
+            try:
+                viewer.layers.move(viewer.layers.index(layer), target_index)
+            except Exception:
+                pass
+        moving_layer = moving_layers[0]
+        reference_alignment_state["moving_key"] = moving_key
+        reference_alignment_state["moving_layer"] = moving_layer
+        try:
+            viewer.layers.selection.active = moving_layer
+            moving_layer.mode = "transform"
+        except Exception:
+            pass
+
+    @magicgui(call_button="Save Reference Alignment")
+    def save_reference_alignment_widget():
+        moving_key = reference_alignment_state.get("moving_key")
+        moving_layer = reference_alignment_state.get("moving_layer")
+        if moving_key is None or moving_layer is None:
+            QMessageBox.warning(None, "Reference Alignment", "Start a reference alignment first.")
+            return
+        affine_yx = np.asarray(moving_layer.affine.affine_matrix, dtype=float)
+        if affine_yx.shape != (3, 3):
+            affine_yx = affine_yx[-3:, -3:]
+        affine_xy = xy_to_yx_matrix(affine_yx)
+        state = get_active_state()
+        _run_with_busy_dialog(
+            "Save Reference Alignment",
+            "Saving reference-image transform...",
+            lambda: save_reference_registration(
+                state["dataset"].zarr_path,
+                str(moving_key),
+                affine_xy,
+                coordinate_system=registered_cs,
+            ),
+        )
+        for layer in _reference_layer_list(str(moving_key)):
+            layer.affine = affine_yx
+            try:
+                layer.mode = "pan_zoom"
+            except Exception:
+                pass
+        refresh_datasets_after_reference_update()
+        reference_alignment_state["moving_key"] = None
+        reference_alignment_state["moving_layer"] = None
+        QMessageBox.information(
+            None,
+            "Reference Alignment",
+            f"Saved {moving_key!r} into coordinate system {registered_cs!r}.",
+        )
+
+    @magicgui(call_button="Restore Reference Visibility")
+    def restore_reference_visibility_widget():
+        previous = reference_alignment_state.get("previous_display", {})
+        for layer in _reference_channel_layers():
+            visible, opacity = previous.get(id(layer), (bool(layer.visible), float(layer.opacity)))
+            layer.visible = visible
+            layer.opacity = opacity
+            try:
+                layer.mode = "pan_zoom"
+            except Exception:
+                pass
+        reference_alignment_state["moving_key"] = None
+        reference_alignment_state["moving_layer"] = None
+        enforce_reference_layers_at_bottom()
+
     msi_layer_controls = QWidget()
     msi_layer_controls_layout = QGridLayout(msi_layer_controls)
     msi_layer_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -4682,6 +4794,22 @@ def launch_coregistration_gui(
         optimize_affine_registration_widget.reference_channel.choices = _reference_channel_choice_names()
         if optimize_affine_registration_widget.reference_channel.value not in optimize_affine_registration_widget.reference_channel.choices:
             optimize_affine_registration_widget.reference_channel.value = optimize_affine_registration_widget.reference_channel.choices[0]
+        reference_keys = list(coreg_dataset.reference_image_keys)
+        add_reference_image_widget.align_to.choices = ["(coordinate system origin)", *reference_keys]
+        if add_reference_image_widget.align_to.value not in add_reference_image_widget.align_to.choices:
+            add_reference_image_widget.align_to.value = add_reference_image_widget.align_to.choices[0]
+        set_coordinate_anchor_widget.reference_image.choices = reference_keys or ["(none)"]
+        if set_coordinate_anchor_widget.reference_image.value not in set_coordinate_anchor_widget.reference_image.choices:
+            set_coordinate_anchor_widget.reference_image.value = set_coordinate_anchor_widget.reference_image.choices[0]
+        coordinate_systems = list(coreg_dataset.sdata.coordinate_systems)
+        select_coordinate_system_widget.coordinate_system.choices = coordinate_systems
+        if registered_cs in coordinate_systems:
+            select_coordinate_system_widget.coordinate_system.value = registered_cs
+        rename_coordinate_system_widget.old_name.choices = coordinate_systems
+        if registered_cs in coordinate_systems:
+            rename_coordinate_system_widget.old_name.value = registered_cs
+        reference_alignment_widget.moving_image.choices = reference_keys or ["(none)"]
+        reference_alignment_widget.fixed_image.choices = reference_keys or ["(none)"]
         try:
             alignment_active_dataset_label.setText(f"Active dataset: {state['label']}")
         except Exception:
@@ -4772,6 +4900,141 @@ def launch_coregistration_gui(
         refresh_all_landmark_numbering()
         state["ion_layer"].visible = True
         set_active_dataset(str(state["id"]))
+
+    @magicgui(
+        layer_name={"widget_type": "LineEdit", "label": "Layer name"},
+        image_type={
+            "widget_type": "ComboBox",
+            "choices": ["H&E / brightfield", "Immunofluorescence", "Other reference"],
+        },
+        align_to={"widget_type": "ComboBox", "choices": ["(coordinate system origin)"]},
+        tiff_series={"widget_type": "SpinBox", "min": -1, "max": 1000, "step": 1, "label": "TIFF/SCN series (-1 = auto)"},
+        pyramid_level={"widget_type": "SpinBox", "min": -1, "max": 32, "step": 1, "label": "Pyramid level (-1 = all)"},
+        call_button="Add Reference Image",
+    )
+    def add_reference_image_widget(
+        layer_name: str = "hne",
+        image_type: str = "H&E / brightfield",
+        align_to: str = "(coordinate system origin)",
+        tiff_series: int = -1,
+        pyramid_level: int = -1,
+    ):
+        state = get_active_state()
+        coreg_dataset = state["dataset"]
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select reference image",
+            "",
+            "Whole-slide and image files (*.scn *.svs *.ndpi *.qptiff *.ome.tif *.ome.tiff *.tif *.tiff *.png *.jpg *.jpeg);;All files (*)",
+        )
+        if not path:
+            return
+        key = sanitize_name(layer_name) or sanitize_name(Path(path).stem)
+        anchor = None if align_to == "(coordinate system origin)" else str(align_to)
+        _run_with_busy_dialog(
+            "Add Reference Image",
+            "Importing reference image...\nWhole-slide pyramids can take a little while.",
+            lambda: add_reference_image(
+                coreg_dataset.zarr_path,
+                path,
+                key=key,
+                registered_cs=registered_cs,
+                qptiff_level=(int(pyramid_level) if int(pyramid_level) >= 0 else None),
+                tiff_series=(int(tiff_series) if int(tiff_series) >= 0 else None),
+                align_to=anchor,
+                image_type=image_type,
+            ),
+        )
+        _run_with_busy_dialog(
+            "Add Reference Image",
+            "Refreshing reference image layers...",
+            refresh_datasets_after_reference_update,
+        )
+        if key not in coreg_dataset.reference_image_keys:
+            coreg_dataset.reference_image_keys.append(key)
+        add_or_update_reference_layer(coreg_dataset, key)
+        sync_controls_to_active_dataset()
+
+    @magicgui(
+        reference_image={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Use As Common Coordinate Anchor",
+    )
+    def set_coordinate_anchor_widget(reference_image: str = "(none)"):
+        if reference_image == "(none)":
+            return
+        state = get_active_state()
+        _run_with_busy_dialog(
+            "Set Coordinate Anchor",
+            "Rebasing stored transformations...",
+            lambda: set_reference_image_as_coordinate_system_anchor(
+                state["dataset"].zarr_path,
+                str(reference_image),
+                coordinate_system=registered_cs,
+            ),
+        )
+        refresh_datasets_after_reference_update()
+        for key in state["dataset"].reference_image_keys:
+            add_or_update_reference_layer(state["dataset"], key, visible=bool(_reference_layer_list(key)[0].visible))
+        for dataset_state in datasets.values():
+            loaded, found = dataset_state["dataset"].load_saved_registration_if_available()
+            if found:
+                dataset_state["current_transform_xy"][:] = loaded
+                apply_transform_to_state(dataset_state)
+        sync_controls_to_active_dataset()
+
+    @magicgui(
+        coordinate_system={"widget_type": "ComboBox", "choices": [registered_cs]},
+        call_button="Use Selected Coordinate System",
+    )
+    def select_coordinate_system_widget(coordinate_system: str = registered_cs):
+        nonlocal registered_cs
+        selected = str(coordinate_system)
+        state = get_active_state()
+        if selected not in state["dataset"].sdata.coordinate_systems:
+            QMessageBox.warning(None, "Coordinate System", f"Coordinate system not found: {selected}")
+            return
+        registered_cs = selected
+        for dataset_state in datasets.values():
+            dataset_state["dataset"].registered_cs = selected
+            loaded, found = dataset_state["dataset"].load_saved_registration_if_available()
+            if found:
+                dataset_state["current_transform_xy"][:] = loaded
+                apply_transform_to_state(dataset_state)
+        for key in state["dataset"].reference_image_keys:
+            layers = _reference_layer_list(key)
+            add_or_update_reference_layer(
+                state["dataset"], key, visible=bool(layers and layers[0].visible)
+            )
+        sync_controls_to_active_dataset()
+
+    @magicgui(
+        old_name={"widget_type": "ComboBox", "choices": [registered_cs]},
+        new_name={"widget_type": "LineEdit", "label": "New coordinate-system name"},
+        keep_old={"widget_type": "CheckBox", "label": "Keep old name as an alias"},
+        call_button="Rename Coordinate System",
+    )
+    def rename_coordinate_system_widget(
+        old_name: str = registered_cs,
+        new_name: str = "if_aligned",
+        keep_old: bool = False,
+    ):
+        renamed = sanitize_name(new_name)
+        if not renamed:
+            QMessageBox.warning(None, "Rename Coordinate System", "Enter a new coordinate-system name.")
+            return
+        state = get_active_state()
+        _run_with_busy_dialog(
+            "Rename Coordinate System",
+            "Updating SpatialData transformations...",
+            lambda: rename_coordinate_system(
+                state["dataset"].zarr_path,
+                str(old_name),
+                renamed,
+                keep_old=bool(keep_old),
+            ),
+        )
+        refresh_datasets_after_reference_update()
+        select_coordinate_system_widget(coordinate_system=renamed)
 
     @magicgui(call_button="Add/Update Optical")
     def add_optical_image():
@@ -5278,6 +5541,16 @@ def launch_coregistration_gui(
     alignment_dialog_container_layout.setSpacing(8)
     alignment_active_dataset_label = QLabel("")
     alignment_dialog_container_layout.addWidget(alignment_active_dataset_label)
+    alignment_dialog_container_layout.addWidget(QLabel("Reference-to-reference alignment"))
+    alignment_dialog_container_layout.addWidget(reference_alignment_widget.native)
+    alignment_dialog_container_layout.addWidget(save_reference_alignment_widget.native)
+    alignment_dialog_container_layout.addWidget(restore_reference_visibility_widget.native)
+    reference_alignment_help = QLabel(
+        "Choose the added image as moving and IF as fixed. Use the transform handles "
+        "on the canvas, then save the reference alignment."
+    )
+    reference_alignment_help.setWordWrap(True)
+    alignment_dialog_container_layout.addWidget(reference_alignment_help)
     alignment_dialog_container_layout.addWidget(QLabel("Landmark picking"))
     alignment_dialog_container_layout.addWidget(pick_msi_landmarks_widget.native)
     alignment_dialog_container_layout.addWidget(pick_reference_landmarks_widget.native)
@@ -5311,6 +5584,8 @@ def launch_coregistration_gui(
             key for key in state["dataset"].reference_image_keys
             if key in state["dataset"].sdata.images
         ]
+        reference_alignment_widget.moving_image.choices = reference_choices or ["(none)"]
+        reference_alignment_widget.fixed_image.choices = reference_choices or ["(none)"]
         rescale_registration_pyramid_widget.reference_image.choices = reference_choices or ["(none)"]
         if rescale_registration_pyramid_widget.reference_image.value not in rescale_registration_pyramid_widget.reference_image.choices:
             rescale_registration_pyramid_widget.reference_image.value = rescale_registration_pyramid_widget.reference_image.choices[0]
@@ -5546,6 +5821,10 @@ def launch_coregistration_gui(
     add_data_dialog_container_layout.setContentsMargins(4, 4, 4, 4)
     add_data_dialog_container_layout.setSpacing(8)
     add_data_dialog_container_layout.addWidget(add_msi_dataset.native)
+    add_data_dialog_container_layout.addWidget(QLabel("Reference images and coordinate system"))
+    add_data_dialog_container_layout.addWidget(add_reference_image_widget.native)
+    add_data_dialog_container_layout.addWidget(set_coordinate_anchor_widget.native)
+    add_data_dialog_container_layout.addWidget(QLabel("Legacy named reference importers"))
     add_data_dialog_container_layout.addWidget(add_optical_image.native)
     add_data_dialog_container_layout.addWidget(add_hne_image.native)
     add_data_dialog_container_layout.addWidget(add_hne_from_qptiff.native)
@@ -5585,6 +5864,9 @@ def launch_coregistration_gui(
     data_management_dialog_layout = QVBoxLayout(data_management_dialog)
     data_management_dialog_layout.setContentsMargins(8, 8, 8, 8)
     data_management_dialog_layout.setSpacing(8)
+    data_management_dialog_layout.addWidget(QLabel("Common coordinate system"))
+    data_management_dialog_layout.addWidget(select_coordinate_system_widget.native)
+    data_management_dialog_layout.addWidget(rename_coordinate_system_widget.native)
     data_management_dialog_layout.addWidget(remove_msi_dataset_from_zarr_widget.native)
     data_management_dialog_layout.addWidget(remove_annotation_from_zarr_widget.native)
     data_management_dialog_layout.addStretch(1)

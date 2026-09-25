@@ -15,7 +15,7 @@ pytest.importorskip("shapely")
 
 from shapely.geometry import box
 from spatialdata.models import Image2DModel, ShapesModel, TableModel, get_channel_names
-from spatialdata.transformations import Identity, get_transformation, set_transformation
+from spatialdata.transformations import Affine, Identity, get_transformation, set_transformation
 
 from viu_chem.coreg_figures import get_coregistered_ion_image
 from viu_chem.msi_coregistration import (
@@ -35,9 +35,12 @@ from viu_chem.msi_coregistration import (
     import_geojson_annotations,
     list_coregistration_msi_datasets,
     rename_msi_dataset,
+    rename_coordinate_system,
     rescale_registration_between_pyramid_levels,
     sample_reference_channel_values_at_msi_pixels,
     save_coregistration,
+    save_reference_registration,
+    set_reference_image_as_coordinate_system_anchor,
     sitk_affine_from_fixed_to_moving_matrix,
     sitk_transform_to_homogeneous_matrix,
 )
@@ -553,6 +556,109 @@ def test_qptiff_reference_ingestion_preserves_native_lazy_pyramid(tmp_path: Path
     assert image.attrs["image_source"] == "qptiff_pyramid_multiscale"
     assert image.attrs["pyramid_level_shapes_yx"] == [[64, 80], [32, 40], [16, 20]]
     np.testing.assert_array_equal(np.asarray(levels[0][0, :2, :3]), full[0, :2, :3])
+
+
+def test_scn_ingestion_selects_largest_scene_and_accepts_custom_layer_name(tmp_path: Path):
+    import tifffile
+
+    store = _write_coregistration_store(
+        tmp_path / "scn.zarr",
+        include_reference=False,
+        include_roi=False,
+    )
+    slide_path = tmp_path / "histology.scn"
+    thumbnail = np.zeros((8, 10, 3), dtype=np.uint8)
+    full = np.arange(32 * 40 * 3, dtype=np.uint16).reshape(32, 40, 3)
+    with tifffile.TiffWriter(slide_path) as tif:
+        tif.write(thumbnail, photometric="rgb")
+        tif.write(full, photometric="rgb", tile=(16, 16), subifds=1)
+        tif.write(full[::2, ::2], photometric="rgb", tile=(16, 16), subfiletype=1)
+
+    dataset = add_reference_image(
+        store,
+        slide_path,
+        key="Histology scan 1",
+        image_type="H&E / brightfield",
+    )
+    image = dataset.sdata.images["histology_scan_1"]
+    levels = _multiscale_image_levels(image)
+
+    assert [level.shape for level in levels] == [(3, 32, 40), (3, 16, 20)]
+    assert image.attrs["tiff_series"] == 1
+    assert image.attrs["image_type"] == "H&E / brightfield"
+    assert "registered" in dataset.sdata.coordinate_systems
+
+
+def test_reference_image_can_rebase_common_coordinate_system(tmp_path: Path):
+    store = _write_coregistration_store(tmp_path / "rebase.zarr")
+    sdata = sd.read_zarr(store)
+    anchor_xy = np.array([[2.0, 0.0, 10.0], [0.0, 2.0, -4.0], [0.0, 0.0, 1.0]])
+    msi_xy = np.array([[3.0, 0.0, 13.0], [0.0, 3.0, 2.0], [0.0, 0.0, 1.0]])
+    set_transformation(
+        sdata.images["hne"],
+        Affine(anchor_xy, input_axes=("x", "y"), output_axes=("x", "y")),
+        to_coordinate_system="registered",
+    )
+    set_transformation(
+        sdata.images["msi_tic"],
+        Affine(msi_xy, input_axes=("x", "y"), output_axes=("x", "y")),
+        to_coordinate_system="registered",
+    )
+    sdata.write_transformations("hne")
+    sdata.write_transformations("msi_tic")
+
+    set_reference_image_as_coordinate_system_anchor(store, "hne")
+
+    reloaded = sd.read_zarr(store)
+    np.testing.assert_allclose(
+        _xy_matrix_from_transform(get_transformation(reloaded.images["hne"], to_coordinate_system="registered")),
+        np.eye(3),
+    )
+    np.testing.assert_allclose(
+        _xy_matrix_from_transform(get_transformation(reloaded.images["msi_tic"], to_coordinate_system="registered")),
+        np.linalg.inv(anchor_xy) @ msi_xy,
+    )
+
+
+def test_coordinate_system_can_be_renamed_without_changing_transforms(tmp_path: Path):
+    store = _write_coregistration_store(tmp_path / "rename-coordinate-system.zarr")
+    before = sd.read_zarr(store)
+    expected = {
+        name: _xy_matrix_from_transform(get_transformation(element, to_coordinate_system="registered"))
+        for _kind, name, element in before.gen_spatial_elements()
+        if "registered" in get_transformation(element, get_all=True)
+    }
+
+    changed = rename_coordinate_system(store, "registered", "IF aligned")
+
+    reloaded = sd.read_zarr(store)
+    assert changed == len(expected)
+    assert "if_aligned" in reloaded.coordinate_systems
+    assert "registered" not in reloaded.coordinate_systems
+    for _kind, name, element in reloaded.gen_spatial_elements():
+        if name in expected:
+            np.testing.assert_allclose(
+                _xy_matrix_from_transform(get_transformation(element, to_coordinate_system="if_aligned")),
+                expected[name],
+            )
+
+
+def test_reference_registration_affine_is_persisted(tmp_path: Path):
+    store = _write_coregistration_store(tmp_path / "reference-registration.zarr")
+    transform_xy = np.array(
+        [[0.9, -0.2, 14.0], [0.1, 1.1, -8.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+
+    save_reference_registration(store, "hne", transform_xy)
+
+    reloaded = sd.read_zarr(store)
+    np.testing.assert_allclose(
+        _xy_matrix_from_transform(
+            get_transformation(reloaded.images["hne"], to_coordinate_system="registered")
+        ),
+        transform_xy,
+    )
 
 
 def test_registration_affine_can_be_converted_between_reference_pyramid_levels(tmp_path: Path):

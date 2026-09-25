@@ -43,6 +43,13 @@ If the zarr already exists, you can add data incrementally:
 
    add_reference_image("sample.zarr", "sample_hne.tif", key="hne")
    add_reference_image("sample.zarr", "sample_if.qptiff", key="optical")
+   add_reference_image(
+       "sample.zarr",
+       "whole_slide.scn",
+       key="hne_whole_slide",
+       image_type="H&E / brightfield",
+       align_to="optical",
+   )
 
    embed_msi_dataset(
        "sample.zarr",
@@ -65,11 +72,39 @@ an automatic resampling configuration for unaligned inputs. The **Add MSI
 Dataset** tool exposes the same option as an unchecked checkbox. Existing Zarr
 inputs are copied directly and are never resampled.
 
-QPTIFF and OME-TIFF reference images are imported as chunked multiscale
-images by default. Napari then selects a pyramid level as the view is zoomed,
-without loading the full-resolution plane into memory. Pass an explicit
+QPTIFF, OME-TIFF, Leica SCN, SVS, and NDPI reference images are imported as
+chunked multiscale images by default. For multi-scene whole-slide files the
+largest XY scene is selected automatically; pass ``tiff_series`` to override
+that choice. Napari then selects a pyramid level as the view is zoomed, without
+loading the full-resolution plane into memory. Reference keys are arbitrary
+sanitized names, so a store can contain multiple H&E, IF, or other images.
+Pass ``align_to`` to initialize a new image in the anchor image's physical
+pixel scale within the common coordinate system. Pass an explicit
 ``qptiff_level`` to ``add_reference_image`` only when a single pyramid level
 is desired. In the GUI's QPTIFF importer, ``-1`` selects the complete pyramid.
+The generic **Add Reference Image** GUI supports the same options. **Use As
+Common Coordinate Anchor** rebases every SpatialData element mapped to the
+``registered`` coordinate system so the selected image has an identity
+transform while all relative alignments are preserved. This follows the
+SpatialData model in which each element maps into a named common coordinate
+system through its own transformation.
+
+Image element names and coordinate-system names are independent. For example,
+an image element named ``hne`` can map to a common coordinate system named
+``if_aligned``. In **Data Management**, use **Use Selected Coordinate System**
+to switch the GUI without changing the zarr, or **Rename Coordinate System**
+to migrate the stored name while preserving every transform. The optional
+**Keep old name as an alias** checkbox writes both names. The same migration is
+available programmatically:
+
+.. code-block:: python
+
+   from viu_chem.msi_coregistration import rename_coordinate_system
+
+   rename_coordinate_system("sample.zarr", "hne", "if_aligned")
+
+You can also select an existing name when launching the GUI with
+``launch_coregistration_gui(..., registered_cs="if_aligned")``.
 If a registration was fitted against a lower-resolution level, use **Alignment
 Tools > Registration > Convert Active Affine** to convert it to another level
 (``0`` is full resolution). The conversion updates the live overlay for review;
@@ -106,6 +141,15 @@ a compact left dock column to leave more room for the image canvas.
 Inside the GUI, use the alignment tools to adjust landmarks, optimize the
 affine registration, and save the active transform. The saved transform is
 written to the SpatialData coordinate system named ``registered`` by default.
+To align an added H&E/whole-slide image to IF, open **Alignment Tools**, choose
+the H&E layer as **Moving image** and the IF layer as **Fixed image**, then
+select **Start Reference Alignment**. Napari's transform handles can translate,
+rotate, and scale the moving image. Select **Save Reference Alignment** to
+write that affine to the common SpatialData coordinate system. Alignment mode
+temporarily solos the two selected references, keeps the fixed IF pyramid
+underneath, and makes the moving image translucent; each layer retains its own
+independent multiscale pyramid. **Restore Reference Visibility** returns the
+previous visibility and opacity settings.
 For a translation-only adjustment, open **Translation Alignment**, choose the
 reference image or channel, select **Start dragging**, and left-drag in the
 canvas until the active ion image overlaps the reference. The tool preserves
