@@ -100,9 +100,19 @@ open an existing zarr or convert an input path first.
 
    coreg_gui.launch_coregistration_gui(zarr_path="sample.zarr")
 
+The viewer opens with the active ion layer in napari's pan/zoom mode and uses
+a compact left dock column to leave more room for the image canvas.
+
 Inside the GUI, use the alignment tools to adjust landmarks, optimize the
 affine registration, and save the active transform. The saved transform is
 written to the SpatialData coordinate system named ``registered`` by default.
+For a translation-only adjustment, open **Translation Alignment**, choose the
+reference image or channel, select **Start dragging**, and left-drag in the
+canvas until the active ion image overlaps the reference. The tool preserves
+the affine's scale, rotation, and shear. Use **Save Active Registration** in
+that window to persist the translated transform. **Undo last drag** toggles
+between the positions before and after the most recent drag, and Alt-drag
+remains available for napari's box zoom.
 When multiple MSI datasets are embedded, each dataset can have its own saved
 MSI-to-reference transform. Intensity-based optimization supports mutual
 information and normalized cross-correlation through the **Metric** control.

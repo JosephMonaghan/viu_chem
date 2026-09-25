@@ -29,6 +29,7 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -36,6 +37,7 @@ from qtpy.QtWidgets import (
     QProgressDialog,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -93,6 +95,24 @@ from .msi_coregistration import (
 globals().update({name: getattr(_api, name) for name in dir(_api) if not name.startswith("__")})
 
 _QT_APP = None
+
+
+def _translate_affine_in_world(
+    transform_xy: np.ndarray,
+    delta_yx: Iterable[float],
+) -> np.ndarray:
+    """Return an MSI-to-world affine translated by a napari world-space drag."""
+    transform = np.asarray(transform_xy, dtype=float)
+    delta = np.asarray(tuple(delta_yx), dtype=float).ravel()
+    if transform.shape != (3, 3):
+        raise ValueError(f"Registration transform must have shape (3, 3), got {transform.shape}.")
+    if delta.size != 2 or not np.all(np.isfinite(delta)):
+        raise ValueError("Drag delta must contain finite y and x values.")
+    translation_xy = np.array(
+        [[1.0, 0.0, float(delta[1])], [0.0, 1.0, float(delta[0])], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    return translation_xy @ transform
 
 
 def _ensure_qapplication(QApplication):
@@ -4666,6 +4686,10 @@ def launch_coregistration_gui(
             alignment_active_dataset_label.setText(f"Active dataset: {state['label']}")
         except Exception:
             pass
+        try:
+            refresh_translation_alignment_controls()
+        except Exception:
+            pass
         for key, other_state in datasets.items():
             other_state["msi_landmarks"].visible = (key == str(state["id"]))
             spectrum_selection_layer = other_state.get("spectrum_selection_layer")
@@ -4712,6 +4736,10 @@ def launch_coregistration_gui(
         nonlocal active_dataset_label
         if label not in datasets:
             return
+        try:
+            stop_translation_dragging()
+        except Exception:
+            pass
         active_dataset_label = label
         sync_controls_to_active_dataset()
 
@@ -5298,13 +5326,210 @@ def launch_coregistration_gui(
 
     alignment_button.clicked.connect(open_alignment_dialog)
 
+    translation_drag_enabled = False
+    translation_drag_session: dict[str, Any] = {
+        "dataset_id": None,
+        "last_drag_transform_xy": None,
+    }
+
+    translation_launcher = QWidget()
+    translation_launcher_layout = QVBoxLayout(translation_launcher)
+    translation_launcher_layout.setContentsMargins(0, 0, 0, 0)
+    translation_launcher_layout.setSpacing(6)
+    translation_button = QPushButton("Open Translation Alignment")
+    translation_launcher_layout.addWidget(translation_button)
+    translation_launcher_layout.addWidget(QLabel("Choose a reference image, then drag the active ion image"))
+
+    translation_dialog = QDialog()
+    translation_dialog.setWindowTitle("Translation Alignment")
+    translation_dialog.setModal(False)
+    translation_dialog.resize(470, 270)
+    translation_dialog_layout = QVBoxLayout(translation_dialog)
+    translation_dialog_layout.setContentsMargins(10, 10, 10, 10)
+    translation_dialog_layout.setSpacing(8)
+    translation_active_dataset_label = QLabel("")
+    translation_dialog_layout.addWidget(translation_active_dataset_label)
+    translation_dialog_layout.addWidget(QLabel("Reference image / channel"))
+    translation_reference_combo = QComboBox()
+    translation_dialog_layout.addWidget(translation_reference_combo)
+    translation_instructions = QLabel(
+        "Start dragging, then left-drag anywhere in the canvas to move the active ion image. "
+        "Only translation is changed; scale, rotation, and shear are preserved."
+    )
+    translation_instructions.setWordWrap(True)
+    translation_dialog_layout.addWidget(translation_instructions)
+    translation_status_label = QLabel("Dragging is off.")
+    translation_status_label.setWordWrap(True)
+    translation_dialog_layout.addWidget(translation_status_label)
+
+    translation_button_row = QWidget()
+    translation_button_row_layout = QHBoxLayout(translation_button_row)
+    translation_button_row_layout.setContentsMargins(0, 0, 0, 0)
+    start_translation_button = QPushButton("Start dragging")
+    stop_translation_button = QPushButton("Stop")
+    undo_translation_button = QPushButton("Undo last drag")
+    translation_button_row_layout.addWidget(start_translation_button)
+    translation_button_row_layout.addWidget(stop_translation_button)
+    translation_button_row_layout.addWidget(undo_translation_button)
+    translation_dialog_layout.addWidget(translation_button_row)
+
+    translation_save_button = QPushButton("Save Active Registration")
+    translation_dialog_layout.addWidget(translation_save_button)
+
+    def refresh_translation_alignment_controls():
+        state = get_active_state()
+        translation_active_dataset_label.setText(f"Active ion image: {state['label']}")
+        previous_choice = str(translation_reference_combo.currentText())
+        choices = _reference_channel_choice_names()
+        translation_reference_combo.blockSignals(True)
+        translation_reference_combo.clear()
+        translation_reference_combo.addItems(choices)
+        if previous_choice in choices:
+            translation_reference_combo.setCurrentText(previous_choice)
+        translation_reference_combo.blockSignals(False)
+        transform = np.asarray(state["current_transform_xy"], dtype=float)
+        if not translation_drag_enabled:
+            translation_status_label.setText(
+                f"Dragging is off. Current translation: x={transform[0, 2]:.2f}, y={transform[1, 2]:.2f}."
+            )
+
+    def stop_translation_dragging(*_args):
+        nonlocal translation_drag_enabled
+        translation_drag_enabled = False
+        try:
+            viewer.cursor = "standard"
+        except Exception:
+            pass
+        refresh_translation_alignment_controls()
+
+    def start_translation_dragging():
+        nonlocal translation_drag_enabled
+        state = get_active_state()
+        reference_layer = _get_reference_layer_by_name(str(translation_reference_combo.currentText()))
+        if reference_layer is None:
+            QMessageBox.warning(None, "Translation Alignment", "Select a reference image or channel first.")
+            return
+        reference_layer.visible = True
+        state["ion_layer"].visible = True
+        pick_pixel_spectrum_action.setChecked(False)
+        pick_region_spectrum_action.setChecked(False)
+        stop_landmark_picking()
+        try:
+            viewer.layers.selection.active = state["ion_layer"]
+        except Exception:
+            pass
+        if translation_drag_session["dataset_id"] != str(state["id"]):
+            translation_drag_session["dataset_id"] = str(state["id"])
+            translation_drag_session["last_drag_transform_xy"] = None
+        translation_drag_enabled = True
+        try:
+            viewer.cursor = "cross"
+        except Exception:
+            pass
+        transform = np.asarray(state["current_transform_xy"], dtype=float)
+        translation_status_label.setText(
+            f"Dragging {state['label']} over {reference_layer.name}. "
+            f"Current translation: x={transform[0, 2]:.2f}, y={transform[1, 2]:.2f}."
+        )
+
+    def undo_last_translation_drag():
+        state = get_active_state()
+        previous = translation_drag_session.get("last_drag_transform_xy")
+        if translation_drag_session.get("dataset_id") != str(state["id"]) or previous is None:
+            return
+        current = np.asarray(state["current_transform_xy"], dtype=float).copy()
+        state["current_transform_xy"][:] = np.asarray(previous, dtype=float)
+        translation_drag_session["last_drag_transform_xy"] = current
+        state["current_transform_is_initial_guess"] = False
+        apply_transform_to_state(state)
+        transform = np.asarray(state["current_transform_xy"], dtype=float)
+        translation_status_label.setText(
+            f"Restored the previous position: x={transform[0, 2]:.2f}, y={transform[1, 2]:.2f}."
+        )
+
+    def save_translation_registration():
+        state = get_active_state()
+        _run_with_busy_dialog(
+            "Save Registration",
+            "Saving active registration...",
+            lambda: save_coregistration(
+                state["dataset"].zarr_path,
+                state["current_transform_xy"],
+                table_key=state["dataset"].table_key,
+                tic_key=state["dataset"].tic_key,
+                registered_cs=registered_cs,
+            ),
+        )
+        state["current_transform_is_initial_guess"] = False
+        translation_status_label.setText(
+            f"Saved {state['label']} registration. You can continue dragging and save again."
+        )
+
+    def drag_active_ion_image(_viewer, event):
+        if (
+            not translation_drag_enabled
+            or getattr(event, "button", None) != 1
+            or "Alt" in getattr(event, "modifiers", ())
+        ):
+            return
+        state = get_active_state()
+        start_yx = np.asarray(event.position, dtype=float).ravel()[-2:]
+        start_transform_xy = np.asarray(state["current_transform_xy"], dtype=float).copy()
+        moved = False
+        try:
+            event.handled = True
+        except Exception:
+            pass
+        yield
+        while getattr(event, "type", None) == "mouse_move":
+            current_yx = np.asarray(event.position, dtype=float).ravel()[-2:]
+            delta_yx = current_yx - start_yx
+            state["current_transform_xy"][:] = _translate_affine_in_world(start_transform_xy, delta_yx)
+            state["current_transform_is_initial_guess"] = False
+            apply_transform_to_state(state)
+            moved = moved or bool(np.any(np.abs(delta_yx) > 0.0))
+            transform = np.asarray(state["current_transform_xy"], dtype=float)
+            translation_status_label.setText(
+                f"Dragging {state['label']}: x={transform[0, 2]:.2f}, y={transform[1, 2]:.2f}."
+            )
+            try:
+                event.handled = True
+            except Exception:
+                pass
+            yield
+        if moved:
+            translation_drag_session["dataset_id"] = str(state["id"])
+            translation_drag_session["last_drag_transform_xy"] = start_transform_xy
+        sync_controls_to_active_dataset()
+
+    viewer.mouse_drag_callbacks.append(drag_active_ion_image)
+    start_translation_button.clicked.connect(start_translation_dragging)
+    stop_translation_button.clicked.connect(stop_translation_dragging)
+    undo_translation_button.clicked.connect(undo_last_translation_drag)
+    translation_save_button.clicked.connect(save_translation_registration)
+    translation_dialog.finished.connect(stop_translation_dragging)
+
+    def open_translation_dialog():
+        refresh_translation_alignment_controls()
+        translation_dialog.show()
+        translation_dialog.raise_()
+        translation_dialog.activateWindow()
+
+    translation_button.clicked.connect(open_translation_dialog)
+
     add_data_launcher = QWidget()
+    add_data_launcher.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
     add_data_launcher_layout = QVBoxLayout(add_data_launcher)
     add_data_launcher_layout.setContentsMargins(6, 6, 6, 6)
     add_data_launcher_layout.setSpacing(6)
     add_data_button = QPushButton("Open Add Data Tools")
     add_data_launcher_layout.addWidget(add_data_button)
-    add_data_launcher_layout.addWidget(QLabel("Imports and annotation tools"))
+    add_data_description = QLabel("Imports and annotation tools")
+    add_data_description.setWordWrap(True)
+    add_data_description.setMinimumWidth(0)
+    add_data_description.setMaximumWidth(190)
+    add_data_description.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    add_data_launcher_layout.addWidget(add_data_description)
     add_data_launcher_layout.addStretch(1)
 
     add_data_dialog = QDialog()
@@ -5339,12 +5564,18 @@ def launch_coregistration_gui(
     add_data_button.clicked.connect(open_add_data_dialog)
 
     data_management_launcher = QWidget()
+    data_management_launcher.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
     data_management_launcher_layout = QVBoxLayout(data_management_launcher)
     data_management_launcher_layout.setContentsMargins(6, 6, 6, 6)
     data_management_launcher_layout.setSpacing(6)
     data_management_button = QPushButton("Open Data Management")
     data_management_launcher_layout.addWidget(data_management_button)
-    data_management_launcher_layout.addWidget(QLabel("Remove MSI datasets or annotations from the zarr"))
+    data_management_description = QLabel("Remove MSI datasets or annotations from the zarr")
+    data_management_description.setWordWrap(True)
+    data_management_description.setMinimumWidth(0)
+    data_management_description.setMaximumWidth(190)
+    data_management_description.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    data_management_launcher_layout.addWidget(data_management_description)
     data_management_launcher_layout.addStretch(1)
 
     data_management_dialog = QDialog()
@@ -5367,16 +5598,109 @@ def launch_coregistration_gui(
     data_management_button.clicked.connect(open_data_management_dialog)
 
     viewer.window.add_dock_widget(controls_scroll, area="right", name="Controls")
-    viewer.window.add_dock_widget(add_data_launcher, area="left", name="Add Data")
-    viewer.window.add_dock_widget(data_management_launcher, area="left", name="Data Management")
+    add_data_dock = viewer.window.add_dock_widget(add_data_launcher, area="left", name="Add Data")
+    data_management_dock = viewer.window.add_dock_widget(
+        data_management_launcher,
+        area="left",
+        name="Data Management",
+    )
     viewer.window.add_dock_widget(if_launcher, area="right", name="IF Display")
     viewer.window.add_dock_widget(threshold_launcher, area="right", name="MSI Threshold")
     viewer.window.add_dock_widget(if_threshold_launcher, area="right", name="IF Threshold")
     viewer.window.add_dock_widget(alignment_launcher, area="right", name="Alignment")
+    viewer.window.add_dock_widget(translation_launcher, area="right", name="Translation Alignment")
     enforce_reference_layers_at_bottom()
     add_annotation_shape_layers(initial_state)
     sync_controls_to_active_dataset()
     _refresh_if_toolbox_widgets()
+
+    def activate_pan_tool():
+        """Leave startup in napari's normal pan/zoom interaction mode."""
+        state = get_active_state()
+        try:
+            viewer.layers.selection.active = state["ion_layer"]
+            state["ion_layer"].mode = "pan_zoom"
+        except Exception:
+            pass
+
+    def compact_napari_layer_controls():
+        """Remove napari image-control size hints that force a wide left dock."""
+        try:
+            qt_viewer = viewer.window._qt_viewer
+            controls_container = qt_viewer.controls
+            controls_container.setMinimumWidth(0)
+            controls_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            for controls in controls_container.widgets.values():
+                controls.setMinimumWidth(0)
+                controls.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+                for label in controls.findChildren(QLabel):
+                    label.setWordWrap(True)
+                    label.setMinimumWidth(0)
+                    label.setMaximumWidth(100)
+                    label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+                for combo in controls.findChildren(QComboBox):
+                    combo.setMinimumWidth(70)
+                    combo.setMinimumContentsLength(6)
+                    combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                    combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        except Exception:
+            pass
+
+    def release_left_dock_width():
+        """Make the compact startup column user-resizable after layout settles."""
+        try:
+            qt_viewer = viewer.window._qt_viewer
+            left_docks = [
+                qt_viewer.dockLayerControls,
+                qt_viewer.dockLayerList,
+                add_data_dock,
+                data_management_dock,
+            ]
+            for dock in left_docks:
+                for widget in (dock.inner_widget(), dock.widget()):
+                    widget.setMinimumWidth(0)
+                    widget.setMaximumWidth(16777215)
+                dock.setMinimumWidth(50)
+                dock.setMaximumWidth(16777215)
+        except Exception:
+            pass
+
+    def narrow_left_dock_column():
+        """Give the image canvas more of the initial horizontal space."""
+        try:
+            qt_viewer = viewer.window._qt_viewer
+            left_docks = [
+                qt_viewer.dockLayerControls,
+                qt_viewer.dockLayerList,
+                add_data_dock,
+                data_management_dock,
+            ]
+            for dock in left_docks:
+                inner_widget = dock.inner_widget()
+                wrapped_widget = dock.widget()
+                inner_widget.setFixedWidth(210)
+                wrapped_widget.setFixedWidth(210)
+                dock.setFixedWidth(225)
+            viewer.window._qt_window.resizeDocks(
+                left_docks,
+                [225] * len(left_docks),
+                Qt.Horizontal,
+            )
+        except Exception:
+            pass
+
+    activate_pan_tool()
+    compact_napari_layer_controls()
+    narrow_left_dock_column()
+    QTimer.singleShot(0, activate_pan_tool)
+    QTimer.singleShot(0, compact_napari_layer_controls)
+    QTimer.singleShot(0, narrow_left_dock_column)
+    QTimer.singleShot(250, compact_napari_layer_controls)
+    QTimer.singleShot(250, narrow_left_dock_column)
+    QTimer.singleShot(600, release_left_dock_width)
+    viewer.layers.events.inserted.connect(
+        lambda _event: QTimer.singleShot(0, compact_napari_layer_controls)
+    )
     try:
         viewer.reset_view()
         startup_camera_state = {
