@@ -30,6 +30,7 @@ from viu_chem.msi_coregistration import (
     create_annotation_region_mask,
     convert_input_to_zarr,
     delete_msi_dataset,
+    delete_reference_image,
     embed_msi_dataset,
     get_msi_table,
     import_geojson_annotations,
@@ -766,6 +767,24 @@ def test_embedding_another_msi_dataset_preserves_current_selection_contract(tmp_
         "shapes": result["pixel_shape_keys"],
     }
     assert {spec["table_key"] for spec in list_coregistration_msi_datasets(host)} == {"msi"}
+
+
+def test_deleting_reference_image_preserves_msi_and_annotations(tmp_path: Path):
+    host = _write_coregistration_store(tmp_path / "delete-reference.zarr")
+
+    assert delete_reference_image(host, image_key="hne") == "hne"
+
+    reloaded = sd.read_zarr(host)
+    assert "hne" not in reloaded.images
+    assert "msi_tic" in reloaded.images
+    assert "msi" in reloaded.tables
+    assert "pixels" in reloaded.shapes
+    assert "anno_thin_roi" in reloaded.shapes
+
+    with pytest.raises(ValueError, match="MSI TIC image"):
+        delete_reference_image(host, image_key="msi_tic")
+    with pytest.raises(KeyError, match="Reference image not found"):
+        delete_reference_image(host, image_key="missing")
 
 
 def test_embedding_aligned_imzml_can_skip_thyra_resampling(tmp_path: Path):

@@ -76,6 +76,7 @@ from .msi_coregistration import (
     create_reference_threshold_annotation,
     delete_geojson_annotations,
     delete_msi_dataset,
+    delete_reference_image,
     embed_msi_dataset,
     finite_data_limits,
     import_geojson_annotations,
@@ -116,6 +117,85 @@ def _translate_affine_in_world(
         dtype=float,
     )
     return translation_xy @ transform
+
+
+def _reference_level_alignment_to_world(
+    moving_level_to_fixed_level_xy: np.ndarray,
+    fixed_level_zero_to_world_xy: np.ndarray,
+    *,
+    moving_level_zero_shape: tuple[int, int],
+    moving_level_shape: tuple[int, int],
+    fixed_level_zero_shape: tuple[int, int],
+    fixed_level_shape: tuple[int, int],
+) -> np.ndarray:
+    """Compose a pyramid-level reference alignment into level-0 world coordinates."""
+    candidate = np.asarray(moving_level_to_fixed_level_xy, dtype=float)
+    fixed_to_world = np.asarray(fixed_level_zero_to_world_xy, dtype=float)
+    if candidate.shape != (3, 3) or fixed_to_world.shape != (3, 3):
+        raise ValueError("Reference alignment matrices must both have shape (3, 3).")
+    shapes = (
+        moving_level_zero_shape,
+        moving_level_shape,
+        fixed_level_zero_shape,
+        fixed_level_shape,
+    )
+    if any(len(shape) != 2 or min(float(shape[0]), float(shape[1])) <= 0 for shape in shapes):
+        raise ValueError("Reference pyramid shapes must contain positive y and x dimensions.")
+
+    moving_level_to_zero = np.diag(
+        [
+            float(moving_level_zero_shape[1]) / float(moving_level_shape[1]),
+            float(moving_level_zero_shape[0]) / float(moving_level_shape[0]),
+            1.0,
+        ]
+    )
+    fixed_level_to_zero = np.diag(
+        [
+            float(fixed_level_zero_shape[1]) / float(fixed_level_shape[1]),
+            float(fixed_level_zero_shape[0]) / float(fixed_level_shape[0]),
+            1.0,
+        ]
+    )
+    return fixed_to_world @ fixed_level_to_zero @ candidate @ np.linalg.inv(moving_level_to_zero)
+
+
+def _reference_spatial_shape(data: Any) -> tuple[int, int]:
+    """Return an image-like object's spatial ``(y, x)`` shape without loading it."""
+    shape = tuple(int(v) for v in data.shape)
+    if len(shape) == 2:
+        return shape
+    if len(shape) == 3 and shape[-1] in (3, 4):
+        return shape[:2]
+    if len(shape) == 3 and shape[0] in (3, 4):
+        return shape[1:]
+    raise ValueError(f"Reference data must be 2D or RGB(A), got shape {shape}.")
+
+
+def _reference_pixel_stride(data: Any, max_pixels: int | None) -> int:
+    """Return a common y/x stride that satisfies a registration pixel budget."""
+    if max_pixels is None:
+        return 1
+    max_pixels = int(max_pixels)
+    if max_pixels <= 0:
+        raise ValueError("The registration pixel budget must be positive.")
+    height, width = _reference_spatial_shape(data)
+    stride = max(1, int(np.ceil(np.sqrt((height * width) / max_pixels))))
+    while int(np.ceil(height / stride)) * int(np.ceil(width / stride)) > max_pixels:
+        stride += 1
+    return stride
+
+
+def _limit_reference_pixels(data: Any, max_pixels: int | None) -> Any:
+    """Stride-sample lazy image data before materialization to cap registration memory."""
+    stride = _reference_pixel_stride(data, max_pixels)
+    if stride == 1:
+        return data
+    shape = tuple(int(v) for v in data.shape)
+    if len(shape) == 2:
+        return data[::stride, ::stride]
+    if shape[-1] in (3, 4):
+        return data[::stride, ::stride, :]
+    return data[:, ::stride, ::stride]
 
 
 def _ensure_qapplication(QApplication):
@@ -220,6 +300,18 @@ def launch_coregistration_gui(
     registered_cs: str = "registered",
     skip_resampling: bool = False,
 ):
+
+    # Multiscale Zarr chunks can take seconds to hydrate when the store lives
+    # in a cloud-synced folder.  Keep those reads off Qt's paint callback so a
+    # slow or retried File Provider request does not freeze the whole GUI.
+    try:
+        from napari.settings import get_settings
+
+        get_settings().experimental.async_ = True
+    except Exception:
+        # Older napari releases may not expose this setting; opening the GUI is
+        # still preferable to failing during optional performance setup.
+        pass
 
     if zarr_path is None:
         if input_path is not None:
@@ -2491,7 +2583,7 @@ def launch_coregistration_gui(
         except Exception:
             pass
 
-    def _reference_intensity_from_layer(layer, pyramid_level: int = 0) -> np.ndarray:
+    def _reference_data_from_layer(layer, pyramid_level: int = 0):
         if bool(getattr(layer, "multiscale", False)):
             levels = list(layer.data)
             pyramid_level = int(pyramid_level)
@@ -2505,6 +2597,21 @@ def launch_coregistration_gui(
             if int(pyramid_level) != 0:
                 raise ValueError(f"Reference layer {layer.name!r} has only pyramid level 0.")
             data = layer.data
+        return data
+
+    def _reference_layer_spatial_shape(layer, pyramid_level: int = 0) -> tuple[int, int]:
+        return _reference_spatial_shape(_reference_data_from_layer(layer, pyramid_level))
+
+    def _reference_intensity_from_layer(
+        layer,
+        pyramid_level: int = 0,
+        *,
+        max_pixels: int | None = None,
+    ) -> np.ndarray:
+        data = _limit_reference_pixels(
+            _reference_data_from_layer(layer, pyramid_level),
+            max_pixels,
+        )
         arr = np.asarray(data)
         if arr.ndim == 2:
             return np.asarray(arr, dtype=float)
@@ -3489,7 +3596,7 @@ def launch_coregistration_gui(
         overlap_pixels = int(np.count_nonzero(fixed_mask_arr))
         if sitk_overlap_pixels < 8:
             raise ValueError(
-                "The current MSI/reference affine does not produce enough SimpleITK fixed-to-moving overlap for optimization. "
+                "The current moving/fixed affine does not produce enough SimpleITK overlap for optimization. "
                 f"Overlap candidates: {', '.join(f'{label}={int(sitk_count)} SITK samples/{int(np.count_nonzero(mask))} mask pixels' for label, _matrix, _transform, mask, sitk_count in candidate_masks)}."
             )
 
@@ -3811,7 +3918,7 @@ def launch_coregistration_gui(
         axes[1].imshow(overlay, cmap="magma", alpha=0.55)
         min_x, max_x, min_y, max_y = mi_inputs["crop_bounds"]
         axes[1].set_title(
-            f"MSI after current affine\n{mi_inputs['transform_label']}; overlap {mi_inputs['sitk_overlap_pixels']} samples",
+            f"Moving image after current affine\n{mi_inputs['transform_label']}; overlap {mi_inputs['sitk_overlap_pixels']} samples",
             loc="left",
         )
         fig.suptitle(
@@ -4069,6 +4176,9 @@ def launch_coregistration_gui(
     reference_alignment_state: dict[str, Any] = {
         "moving_key": None,
         "moving_layer": None,
+        "fixed_key": None,
+        "fixed_layer": None,
+        "optimization_previous_affine_yx": None,
         "previous_display": {},
     }
 
@@ -4104,13 +4214,213 @@ def launch_coregistration_gui(
             except Exception:
                 pass
         moving_layer = moving_layers[0]
+        fixed_layer = fixed_layers[0]
         reference_alignment_state["moving_key"] = moving_key
         reference_alignment_state["moving_layer"] = moving_layer
+        reference_alignment_state["fixed_key"] = fixed_key
+        reference_alignment_state["fixed_layer"] = fixed_layer
+        reference_alignment_state["optimization_previous_affine_yx"] = None
+        reference_optimization_widget.moving_channel.choices = [str(layer.name) for layer in moving_layers]
+        reference_optimization_widget.fixed_channel.choices = [str(layer.name) for layer in fixed_layers]
+        reference_optimization_widget.moving_channel.value = str(moving_layer.name)
+        reference_optimization_widget.fixed_channel.value = str(fixed_layer.name)
         try:
             viewer.layers.selection.active = moving_layer
             moving_layer.mode = "transform"
         except Exception:
             pass
+
+    @magicgui(
+        moving_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        fixed_channel={"widget_type": "ComboBox", "choices": ["(none)"]},
+        moving_pyramid_level={
+            "widget_type": "SpinBox",
+            "min": -1,
+            "max": 32,
+            "step": 1,
+            "label": "Moving level (-1 = highest)",
+        },
+        fixed_pyramid_level={
+            "widget_type": "SpinBox",
+            "min": -1,
+            "max": 32,
+            "step": 1,
+            "label": "Fixed level (-1 = highest)",
+        },
+        metric={"widget_type": "ComboBox", "choices": list(REGISTRATION_METRIC_CHOICES)},
+        histogram_bins={"widget_type": "SpinBox", "min": 8, "max": 256, "step": 1, "label": "Histogram bins (MI only)"},
+        max_megapixels={"widget_type": "FloatSpinBox", "min": 0.1, "max": 16.0, "step": 0.1, "label": "Max megapixels per image"},
+        max_translation={"widget_type": "FloatSpinBox", "min": 0.0, "max": 5000.0, "step": 1.0},
+        max_linear_delta={"widget_type": "FloatSpinBox", "min": 0.0, "max": 10.0, "step": 0.01},
+        max_passes={"widget_type": "SpinBox", "min": 1, "max": 100, "step": 1},
+        call_button="Optimize Reference Alignment",
+    )
+    def reference_optimization_widget(
+        moving_channel: str = "(none)",
+        fixed_channel: str = "(none)",
+        moving_pyramid_level: int = -1,
+        fixed_pyramid_level: int = -1,
+        metric: str = "Mutual information",
+        histogram_bins: int = 50,
+        max_megapixels: float = 1.0,
+        max_translation: float = 50.0,
+        max_linear_delta: float = 0.2,
+        max_passes: int = 5,
+    ):
+        moving_key = reference_alignment_state.get("moving_key")
+        fixed_key = reference_alignment_state.get("fixed_key")
+        if moving_key is None or fixed_key is None:
+            QMessageBox.warning(None, "Reference Optimization", "Start a reference alignment first.")
+            return
+        moving_layer = _get_reference_layer_by_name(str(moving_channel))
+        fixed_layer = _get_reference_layer_by_name(str(fixed_channel))
+        alignment_moving_layer = reference_alignment_state.get("moving_layer")
+        if moving_layer not in _reference_layer_list(str(moving_key)):
+            QMessageBox.warning(None, "Reference Optimization", "Choose a channel from the moving image.")
+            return
+        if fixed_layer not in _reference_layer_list(str(fixed_key)):
+            QMessageBox.warning(None, "Reference Optimization", "Choose a channel from the fixed image.")
+            return
+
+        def run_reference_optimization():
+            resolved_moving_level = _resolve_reference_pyramid_level(moving_layer, moving_pyramid_level)
+            resolved_fixed_level = _resolve_reference_pyramid_level(fixed_layer, fixed_pyramid_level)
+            moving_selected_level_shape = _reference_layer_spatial_shape(moving_layer, resolved_moving_level)
+            fixed_selected_level_shape = _reference_layer_spatial_shape(fixed_layer, resolved_fixed_level)
+            max_pixels = max(1, int(float(max_megapixels) * 1_000_000))
+            moving_stride = _reference_pixel_stride(
+                _reference_data_from_layer(moving_layer, resolved_moving_level),
+                max_pixels,
+            )
+            fixed_stride = _reference_pixel_stride(
+                _reference_data_from_layer(fixed_layer, resolved_fixed_level),
+                max_pixels,
+            )
+            moving_img = _reference_intensity_from_layer(
+                moving_layer,
+                resolved_moving_level,
+                max_pixels=max_pixels,
+            )
+            fixed_img = _reference_intensity_from_layer(
+                fixed_layer,
+                resolved_fixed_level,
+                max_pixels=max_pixels,
+            )
+
+            moving_affine_yx = np.asarray(alignment_moving_layer.affine.affine_matrix, dtype=float)
+            fixed_affine_yx = np.asarray(fixed_layer.affine.affine_matrix, dtype=float)
+            moving_level_zero_to_world_xy = xy_to_yx_matrix(moving_affine_yx[-3:, -3:])
+            fixed_level_zero_to_world_xy = xy_to_yx_matrix(fixed_affine_yx[-3:, -3:])
+            moving_level_zero_shape = _reference_layer_spatial_shape(moving_layer, 0)
+            fixed_level_zero_shape = _reference_layer_spatial_shape(fixed_layer, 0)
+            moving_level_to_zero = np.diag(
+                [
+                    (moving_level_zero_shape[1] / moving_selected_level_shape[1]) * moving_stride,
+                    (moving_level_zero_shape[0] / moving_selected_level_shape[0]) * moving_stride,
+                    1.0,
+                ]
+            )
+            fixed_level_to_zero = np.diag(
+                [
+                    (fixed_level_zero_shape[1] / fixed_selected_level_shape[1]) * fixed_stride,
+                    (fixed_level_zero_shape[0] / fixed_selected_level_shape[0]) * fixed_stride,
+                    1.0,
+                ]
+            )
+            initial_moving_to_fixed_level_xy = (
+                np.linalg.inv(fixed_level_zero_to_world_xy @ fixed_level_to_zero)
+                @ moving_level_zero_to_world_xy
+                @ moving_level_to_zero
+            )
+            selected_metric = _normalize_registration_metric(metric)
+            result = optimize_affine_registration(
+                fixed_img,
+                moving_img,
+                initial_moving_to_fixed_level_xy,
+                metric=selected_metric,
+                histogram_bins=int(histogram_bins),
+                learning_rate=0.05,
+                min_step=1e-4,
+                iterations=150,
+                sampling_percentage=0.2,
+                seed=42,
+                max_translation=float(max_translation),
+                max_linear_delta=float(max_linear_delta),
+                max_passes=int(max_passes),
+                min_score_improvement=0.001,
+            )
+            candidate_world_xy = _reference_level_alignment_to_world(
+                result[0],
+                fixed_level_zero_to_world_xy,
+                moving_level_zero_shape=moving_level_zero_shape,
+                moving_level_shape=(
+                    moving_selected_level_shape[0] / moving_stride,
+                    moving_selected_level_shape[1] / moving_stride,
+                ),
+                fixed_level_zero_shape=fixed_level_zero_shape,
+                fixed_level_shape=(
+                    fixed_selected_level_shape[0] / fixed_stride,
+                    fixed_selected_level_shape[1] / fixed_stride,
+                ),
+            )
+            return (
+                candidate_world_xy,
+                selected_metric,
+                resolved_moving_level,
+                resolved_fixed_level,
+                tuple(int(v) for v in moving_img.shape),
+                tuple(int(v) for v in fixed_img.shape),
+                result,
+            )
+
+        try:
+            (
+                candidate_world_xy,
+                selected_metric,
+                resolved_moving_level,
+                resolved_fixed_level,
+                moving_optimization_shape,
+                fixed_optimization_shape,
+                result,
+            ) = _run_with_busy_dialog(
+                "Reference Optimization",
+                f"Optimizing reference alignment with {str(metric).lower()}...\nThis can take a minute.",
+                run_reference_optimization,
+            )
+        except ModuleNotFoundError:
+            QMessageBox.warning(None, "Reference Optimization", "SimpleITK is not installed. Install the coregistration extra again to enable this tool.")
+            return
+        except Exception as exc:
+            QMessageBox.warning(None, "Reference Optimization", str(exc))
+            return
+
+        current_affine_yx = np.asarray(alignment_moving_layer.affine.affine_matrix, dtype=float)[-3:, -3:].copy()
+        reference_alignment_state["optimization_previous_affine_yx"] = current_affine_yx
+        candidate_world_yx = xy_to_yx_matrix(candidate_world_xy)
+        for layer in _reference_layer_list(str(moving_key)):
+            layer.affine = candidate_world_yx
+        _before_score, after_score = float(result[1]), float(result[2])
+        QMessageBox.information(
+            None,
+            "Reference Optimization Preview",
+            (
+                f"Applied an unsaved {selected_metric} refinement to the moving image.\n\n"
+                f"Score: {_before_score:.6g} → {after_score:.6g}\n"
+                f"Pyramid levels: moving {resolved_moving_level}, fixed {resolved_fixed_level}\n\n"
+                f"Optimization arrays: moving {moving_optimization_shape}, fixed {fixed_optimization_shape}\n\n"
+                "Review it in the viewer, then save the reference alignment or undo the refinement."
+            ),
+        )
+
+    @magicgui(call_button="Undo Automated Reference Refinement")
+    def undo_reference_optimization_widget():
+        moving_key = reference_alignment_state.get("moving_key")
+        previous_affine_yx = reference_alignment_state.get("optimization_previous_affine_yx")
+        if moving_key is None or previous_affine_yx is None:
+            return
+        for layer in _reference_layer_list(str(moving_key)):
+            layer.affine = np.asarray(previous_affine_yx, dtype=float)
+        reference_alignment_state["optimization_previous_affine_yx"] = None
 
     @magicgui(call_button="Save Reference Alignment")
     def save_reference_alignment_widget():
@@ -4143,6 +4453,9 @@ def launch_coregistration_gui(
         refresh_datasets_after_reference_update()
         reference_alignment_state["moving_key"] = None
         reference_alignment_state["moving_layer"] = None
+        reference_alignment_state["fixed_key"] = None
+        reference_alignment_state["fixed_layer"] = None
+        reference_alignment_state["optimization_previous_affine_yx"] = None
         QMessageBox.information(
             None,
             "Reference Alignment",
@@ -4162,6 +4475,9 @@ def launch_coregistration_gui(
                 pass
         reference_alignment_state["moving_key"] = None
         reference_alignment_state["moving_layer"] = None
+        reference_alignment_state["fixed_key"] = None
+        reference_alignment_state["fixed_layer"] = None
+        reference_alignment_state["optimization_previous_affine_yx"] = None
         enforce_reference_layers_at_bottom()
 
     msi_layer_controls = QWidget()
@@ -4704,6 +5020,54 @@ def launch_coregistration_gui(
         sync_controls_to_active_dataset()
 
     @magicgui(
+        reference_image={"widget_type": "ComboBox", "choices": ["(none)"]},
+        call_button="Remove Reference Image From Zarr",
+    )
+    def remove_reference_image_from_zarr_widget(reference_image: str = "(none)"):
+        key = str(reference_image)
+        if key == "(none)" or key not in reference_layers:
+            return
+        if not _confirm_data_delete(
+            "Remove Reference Image",
+            (
+                f"Remove reference image '{key}' from the zarr?\n\n"
+                "This deletes its image pyramid. MSI data and annotation shapes are not deleted."
+            ),
+        ):
+            return
+
+        deleted_key = _run_with_busy_dialog(
+            "Remove Reference Image",
+            "Deleting reference image from zarr...",
+            lambda: delete_reference_image(host_zarr_path, image_key=key),
+        )
+        if deleted_key != key:
+            QMessageBox.warning(None, "Remove Reference Image", "No matching reference image was deleted.")
+            return
+
+        for layer in _reference_layer_list(key):
+            _remove_viewer_layer(layer)
+        reference_layers.pop(key, None)
+        previous_display = reference_alignment_state.get("previous_display", {})
+        for layer in _reference_channel_layers():
+            if id(layer) in previous_display:
+                layer.visible, layer.opacity = previous_display[id(layer)]
+            try:
+                layer.mode = "pan_zoom"
+            except Exception:
+                pass
+        reference_alignment_state["moving_key"] = None
+        reference_alignment_state["moving_layer"] = None
+        reference_alignment_state["fixed_key"] = None
+        reference_alignment_state["fixed_layer"] = None
+        reference_alignment_state["optimization_previous_affine_yx"] = None
+        reference_alignment_state["previous_display"] = {}
+        refresh_datasets_after_reference_update()
+        _refresh_if_toolbox_widgets()
+        enforce_reference_layers_at_bottom()
+        sync_controls_to_active_dataset()
+
+    @magicgui(
         annotation_key={"widget_type": "ComboBox", "choices": ["(none)"]},
         call_button="Remove Annotation From Zarr",
     )
@@ -4795,6 +5159,9 @@ def launch_coregistration_gui(
         if optimize_affine_registration_widget.reference_channel.value not in optimize_affine_registration_widget.reference_channel.choices:
             optimize_affine_registration_widget.reference_channel.value = optimize_affine_registration_widget.reference_channel.choices[0]
         reference_keys = list(coreg_dataset.reference_image_keys)
+        remove_reference_image_from_zarr_widget.reference_image.choices = reference_keys or ["(none)"]
+        if remove_reference_image_from_zarr_widget.reference_image.value not in remove_reference_image_from_zarr_widget.reference_image.choices:
+            remove_reference_image_from_zarr_widget.reference_image.value = remove_reference_image_from_zarr_widget.reference_image.choices[0]
         add_reference_image_widget.align_to.choices = ["(coordinate system origin)", *reference_keys]
         if add_reference_image_widget.align_to.value not in add_reference_image_widget.align_to.choices:
             add_reference_image_widget.align_to.value = add_reference_image_widget.align_to.choices[0]
@@ -5543,11 +5910,14 @@ def launch_coregistration_gui(
     alignment_dialog_container_layout.addWidget(alignment_active_dataset_label)
     alignment_dialog_container_layout.addWidget(QLabel("Reference-to-reference alignment"))
     alignment_dialog_container_layout.addWidget(reference_alignment_widget.native)
+    alignment_dialog_container_layout.addWidget(reference_optimization_widget.native)
+    alignment_dialog_container_layout.addWidget(undo_reference_optimization_widget.native)
     alignment_dialog_container_layout.addWidget(save_reference_alignment_widget.native)
     alignment_dialog_container_layout.addWidget(restore_reference_visibility_widget.native)
     reference_alignment_help = QLabel(
-        "Choose the added image as moving and IF as fixed. Use the transform handles "
-        "on the canvas, then save the reference alignment."
+        "Choose the added image as moving and IF as fixed. Use the transform handles for a rough start, "
+        "then optionally refine selected channels with mutual information or normalized cross-correlation. "
+        "The optimized result is only a viewer preview until you save the reference alignment."
     )
     reference_alignment_help.setWordWrap(True)
     alignment_dialog_container_layout.addWidget(reference_alignment_help)
@@ -5849,7 +6219,7 @@ def launch_coregistration_gui(
     data_management_launcher_layout.setSpacing(6)
     data_management_button = QPushButton("Open Data Management")
     data_management_launcher_layout.addWidget(data_management_button)
-    data_management_description = QLabel("Remove MSI datasets or annotations from the zarr")
+    data_management_description = QLabel("Remove MSI datasets, reference images, or annotations from the zarr")
     data_management_description.setWordWrap(True)
     data_management_description.setMinimumWidth(0)
     data_management_description.setMaximumWidth(190)
@@ -5860,7 +6230,7 @@ def launch_coregistration_gui(
     data_management_dialog = QDialog()
     data_management_dialog.setWindowTitle("Data Management")
     data_management_dialog.setModal(False)
-    data_management_dialog.resize(500, 260)
+    data_management_dialog.resize(500, 340)
     data_management_dialog_layout = QVBoxLayout(data_management_dialog)
     data_management_dialog_layout.setContentsMargins(8, 8, 8, 8)
     data_management_dialog_layout.setSpacing(8)
@@ -5868,6 +6238,7 @@ def launch_coregistration_gui(
     data_management_dialog_layout.addWidget(select_coordinate_system_widget.native)
     data_management_dialog_layout.addWidget(rename_coordinate_system_widget.native)
     data_management_dialog_layout.addWidget(remove_msi_dataset_from_zarr_widget.native)
+    data_management_dialog_layout.addWidget(remove_reference_image_from_zarr_widget.native)
     data_management_dialog_layout.addWidget(remove_annotation_from_zarr_widget.native)
     data_management_dialog_layout.addStretch(1)
 

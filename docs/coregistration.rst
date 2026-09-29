@@ -150,6 +150,20 @@ temporarily solos the two selected references, keeps the fixed IF pyramid
 underneath, and makes the moving image translucent; each layer retains its own
 independent multiscale pyramid. **Restore Reference Visibility** returns the
 previous visibility and opacity settings.
+For automatic refinement, start the same reference alignment, choose a moving
+and fixed channel, select mutual information or normalized cross-correlation,
+and use **Optimize Reference Alignment**. The coarsest pyramid levels are used
+by default for speed. The optimized affine is previewed live but is not written
+to the zarr until **Save Reference Alignment** is selected; **Undo Automated
+Reference Refinement** restores the preceding manual position.
+Registration arrays are also stride-sampled before loading according to **Max
+megapixels per image** (1 megapixel by default), which keeps whole-slide images
+within a predictable memory budget even when a pyramid is missing. Raise this
+limit only for a final fine refinement.
+Use **Data Management > Remove Reference Image From Zarr** to permanently
+delete an obsolete reference image and its pyramid. This leaves MSI datasets
+and annotation shapes intact; MSI TIC images remain managed through the
+separate MSI dataset removal control.
 For a translation-only adjustment, open **Translation Alignment**, choose the
 reference image or channel, select **Start dragging**, and left-drag in the
 canvas until the active ion image overlaps the reference. The tool preserves
@@ -485,6 +499,7 @@ Dataset Preparation and Management
    embed_msi_dataset
    rename_msi_dataset
    delete_msi_dataset
+   delete_reference_image
    add_reference_image
 
 Registration and Display Utilities

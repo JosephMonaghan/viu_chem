@@ -8,6 +8,7 @@
 /peak_align
 /coreg
 .vscode
+/scripts
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

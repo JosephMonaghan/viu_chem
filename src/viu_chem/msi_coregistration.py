@@ -1288,6 +1288,34 @@ def delete_msi_dataset(
     return deleted
 
 
+def delete_reference_image(
+    zarr_path: str | Path,
+    *,
+    image_key: str,
+) -> str:
+    """Delete a non-MSI reference image from a coregistration store.
+
+    MSI TIC images are deliberately protected because they are coupled to an
+    MSI table and pixel shapes; use :func:`delete_msi_dataset` for those.
+    """
+    host_zarr_path = Path(zarr_path).expanduser()
+    sdata = sd.read_zarr(host_zarr_path)
+    key = str(image_key)
+    if key not in sdata.images:
+        raise KeyError(f"Reference image not found: {key}")
+
+    tic_keys = {str(spec["tic_key"]) for spec in _infer_msi_dataset_specs(sdata)}
+    if key in tic_keys:
+        raise ValueError(
+            f"Image {key!r} is an MSI TIC image; remove its MSI dataset instead."
+        )
+
+    del sdata[key]
+    sdata.delete_element_from_disk(key)
+    sdata.write_metadata(consolidate_metadata=True)
+    return key
+
+
 @dataclass
 class CoregistrationDataset:
     zarr_path: Path
